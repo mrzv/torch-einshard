@@ -1,0 +1,7 @@
+[project]
+name = "torch-einshard"
+version = "0.1.0"
+description = "Sharding in torch using einsum-like notation"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = []
