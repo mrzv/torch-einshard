@@ -1,1 +1,1 @@
-from .dot import contract
+from .einsum import einsum
