@@ -1,12 +1,8 @@
 import string
 import torch
 
-from .grammar import sharding
-
 # local contraction: translate the formula to einsum
 def einsum(shard, *xs):
-    shard = sharding(shard).map()
-
     shard_to_einsum = {}
     idx = 0
     equation = ""
@@ -26,7 +22,7 @@ def einsum(shard, *xs):
             equation += shard_to_einsum[n]
     equation += '->'
     for i,n in enumerate(shard[2]):
-        assert n in shard_to_einsum, "Output dimensions must be present in input"
+        assert n in shard_to_einsum, f"Output dimension {n} must be present in input"
         equation += shard_to_einsum[n]
 
     return torch.einsum(equation, *xs)
