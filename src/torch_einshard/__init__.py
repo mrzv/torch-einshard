@@ -1,5 +1,6 @@
 from .einsum import einsum
 from .grammar import sharding, Axes
+from .distributed import distributed_1d
 
 def all_local(shard):
     for s in shard:
@@ -21,4 +22,4 @@ def einshard(shard, *xs, mesh = None):
     if local_contraction(shard):
         return einsum(shard, *xs)
 
-    return NotImplemented
+    return distributed_1d(shard, *xs, mesh = mesh)

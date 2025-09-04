@@ -1,6 +1,6 @@
 class Axis:
     name: str
-    shard_dim: str
+    shard_dim: str     # TODO: should this be a list?
 
     def __init__(self, name: str, shard_dim: str = '') -> None:
         self.name = name
