@@ -28,3 +28,9 @@ class Axis:
 class Axes(list[Axis]):
     def __repr__(self):
         return " × ".join(str(x) for x in self)
+
+    def local(self):
+        for x in self:
+            if not x.local():
+                return False
+        return True

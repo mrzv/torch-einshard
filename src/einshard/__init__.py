@@ -1,18 +1,24 @@
 from .einsum import einsum
-from .grammar import sharding
+from .grammar import sharding, Axes
 
 def all_local(shard):
     for s in shard:
         if s is None: continue
-        for a in s:
-            if not a.local():
-                return False
+        if not s.local(): return False
     return True
 
-def einshard(shard, *xs):
+def local_contraction(shard):
+    if shard[1] is None:
+        # X -> Z
+        return Axes(set(shard[0]) - set(shard[2])).local()
+    else:
+        # X,Y -> Z
+        return Axes(set(shard[0]) & set(shard[1])).local()
+
+def einshard(shard, *xs, mesh = None):
     shard = sharding(shard).map()
 
-    if all_local(shard):
+    if local_contraction(shard):
         return einsum(shard, *xs)
 
     return NotImplemented
