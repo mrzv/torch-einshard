@@ -25,4 +25,6 @@ class Axis:
         return self.name == other.name and self.shard_dim == other.shard_dim
 
 # TODO: eventually add replication, so this won't be just a list
-type Sharding = list[Axis]
+class Axes(list[Axis]):
+    def __repr__(self):
+        return " × ".join(str(x) for x in self)

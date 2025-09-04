@@ -1,5 +1,5 @@
 from parsley import makeGrammar
-from .sharding import Axis
+from .sharding import Axis, Axes
 
 # TODO: add subscript-notation for parallelism and ellipsis
 # TODO: for now only two tensors
@@ -8,15 +8,9 @@ grammar = r"""
 
     id = <letterOrDigit+>
     sharded = id:a ws '/' ws id:p -> Axis(a,p)
-    axes = (ws (sharded | id:a -> Axis(a)))+
+    axes = (ws (sharded | id:a -> Axis(a)))+:axs -> Axes(axs)
 
     map = axes:a ws (',' axes:x ws -> x)?:aa '->' axes:o -> (a, aa, o)
 """
 
 sharding = makeGrammar(grammar, globals(), name = "Einshard")
-
-if __name__ == '__main__':
-    print(sharding('a b c').axes())
-    print(sharding('a b / dp c').axes())
-    print(sharding('a b / dp c, a c -> b/dp').map())
-    print(sharding('b c -> b/dp c').map())
