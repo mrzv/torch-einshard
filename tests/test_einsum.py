@@ -1,6 +1,6 @@
 import pytest
 import torch
-import einshard as es
+import torch_einshard as es
 
 def test_contract_permute():
     # contract + permute
