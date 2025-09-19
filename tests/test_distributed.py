@@ -31,16 +31,24 @@ def init():
 
     return (device,local_rank,world_rank,world_size)
 
+def factors(n):
+    return set(
+        factor for i in range(1, int(n**0.5) + 1) if n % i == 0
+        for factor in (i, n//i)
+    )
+
 def test_distributed_1d_2():
     device,local_rank,world_rank,world_size = init()
-    mesh = init_device_mesh(device, (2, world_size // 2), mesh_dim_names=("dp", "sp"))
 
-    # distributed
-    x = torch.randn(8,5)
-    y = torch.randn(5,10)
-    z = es.einshard('a/sp b/dp, b / dp c -> a/sp c', x, y, mesh = mesh)
+    for x in factors(world_size):
+        mesh = init_device_mesh(device, (x, world_size // x), mesh_dim_names=("dp", "sp"))
 
-    zz = torch.einsum('a b, b c -> a c', x, y)
-    es.helpers.all_reduce(zz, mesh['dp'].get_group())
-    assert torch.norm(z - zz) == 0.
-    print(world_rank, x.shape,y.shape,z.shape)
+        # distributed
+        x = torch.randn(8,5)
+        y = torch.randn(5,10)
+        z = es.einshard('a/sp b/dp, b / dp c -> a/sp c', x, y, mesh = mesh)
+
+        zz = torch.einsum('a b, b c -> a c', x, y)
+        es.helpers.all_reduce(zz, mesh['dp'].get_group())
+        assert torch.norm(z - zz) == 0.
+        print(world_rank, x.shape,y.shape,z.shape)
