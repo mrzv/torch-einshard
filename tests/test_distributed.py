@@ -19,7 +19,8 @@ def init():
         return (device,local_rank,world_rank,world_size)
     initialized = True
 
-    local_rank, world_rank, world_size = es.helpers.init_process_group('gloo', use_cuda = use_cuda)
+    backend = 'nccl' if use_cuda else 'gloo'
+    local_rank, world_rank, world_size = es.helpers.init_process_group(backend, use_cuda = use_cuda)
 
     if use_cuda:
         device = f"cuda:{local_rank}"
