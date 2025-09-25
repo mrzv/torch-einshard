@@ -34,3 +34,6 @@ class Axes(list[Axis]):
             if not x.local():
                 return False
         return True
+
+    def all_shard_dims(self):
+        return [x.shard_dim for x in self if x.shard_dim]
