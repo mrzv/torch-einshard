@@ -1,6 +1,7 @@
 #!/usr/bin/env -S uv run
 
 import pytest
+from icecream import ic
 
 import torch
 import torch.distributed as dist
@@ -40,16 +41,52 @@ def factors(n):
 
 def test_distributed_1d_2():
     device,local_rank,world_rank,world_size = init()
+    # output only on rank=0
+    if world_rank != 0:
+        ic.disable()
 
     for x in factors(world_size):
         mesh = init_device_mesh(device, (x, world_size // x), mesh_dim_names=("dp", "sp"))
 
         # distributed
-        x = torch.randn(8,5)
-        y = torch.randn(5,10)
+        x = torch.randn(8,5, requires_grad = True)
+        y = torch.randn(5,10, requires_grad = True)
         z = es.einshard('a/sp b/dp, b / dp c -> a/sp c', x, y, mesh = mesh)
 
-        zz = torch.einsum('a b, b c -> a c', x, y)
+        loss = z.norm()
+        ic(loss)
+        loss.backward()
+
+        # compute locally and manually all_reduce
+        zz = es.einshard('al bl, bl c -> al c', x, y)
         es.helpers.all_reduce(zz, mesh['dp'].get_group())
-        assert torch.norm(z - zz) == 0.
+        ic(torch.norm(z - zz))
+        assert torch.allclose(z, zz)
         print(world_rank, x.shape,y.shape,z.shape)
+
+        # Gather x and y (across dp)
+        xx = x.detach().clone().requires_grad_(True)
+        x_all = es.einshard('a/sp b/dp -> a/sp b', xx,    mesh = mesh)
+        x_all.retain_grad()
+
+        yy = y.detach().clone().requires_grad_(True)
+        y_all = es.einshard('b/dp c -> b c', yy, mesh = mesh)
+
+        # Multiply the matrix locally
+        z_all = es.einshard('a/sp b, b c -> a/sp c', x_all, y_all)
+        loss_all = z_all.norm()
+        ic(torch.norm(z - z_all))
+        assert torch.allclose(z, z_all)
+        loss_all.backward()
+        ic((x.grad - xx.grad).norm())
+        assert torch.allclose(x.grad, xx.grad)
+
+        # Split the grads and compare
+        x_all_grad = x_all.grad.detach().clone()
+        ic(x_all_grad.shape)
+        x_all_grad = es.einshard('a/sp b    -> a/sp    b/dp', x_all_grad, mesh = mesh)
+        ic(x_all_grad.shape)
+
+        ic(x_all.shape, x_all_grad.shape)
+        ic((x.grad - x_all_grad).norm())
+        assert torch.allclose(x.grad, x_all_grad)

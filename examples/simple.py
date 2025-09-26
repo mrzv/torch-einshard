@@ -66,7 +66,7 @@ z_all = es.einshard('a/sp b, b c -> a/sp c', x_all, y_all)
 loss_all = z_all.norm()
 ic(loss_all)
 loss_all.backward()
-ic((x.grad - xx.grad).norm())
+ic((x.grad - xx.grad).norm(), torch.allclose(x.grad, xx.grad))
 
 # Split the grads and compare
 x_all_grad = x_all.grad.detach().clone()
@@ -75,4 +75,4 @@ x_all_grad = es.einshard('a/sp b    -> a/sp    b/dp', x_all_grad, mesh = mesh)
 ic(x_all_grad.shape)
 
 ic(x_all.shape, x_all_grad.shape)
-ic((x.grad - x_all_grad).norm())
+ic((x.grad - x_all_grad).norm(), torch.allclose(x.grad, x_all_grad))
