@@ -1,4 +1,4 @@
-from einshard.grammar import sharding
+from torch_einshard.grammar import sharding
 
 print(sharding('a b c').axes())
 print(sharding('a b / dp c').axes())
