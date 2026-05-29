@@ -78,6 +78,9 @@ def test_single_axis_distributed_roll_uneven_shards(dist_env, mesh_1d):
     expected = torch.split(torch.roll(full, shifts=-3, dims=0), shapes, dim=0)[rank]
     assert_close(z, expected)
 
+    z.sum().backward()
+    assert_close(x.grad, torch.ones_like(x))
+
 
 def test_multi_axis_distributed_roll(dist_env, mesh_2d):
     sp_group = mesh_2d["sp"].get_group()
@@ -121,3 +124,6 @@ def test_multi_axis_distributed_roll_uneven_shards(dist_env, mesh_2d):
     expected = torch.split(expected, shapes["sp"], dim=0)[sp_rank]
     expected = torch.split(expected, shapes["dp"], dim=1)[dp_rank]
     assert_close(z, expected)
+
+    z.sum().backward()
+    assert_close(x.grad, torch.ones_like(x))

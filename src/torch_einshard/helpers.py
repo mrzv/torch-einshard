@@ -171,26 +171,41 @@ def roll_shards(input, group, shard_shift):
     return output
 
 
-def roll_even_shards(input, group, dim, shift, shard_size):
+def roll_sharded(input, group, dim, shift, shapes):
     size = dist.get_world_size(group)
     rank = dist.get_rank(group)
-    total_size = size * shard_size
+    if shapes is None or len(shapes) != size:
+        return None
+
+    total_size = sum(shapes)
     shift = shift % total_size
     if size == 1:
         return torch.roll(input, shifts=shift, dims=dim)
     if shift == 0:
         return input
-    if input.shape[dim] != shard_size:
+    if input.shape[dim] != shapes[rank]:
         return None
+
+    offsets = [sum(shapes[:i]) for i in range(size)]
+    ends = [offsets[i] + shapes[i] for i in range(size)]
+
+    def rank_for(global_offset):
+        for i, end in enumerate(ends):
+            if global_offset < end:
+                return i
+        return size - 1
 
     def chunks_for(src_rank):
         chunks = []
+        src_size = shapes[src_rank]
         start = 0
-        while start < shard_size:
-            dest_global = (src_rank * shard_size + start + shift) % total_size
-            dest_rank = dest_global // shard_size
-            dest_offset = dest_global % shard_size
-            length = min(shard_size - start, shard_size - dest_offset)
+        while start < src_size:
+            dest_global = (offsets[src_rank] + start + shift) % total_size
+            dest_rank = rank_for(dest_global)
+            dest_offset = dest_global - offsets[dest_rank]
+            length = min(src_size - start, ends[dest_rank] - dest_global)
+            if length == 0:
+                break
             chunks.append((start, length, dest_rank, dest_offset))
             start += length
         return chunks

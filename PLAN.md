@@ -44,16 +44,6 @@ b h/sp1 w/sp2 c -> b h/sp2 w/sp1 c
 
 - Preserve the current gather-then-split behavior as a correctness fallback for uneven or unsupported cases.
 
-## Optimized Distributed Roll
-
-`einroll` currently implements correct semantics by gathering sharded axes, applying `torch.roll`, and splitting back. Rolls over evenly split axes use a point-to-point exchange path instead of materializing the full axis.
-
-Remaining optimization:
-
-- Extend optimized roll to uneven shard sizes if the metadata and communication schedule stay simple enough.
-- Preserve the existing `einroll` API and test behavior.
-- Decide whether multi-axis sharded rolls should optimize one axis at a time or use a combined exchange.
-
 ## Compound Groups
 
 SciGPT uses groups such as `sp1-sp2`, `tp-sp1-sp2`, and `dp-sp1-sp2`. Hyphenated names are accepted in sharding and `//` notation when they correspond to actual mesh-dimension names.

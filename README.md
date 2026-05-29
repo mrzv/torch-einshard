@@ -273,7 +273,7 @@ z = es.einroll(
 )
 ```
 
-Current `einroll` semantics are correctness-first: gather each sharded rolled axis, apply `torch.roll`, then split back. Uneven shard sizes are supported through `shapes`. Rolls over evenly split axes use direct rank exchange instead of gathering the full axis; uneven rolls still use gather/roll/split.
+Current `einroll` semantics are correctness-first. Sharded axes with explicit `shapes` use direct point-to-point slice exchange; axes without shape metadata fall back to gather, `torch.roll`, and split.
 
 ## Low-Level Autograd Mappings
 
@@ -380,7 +380,7 @@ Full distributed test suite:
 
 - The grammar supports at most two input tensors.
 - Partial notation represents sum reductions only.
-- Repartition and `einroll` still use correctness-first gather/split fallbacks for uneven, unsupported, or non-shard-aligned cases.
+- Repartition and `einroll` still use correctness-first gather/split fallbacks for unsupported cases or missing shape metadata.
 - Multi-axis repartition swaps between mesh dimensions are not implemented.
 - Partial reductions over multiple mesh dimensions are applied sequentially; compound mesh-group resolution is not yet implemented.
 - `src/torch_einshard/mesh.py` is incomplete; tests and examples use PyTorch `DeviceMesh`.
