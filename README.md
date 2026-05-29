@@ -22,6 +22,8 @@ This means:
 - axis `b` is sharded over mesh dimension `dp`
 - the contraction over `b/dp` produces a partial local result that is all-reduced over `dp`
 
+Mesh dimension names may include hyphens, for example `tp-sp`, if the supplied `DeviceMesh` uses that exact mesh-dimension name.
+
 Tensor-level partial values use `//`. A partial tensor has the full logical shape locally, but each rank only holds one contribution to the value. The contributions are sum-reduced over the named mesh dimension when converting back to a non-partial tensor:
 
 ```text

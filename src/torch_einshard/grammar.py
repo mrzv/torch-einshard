@@ -7,10 +7,11 @@ grammar = r"""
     ws = (' ' | '\r' | '\n' | '\t')*
 
     id = <letterOrDigit+>
-    sharded = id:a ws '/' ws id:p -> Axis(a,p)
+    mesh_id = <letterOrDigit+ ('-' letterOrDigit+)*>
+    sharded = id:a ws '/' ws mesh_id:p -> Axis(a,p)
     axes = (ws (sharded | id:a -> Axis(a)))+:axs -> Axes(axs)
-    partial_many = '(' ws id:first (ws ',' ws id)*:rest ws ')' -> [first] + rest
-    partial = ws '//' ws (partial_many | id:p -> [p])
+    partial_many = '(' ws mesh_id:first (ws ',' ws mesh_id)*:rest ws ')' -> [first] + rest
+    partial = ws '//' ws (partial_many | mesh_id:p -> [p])
     tensor = axes:a (partial:p -> p)?:p -> TensorSpec(a, p or [])
 
     map = tensor:a ws (',' tensor:x ws -> x)?:aa '->' tensor:o -> (a, aa, o)

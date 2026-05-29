@@ -76,7 +76,7 @@ Remaining optimization:
 
 ## Compound Groups
 
-SciGPT uses groups such as `sp1-sp2`, `tp-sp1-sp2`, and `dp-sp1-sp2`.
+SciGPT uses groups such as `sp1-sp2`, `tp-sp1-sp2`, and `dp-sp1-sp2`. Hyphenated names are accepted in sharding and `//` notation when they correspond to actual mesh-dimension names.
 
 Axis-wise notation can already describe many operations over separate dimensions:
 
@@ -86,7 +86,7 @@ b h/sp1 w/sp2 c -> b h w c
 
 Remaining work:
 
-- Decide how compound group names should be represented in notation.
+- Decide whether hyphenated names should also be resolved automatically as compound groups built from multiple mesh dimensions.
 - Optimize scalar reductions over compound groups instead of reducing listed partial dimensions sequentially.
 - Add tests for compound-group reductions and checkpoint-style shard metadata if needed.
 - Decide whether `// (sp1,sp2)` remains the user-facing compound syntax or whether named compound groups should also be accepted.
