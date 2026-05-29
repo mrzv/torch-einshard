@@ -8,6 +8,7 @@ import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
 
 import torch_einshard as es
+from torch_einshard.mappings import identity_forward_allreduce_backward
 
 use_cuda = False     # TODO: make a command-line argument
 initialized = False
@@ -118,3 +119,18 @@ def test_distributed_1d_1_multi_axis_split_gather():
         loss = (z ** 2).sum()
         loss.backward()
         assert torch.allclose(x.grad, 2 * x)
+
+def test_identity_forward_allreduce_backward():
+    device,local_rank,world_rank,world_size = init()
+    mesh = init_device_mesh(device, (world_size,), mesh_dim_names=("dp",))
+
+    x = torch.randn(4,5, requires_grad = True)
+    z = identity_forward_allreduce_backward(x, mesh["dp"].get_group())
+
+    assert torch.allclose(z, x)
+
+    loss = z.sum()
+    loss.backward()
+
+    expected = torch.ones_like(x) * world_size
+    assert torch.allclose(x.grad, expected)

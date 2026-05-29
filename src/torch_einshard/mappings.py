@@ -12,6 +12,18 @@ class _AllReduceForwardIdentityBackward(torch.autograd.Function):
     def backward(ctx, grad_output):
         return grad_output, None
 
+class _IdentityForwardAllReduceBackward(torch.autograd.Function):
+    """Identity in forward, AllReduce in backward"""
+
+    @staticmethod
+    def forward(ctx, input, comm):
+        ctx.comm = comm
+        return input
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return all_reduce(grad_output, group = ctx.comm), None
+
 class _AllGatherForwardSplitBackward(torch.autograd.Function):
     """AllGather in forward and Split in backward"""
 
@@ -43,6 +55,9 @@ class _SplitForwardAllGatherBackward(torch.autograd.Function):
 
 def allreduce_forward_identity_backward(input, comm):
     return _AllReduceForwardIdentityBackward.apply(input, comm)
+
+def identity_forward_allreduce_backward(input, comm):
+    return _IdentityForwardAllReduceBackward.apply(input, comm)
 
 def allgather_forward_split_backward(input, comm, dim, shapes):
     return _AllGatherForwardSplitBackward.apply(input, comm, dim, shapes)
