@@ -42,7 +42,7 @@ Remaining optimization:
 b h/sp1 w/sp2 c -> b h/sp2 w/sp1 c
 ```
 
-- Preserve the current gather-then-split behavior as a correctness fallback for uneven or unsupported cases.
+- Preserve the current gather-then-split behavior as a correctness fallback for uneven or unsupported cases, with warnings when the fallback may be expensive.
 
 ## Compound Groups
 

@@ -1,3 +1,4 @@
+import pytest
 import torch
 import torch.distributed as dist
 
@@ -149,12 +150,13 @@ def test_repartition_between_mesh_dimensions(dist_env, mesh_2d):
     full = torch.randn(rows, 3, requires_grad=True)
     x = torch.split(full.detach(), dp_shapes, dim=0)[dp_rank].clone().requires_grad_(True)
 
-    z = es.einshard(
-        "a/dp b -> a/sp b",
-        x,
-        mesh=mesh_2d,
-        shapes={"dp": {"a": dp_shapes}, "sp": {"a": sp_shapes}},
-    )
+    with pytest.warns(RuntimeWarning, match="gather/split fallback"):
+        z = es.einshard(
+            "a/dp b -> a/sp b",
+            x,
+            mesh=mesh_2d,
+            shapes={"dp": {"a": dp_shapes}, "sp": {"a": sp_shapes}},
+        )
 
     expected = torch.split(full.detach(), sp_shapes, dim=0)[sp_rank]
     assert_close(z, expected)

@@ -1,3 +1,5 @@
+import warnings
+
 from .einsum import einsum
 from .mappings import allreduce_forward_identity_backward, \
                        split_forward_allgather_backward, \
@@ -108,6 +110,22 @@ def distributed_1d_1(shard, x, mesh, shapes = None):
     def dim_of(axis_name):
         return next(i for i, axis in enumerate(current) if axis.name == axis_name)
 
+    def has_repartition_change():
+        gathered = 0
+        split = 0
+        changed_between_mesh_dims = False
+        for out_axis in output_axes:
+            in_axis = in_by_name[out_axis.name]
+            if in_axis.shard_dim == out_axis.shard_dim:
+                continue
+            if in_axis.shard_dim and out_axis.shard_dim:
+                changed_between_mesh_dims = True
+            elif in_axis.shard_dim:
+                gathered += 1
+            elif out_axis.shard_dim:
+                split += 1
+        return changed_between_mesh_dims or (gathered > 0 and split > 0)
+
     def try_same_mesh_repartition():
         if output_partials or [axis.name for axis in input_axes] != [axis.name for axis in output_axes]:
             return None
@@ -171,6 +189,14 @@ def distributed_1d_1(shard, x, mesh, shapes = None):
         current = list(output_axes)
         if [axis.name for axis in current] == [axis.name for axis in output_axes]:
             return z
+
+    if has_repartition_change():
+        warnings.warn(
+            "Using gather/split fallback for distributed repartition; this may materialize a larger tensor. "
+            "The optimized path currently requires same-mesh axis-to-axis repartition with explicit split metadata.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
 
     for out_axis in output_axes:
         in_axis = in_by_name[out_axis.name]

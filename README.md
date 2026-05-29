@@ -139,7 +139,7 @@ z = es.einshard(
 )
 ```
 
-Current repartition semantics are correctness-first: gather the source sharded axis, then split the destination axis. Same-mesh axis-to-axis repartition uses a point-to-point all-to-all-style exchange when split metadata is available, and falls back to gather/split otherwise.
+Current repartition semantics are correctness-first: gather the source sharded axis, then split the destination axis. Same-mesh axis-to-axis repartition uses a point-to-point all-to-all-style exchange when split metadata is available, and falls back to gather/split otherwise. Performance-sensitive repartition fallbacks emit `RuntimeWarning`.
 
 Partial-to-full all-reduce:
 
@@ -273,7 +273,7 @@ z = es.einroll(
 )
 ```
 
-Current `einroll` semantics are correctness-first. Sharded axes with explicit `shapes` use direct point-to-point slice exchange; axes without shape metadata fall back to gather, `torch.roll`, and split.
+Current `einroll` semantics are correctness-first. Sharded axes with explicit `shapes` use direct point-to-point slice exchange; axes without shape metadata fall back to gather, `torch.roll`, and split with a `RuntimeWarning`.
 
 ## Low-Level Autograd Mappings
 
@@ -380,7 +380,7 @@ Full distributed test suite:
 
 - The grammar supports at most two input tensors.
 - Partial notation represents sum reductions only.
-- Repartition and `einroll` still use correctness-first gather/split fallbacks for unsupported cases or missing shape metadata.
+- Repartition and `einroll` still use correctness-first gather/split fallbacks for unsupported cases or missing shape metadata; performance-sensitive fallbacks emit `RuntimeWarning`.
 - Multi-axis repartition swaps between mesh dimensions are not implemented.
 - Partial reductions over multiple mesh dimensions are applied sequentially; compound mesh-group resolution is not yet implemented.
 - `src/torch_einshard/mesh.py` is incomplete; tests and examples use PyTorch `DeviceMesh`.

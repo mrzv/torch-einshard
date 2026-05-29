@@ -1,4 +1,5 @@
 import torch
+import warnings
 
 from .grammar import parse_sharding
 from .helpers import resolve_split_shapes
@@ -25,6 +26,12 @@ def einroll(shard, x, shifts, *, mesh=None, shapes=None):
             z = roll_sharded_forward_backward(z, group, dim, shift, split_shapes)
             continue
 
+        warnings.warn(
+            f"Using gather/roll/split fallback for sharded roll axis {axis.name!r}; "
+            "provide shapes to enable direct slice exchange.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
         z = allgather_forward_split_backward(z, group, dim, split_shapes)
         z = torch.roll(z, shifts=shift, dims=dim)
         z = split_forward_allgather_backward(z, group, dim, split_shapes)
