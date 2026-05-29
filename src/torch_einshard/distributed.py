@@ -49,6 +49,15 @@ def distributed_1d_1(shard, x, mesh, shapes = None):
 
     z = x
     current = list(shard[0])
+
+    def shapes_for(shard_dim, axis_name):
+        if not isinstance(shapes, dict):
+            return shapes
+        split_shapes = shapes.get(shard_dim)
+        if isinstance(split_shapes, dict):
+            return split_shapes.get(axis_name)
+        return split_shapes
+
     for out_axis in shard[2]:
         in_axis = in_by_name[out_axis.name]
         if in_axis.shard_dim == out_axis.shard_dim:
@@ -57,7 +66,7 @@ def distributed_1d_1(shard, x, mesh, shapes = None):
 
         shard_dim = in_axis.shard_dim or out_axis.shard_dim
         dim = next(i for i, axis in enumerate(current) if axis.name == out_axis.name)
-        split_shapes = shapes.get(shard_dim) if isinstance(shapes, dict) else shapes
+        split_shapes = shapes_for(shard_dim, out_axis.name)
 
         if in_axis.local():
             # P * X ... -> X/P ...

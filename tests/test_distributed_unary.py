@@ -58,3 +58,26 @@ def test_split_with_output_permutation(dist_env, mesh_1d):
 
     expected = torch.split(x.detach(), shapes, dim=1)[rank].transpose(0, 1).contiguous()
     assert_close(z, expected)
+
+
+def test_repartition_between_axes(dist_env, mesh_1d):
+    group = mesh_1d["dp"].get_group()
+    rank = dist.get_rank(group)
+    world_size = dist.get_world_size(group)
+    rows = world_size * 2
+    cols = world_size * 3
+    row_shapes = es.helpers.compute_split_shapes(rows, world_size)
+    col_shapes = es.helpers.compute_split_shapes(cols, world_size)
+
+    full = torch.randn(rows, cols, requires_grad=True)
+    x = torch.split(full.detach(), row_shapes, dim=0)[rank].clone().requires_grad_(True)
+
+    z = es.einshard(
+        "a/dp b -> a b/dp",
+        x,
+        mesh=mesh_1d,
+        shapes={"dp": {"a": row_shapes, "b": col_shapes}},
+    )
+
+    expected = torch.split(full.detach(), col_shapes, dim=1)[rank]
+    assert_close(z, expected)
