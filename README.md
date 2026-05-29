@@ -156,7 +156,7 @@ Partial notation currently represents sum reductions only.
 
 ## Supported Distributed Binary Patterns
 
-Binary distributed contractions support one sharded contracted axis. The local contraction is computed first and then all-reduced over the contracted shard dimension.
+Binary distributed contractions support one or more sharded contracted axes. The local contraction is computed first and then all-reduced over each contracted shard dimension.
 
 Generic form:
 
@@ -171,6 +171,12 @@ z = es.einshard("a/sp b/dp, b/dp c -> a/sp c", x, y, mesh=mesh)
 ```
 
 This contracts `b/dp` and all-reduces the output over `dp`.
+
+Multiple sharded contracted axes are reduced sequentially:
+
+```python
+z = es.einshard("a/dp b/sp c, a/dp b/sp d -> c d", x, y, mesh=mesh)
+```
 
 The partial output can also be requested explicitly:
 
@@ -294,7 +300,7 @@ Remaining work is tracked in `PLAN.md`. The main open areas are:
 - Optional notation for autograd-only communication.
 - Optimized all-to-all repartition instead of gather-then-split where possible.
 - Optimized sharded `einroll` using neighbor exchange or all-to-all.
-- General multi-dimensional distributed contractions.
+- Broader binary layouts with shared sharded non-contracted axes.
 - Compound mesh groups instead of sequential reductions over listed partial dimensions.
 - A decision on parameter metadata APIs and the incomplete `mesh.py` module.
 
@@ -349,8 +355,8 @@ Full distributed test suite:
 ## Current Limitations
 
 - The grammar supports at most two input tensors.
-- General multi-dimensional distributed contractions are not implemented.
 - Partial notation represents sum reductions only.
+- Binary distributed operations do not yet support shared sharded non-contracted axes.
 - Autograd-only communication is available as low-level mappings, not as notation.
 - Repartition and `einroll` use correctness-first gather/split implementations rather than optimized all-to-all or neighbor exchange.
 - Partial reductions over multiple mesh dimensions are applied sequentially; compound mesh-group resolution is not yet implemented.

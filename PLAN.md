@@ -2,7 +2,7 @@
 
 This document tracks remaining distributed-pattern work inspired by `../MachineLearning/SciGPT/scaling-transformers-physical-sciences`.
 
-Implemented coverage includes local einsum-style operations, multi-axis unary split/gather, tensor-parallel linear contraction patterns, low-level identity/all-reduce and reduce-scatter autograd mappings, `//` partial-value notation, gather-then-split repartition semantics, and `einroll` with correctness-first gather/roll/split behavior.
+Implemented coverage includes local einsum-style operations, multi-axis unary split/gather, tensor-parallel linear contraction patterns, distributed contractions over one or more sharded contracted axes, low-level identity/all-reduce and reduce-scatter autograd mappings, `//` partial-value notation, gather-then-split repartition semantics, and `einroll` with correctness-first gather/roll/split behavior.
 
 The remaining work is mostly about broadening notation expressiveness, reducing communication overhead, and deciding whether higher-level model/parameter metadata belongs in this package.
 
@@ -74,16 +74,21 @@ Remaining optimization:
 - Add uneven-shard tests once backend support is explicit.
 - Decide whether multi-axis sharded rolls should optimize one axis at a time or use a combined exchange.
 
-## Broader Distributed Contractions
+## Broader Binary Layouts
 
-Distributed binary contractions currently support one sharded contracted axis. That covers common tensor-parallel row-parallel linear patterns, but not general multi-dimensional distributed contractions.
+Binary distributed contractions now support one or more sharded contracted axes. Shared sharded axes that are present in both inputs and the output are not yet handled as distributed batch axes.
+
+Example unsupported pattern:
+
+```text
+b/dp a c, b/dp c d -> b/dp a d
+```
 
 Remaining work:
 
-- Define semantics for contractions with multiple sharded contracted axes.
-- Define whether multiple reductions should use sequential all-reduces, compound groups, or a planned communication schedule.
-- Add tests for multi-dimensional contraction outputs, including explicit `//` partial outputs.
-- Keep unsupported cases failing clearly until semantics are implemented.
+- Define semantics for shared sharded non-contracted axes across both inputs.
+- Add validation that distinguishes unsupported shared batch axes from contracted reductions.
+- Add tests for distributed batched matmul-style patterns once semantics are implemented.
 
 ## Compound Groups
 

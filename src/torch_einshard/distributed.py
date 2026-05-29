@@ -36,23 +36,32 @@ def distributed_1d(shard, *xs, mesh, shapes):
 def distributed_1d_2(shard, x, y, mesh):
     # TODO: check the dimensions match sharding
 
-    intersection = set(_axes(shard[0])) & set(_axes(shard[1]))
-    # TODO: this will not catch different sharding for the same dimension,
-    #       in case we want to support that
-    assert len(intersection) == 1, f"Only 1D contraction is supported, but intersection = {intersection}"
-    common = intersection.pop()
+    input0_by_name = {axis.name: axis for axis in _axes(shard[0])}
+    input1_by_name = {axis.name: axis for axis in _axes(shard[1])}
+    output_names = {axis.name for axis in _axes(shard[2])}
+    contracted_names = [
+        axis.name for axis in _axes(shard[0])
+        if axis.name in input1_by_name and axis.name not in output_names
+    ]
+    assert contracted_names, "Expected a contraction axis"
 
-    assert not common.local(), "Expected distributed contraction, but got local"
-    # TODO: assert that shard[2] is replicated over common.shard_dim
+    reduction_dims = []
+    for name in contracted_names:
+        axis = input0_by_name[name]
+        assert axis == input1_by_name[name], "Contracted axes must use matching sharding"
+        if axis.local() or axis.shard_dim in reduction_dims:
+            continue
+        reduction_dims.append(axis.shard_dim)
 
-    # ... X/P, ... X/P -> P * ...
+    assert reduction_dims, "Expected distributed contraction, but got local"
     z = einsum(shard, x, y)    # perform the local operation
 
-    if common.shard_dim in _partials(shard[2]):
-        return z
+    for shard_dim in reduction_dims:
+        if shard_dim in _partials(shard[2]):
+            continue
+        z = allreduce_forward_identity_backward(z, comm = mesh[shard_dim].get_group())
 
-    # all_reduce z over p
-    return allreduce_forward_identity_backward(z, comm = mesh[common.shard_dim].get_group())
+    return z
 
 def distributed_1d_1(shard, x, mesh, shapes = None):
     input_spec = shard[0]

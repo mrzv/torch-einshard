@@ -91,3 +91,45 @@ def test_row_parallel_linear_explicit_partial_output(dist_env, mesh_tp):
 
     expected = torch.einsum("bnc,hc->bnh", x_shard, weight_shard)
     assert_close(z, expected)
+
+
+def test_multi_axis_sharded_contraction(dist_env, mesh_2d):
+    dp_group = mesh_2d["dp"].get_group()
+    sp_group = mesh_2d["sp"].get_group()
+    dp_rank = dist.get_rank(dp_group)
+    sp_rank = dist.get_rank(sp_group)
+    dp_size = dist.get_world_size(dp_group)
+    sp_size = dist.get_world_size(sp_group)
+    rows = dp_size * 2
+    cols = sp_size * 3
+
+    x = torch.randn(rows, cols, 5)
+    y = torch.randn(rows, cols, 7)
+    x_shard = torch.split(torch.split(x, rows // dp_size, dim=0)[dp_rank], cols // sp_size, dim=1)[sp_rank]
+    y_shard = torch.split(torch.split(y, rows // dp_size, dim=0)[dp_rank], cols // sp_size, dim=1)[sp_rank]
+
+    z = es.einshard("a/dp b/sp c, a/dp b/sp d -> c d", x_shard, y_shard, mesh=mesh_2d)
+
+    expected = torch.einsum("abc,abd->cd", x, y)
+    assert_close(z, expected)
+
+
+def test_multi_axis_sharded_contraction_explicit_partial_output(dist_env, mesh_2d):
+    dp_group = mesh_2d["dp"].get_group()
+    sp_group = mesh_2d["sp"].get_group()
+    dp_rank = dist.get_rank(dp_group)
+    sp_rank = dist.get_rank(sp_group)
+    dp_size = dist.get_world_size(dp_group)
+    sp_size = dist.get_world_size(sp_group)
+    rows = dp_size * 2
+    cols = sp_size * 3
+
+    x = torch.randn(rows, cols, 5)
+    y = torch.randn(rows, cols, 7)
+    x_shard = torch.split(torch.split(x, rows // dp_size, dim=0)[dp_rank], cols // sp_size, dim=1)[sp_rank]
+    y_shard = torch.split(torch.split(y, rows // dp_size, dim=0)[dp_rank], cols // sp_size, dim=1)[sp_rank]
+
+    z = es.einshard("a/dp b/sp c, a/dp b/sp d -> c d // (dp,sp)", x_shard, y_shard, mesh=mesh_2d)
+
+    expected = torch.einsum("abc,abd->cd", x_shard, y_shard)
+    assert_close(z, expected)
