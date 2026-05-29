@@ -74,22 +74,6 @@ Remaining optimization:
 - Add uneven-shard tests once backend support is explicit.
 - Decide whether multi-axis sharded rolls should optimize one axis at a time or use a combined exchange.
 
-## Broader Binary Layouts
-
-Binary distributed contractions now support one or more sharded contracted axes. Shared sharded axes that are present in both inputs and the output are not yet handled as distributed batch axes.
-
-Example unsupported pattern:
-
-```text
-b/dp a c, b/dp c d -> b/dp a d
-```
-
-Remaining work:
-
-- Define semantics for shared sharded non-contracted axes across both inputs.
-- Add validation that distinguishes unsupported shared batch axes from contracted reductions.
-- Add tests for distributed batched matmul-style patterns once semantics are implemented.
-
 ## Compound Groups
 
 SciGPT uses groups such as `sp1-sp2`, `tp-sp1-sp2`, and `dp-sp1-sp2`.

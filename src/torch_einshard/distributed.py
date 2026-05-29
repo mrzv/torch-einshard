@@ -38,12 +38,23 @@ def distributed_1d_2(shard, x, y, mesh):
 
     input0_by_name = {axis.name: axis for axis in _axes(shard[0])}
     input1_by_name = {axis.name: axis for axis in _axes(shard[1])}
+    output_by_name = {axis.name: axis for axis in _axes(shard[2])}
     output_names = {axis.name for axis in _axes(shard[2])}
     contracted_names = [
         axis.name for axis in _axes(shard[0])
         if axis.name in input1_by_name and axis.name not in output_names
     ]
     assert contracted_names, "Expected a contraction axis"
+
+    shared_output_names = [
+        axis.name for axis in _axes(shard[0])
+        if axis.name in input1_by_name and axis.name in output_names
+    ]
+
+    for name in shared_output_names:
+        axis = input0_by_name[name]
+        assert axis == input1_by_name[name], "Shared axes must use matching sharding"
+        assert axis == output_by_name[name], "Output shared axes must preserve input sharding"
 
     reduction_dims = []
     for name in contracted_names:
@@ -53,7 +64,6 @@ def distributed_1d_2(shard, x, y, mesh):
             continue
         reduction_dims.append(axis.shard_dim)
 
-    assert reduction_dims, "Expected distributed contraction, but got local"
     z = einsum(shard, x, y)    # perform the local operation
 
     for shard_dim in reduction_dims:

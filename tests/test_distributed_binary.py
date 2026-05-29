@@ -133,3 +133,41 @@ def test_multi_axis_sharded_contraction_explicit_partial_output(dist_env, mesh_2
 
     expected = torch.einsum("abc,abd->cd", x_shard, y_shard)
     assert_close(z, expected)
+
+
+def test_shared_sharded_batch_axis(dist_env, mesh_2d):
+    dp_group = mesh_2d["dp"].get_group()
+    dp_rank = dist.get_rank(dp_group)
+    dp_size = dist.get_world_size(dp_group)
+    batch = dp_size * 2
+
+    x = torch.randn(batch, 3, 5)
+    y = torch.randn(batch, 5, 7)
+    x_shard = torch.split(x, batch // dp_size, dim=0)[dp_rank].contiguous()
+    y_shard = torch.split(y, batch // dp_size, dim=0)[dp_rank].contiguous()
+
+    z = es.einshard("b/dp a c, b/dp c d -> b/dp a d", x_shard, y_shard, mesh=mesh_2d)
+
+    expected = torch.split(torch.einsum("bac,bcd->bad", x, y), batch // dp_size, dim=0)[dp_rank]
+    assert_close(z, expected)
+
+
+def test_shared_sharded_batch_axis_with_sharded_contraction(dist_env, mesh_2d):
+    dp_group = mesh_2d["dp"].get_group()
+    sp_group = mesh_2d["sp"].get_group()
+    dp_rank = dist.get_rank(dp_group)
+    sp_rank = dist.get_rank(sp_group)
+    dp_size = dist.get_world_size(dp_group)
+    sp_size = dist.get_world_size(sp_group)
+    batch = dp_size * 2
+    channels = sp_size * 3
+
+    x = torch.randn(batch, 4, channels)
+    y = torch.randn(batch, channels, 6)
+    x_shard = torch.split(torch.split(x, batch // dp_size, dim=0)[dp_rank], channels // sp_size, dim=2)[sp_rank]
+    y_shard = torch.split(torch.split(y, batch // dp_size, dim=0)[dp_rank], channels // sp_size, dim=1)[sp_rank]
+
+    z = es.einshard("b/dp a c/sp, b/dp c/sp d -> b/dp a d", x_shard, y_shard, mesh=mesh_2d)
+
+    expected = torch.split(torch.einsum("bac,bcd->bad", x, y), batch // dp_size, dim=0)[dp_rank]
+    assert_close(z, expected)

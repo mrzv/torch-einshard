@@ -178,6 +178,12 @@ Multiple sharded contracted axes are reduced sequentially:
 z = es.einshard("a/dp b/sp c, a/dp b/sp d -> c d", x, y, mesh=mesh)
 ```
 
+Shared sharded axes can also appear in both inputs and the output, which covers distributed batched matmul-style layouts:
+
+```python
+z = es.einshard("b/dp a c, b/dp c d -> b/dp a d", x, y, mesh=mesh)
+```
+
 The partial output can also be requested explicitly:
 
 ```python
@@ -300,7 +306,6 @@ Remaining work is tracked in `PLAN.md`. The main open areas are:
 - Optional notation for autograd-only communication.
 - Optimized all-to-all repartition instead of gather-then-split where possible.
 - Optimized sharded `einroll` using neighbor exchange or all-to-all.
-- Broader binary layouts with shared sharded non-contracted axes.
 - Compound mesh groups instead of sequential reductions over listed partial dimensions.
 - A decision on parameter metadata APIs and the incomplete `mesh.py` module.
 
@@ -356,7 +361,6 @@ Full distributed test suite:
 
 - The grammar supports at most two input tensors.
 - Partial notation represents sum reductions only.
-- Binary distributed operations do not yet support shared sharded non-contracted axes.
 - Autograd-only communication is available as low-level mappings, not as notation.
 - Repartition and `einroll` use correctness-first gather/split implementations rather than optimized all-to-all or neighbor exchange.
 - Partial reductions over multiple mesh dimensions are applied sequentially; compound mesh-group resolution is not yet implemented.
