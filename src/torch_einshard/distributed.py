@@ -43,23 +43,30 @@ def distributed_1d_1(shard, x, mesh, shapes = None):
     assert len(shard[0]) == len(shard[2]), "Input and output dimensions must match in the equation"
     assert len(shard[0]) == x.dim(), "Input dimensions must match those in the equation"
 
-    in_dims_list = shard[0].all_shard_dims()
-    out_dims_list = shard[2].all_shard_dims()
-    in_dims = set(in_dims_list)
-    out_dims = set(out_dims_list)
-    assert len(in_dims ^ out_dims) == 1, "Can only split/gather over a single dimension"
-    shard_dim = (in_dims ^ out_dims).pop()
+    in_by_name = {axis.name: axis for axis in shard[0]}
+    out_by_name = {axis.name: axis for axis in shard[2]}
+    assert in_by_name.keys() == out_by_name.keys(), "Input and output axes must match"
 
-    if in_dims < out_dims:
-        # P * X ... -> X/P ...
-        dim = out_dims_list.index(shard_dim)
-        z = split_forward_allgather_backward(x, mesh[shard_dim].get_group(), dim, shapes)
-    elif in_dims > out_dims:
-        # X/P ... -> P * X ...
-        dim = in_dims_list.index(shard_dim)
-        z = allgather_forward_split_backward(x, mesh[shard_dim].get_group(), dim, shapes)
-    else:
-        assert False, "Cannot simultaneously gather and split"
+    z = x
+    current = list(shard[0])
+    for out_axis in shard[2]:
+        in_axis = in_by_name[out_axis.name]
+        if in_axis.shard_dim == out_axis.shard_dim:
+            continue
+        assert in_axis.local() or out_axis.local(), "Cannot repartition between shard dimensions yet"
+
+        shard_dim = in_axis.shard_dim or out_axis.shard_dim
+        dim = next(i for i, axis in enumerate(current) if axis.name == out_axis.name)
+        split_shapes = shapes.get(shard_dim) if isinstance(shapes, dict) else shapes
+
+        if in_axis.local():
+            # P * X ... -> X/P ...
+            z = split_forward_allgather_backward(z, mesh[shard_dim].get_group(), dim, split_shapes)
+        else:
+            # X/P ... -> P * X ...
+            z = allgather_forward_split_backward(z, mesh[shard_dim].get_group(), dim, split_shapes)
+
+        current[dim] = out_axis
 
     # permute if necessary
     return einsum(shard, z, name_only=True)

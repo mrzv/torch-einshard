@@ -90,3 +90,31 @@ def test_distributed_1d_2():
         ic(x_all.shape, x_all_grad.shape)
         ic((x.grad - x_all_grad).norm())
         assert torch.allclose(x.grad, x_all_grad)
+
+def test_distributed_1d_1_multi_axis_split_gather():
+    device,local_rank,world_rank,world_size = init()
+    # output only on rank=0
+    if world_rank != 0:
+        ic.disable()
+
+    for mesh_rows in factors(world_size):
+        mesh = init_device_mesh(device, (mesh_rows, world_size // mesh_rows), mesh_dim_names=("dp", "sp"))
+
+        x = torch.randn(16,24, requires_grad = True)
+        shapes = {
+            "sp": es.helpers.compute_split_shapes(x.shape[0], dist.get_world_size(mesh["sp"].get_group())),
+            "dp": es.helpers.compute_split_shapes(x.shape[1], dist.get_world_size(mesh["dp"].get_group())),
+        }
+
+        z = es.einshard('a b -> a/sp b/dp', x, mesh = mesh, shapes = shapes)
+        assert z.shape == (
+            shapes["sp"][dist.get_rank(mesh["sp"].get_group())],
+            shapes["dp"][dist.get_rank(mesh["dp"].get_group())],
+        )
+
+        zz = es.einshard('a/sp b/dp -> a b', z, mesh = mesh, shapes = shapes)
+        assert torch.allclose(x, zz)
+
+        loss = (z ** 2).sum()
+        loss.backward()
+        assert torch.allclose(x.grad, 2 * x)
