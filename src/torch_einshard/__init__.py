@@ -1,6 +1,7 @@
 from .einsum import einsum
 from .grammar import sharding, Axes
 from .distributed import distributed_1d
+from .roll import einroll
 
 def all_local(shard):
     for s in shard:
