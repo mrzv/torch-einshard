@@ -85,6 +85,11 @@ def all_gather(input, group, dim, shapes):
 
     return output
 
+def reduce_scatter(input, group, dim, shapes):
+    """Reduce the tensor across ranks, then split the result along dim."""
+    reduced = all_reduce(input, group)
+    return split(reduced, group, dim, shapes)
+
 # helper routine to compute uneven splitting in balanced way:
 def compute_split_shapes(size, num_chunks):
     if num_chunks == 1:
@@ -102,4 +107,3 @@ def compute_split_shapes(size, num_chunks):
     sections = [chunk_size for _ in range(num_chunks - 1)] + [last_chunk_size]
 
     return sections
-

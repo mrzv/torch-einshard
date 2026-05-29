@@ -1,5 +1,5 @@
 import torch
-from .helpers import all_reduce, all_gather, split
+from .helpers import all_reduce, all_gather, reduce_scatter, split
 
 class _AllReduceForwardIdentityBackward(torch.autograd.Function):
     """AllReduce in forward, Identity in backward"""
@@ -53,6 +53,34 @@ class _SplitForwardAllGatherBackward(torch.autograd.Function):
     def backward(ctx, grad_output):
         return all_gather(grad_output, ctx.comm, ctx.dim, ctx.shapes), None, None, None
 
+class _ReduceScatterForwardAllGatherBackward(torch.autograd.Function):
+    """ReduceScatter in forward, AllGather in backward"""
+
+    @staticmethod
+    def forward(ctx, input, comm, dim, shapes):
+        ctx.comm = comm
+        ctx.dim = dim
+        ctx.shapes = shapes
+        return reduce_scatter(input, comm, dim, shapes)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return all_gather(grad_output, ctx.comm, ctx.dim, ctx.shapes), None, None, None
+
+class _AllGatherForwardReduceScatterBackward(torch.autograd.Function):
+    """AllGather in forward, ReduceScatter in backward"""
+
+    @staticmethod
+    def forward(ctx, input, comm, dim, shapes):
+        ctx.comm = comm
+        ctx.dim = dim
+        ctx.shapes = shapes
+        return all_gather(input, comm, dim, shapes)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return reduce_scatter(grad_output, ctx.comm, ctx.dim, ctx.shapes), None, None, None
+
 def allreduce_forward_identity_backward(input, comm):
     return _AllReduceForwardIdentityBackward.apply(input, comm)
 
@@ -64,3 +92,9 @@ def allgather_forward_split_backward(input, comm, dim, shapes):
 
 def split_forward_allgather_backward(input, comm, dim, shapes):
     return _SplitForwardAllGatherBackward.apply(input, comm, dim, shapes)
+
+def reducescatter_forward_allgather_backward(input, comm, dim, shapes):
+    return _ReduceScatterForwardAllGatherBackward.apply(input, comm, dim, shapes)
+
+def allgather_forward_reducescatter_backward(input, comm, dim, shapes):
+    return _AllGatherForwardReduceScatterBackward.apply(input, comm, dim, shapes)
