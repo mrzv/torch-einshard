@@ -23,24 +23,6 @@ Open questions:
 - How should shape metadata be supplied for factored axes?
 - How should factored axes compose with sharding, for example patching an axis that is already sharded?
 
-## Autograd Annotations
-
-Some communication patterns change only backward behavior while the forward tensor layout is unchanged.
-
-Possible notation:
-
-```text
-b n c -> b n c :: backward_reduce(tp)
-b n c -> b n c / grad:tp
-```
-
-Needed work:
-
-- Decide whether autograd-only behavior belongs in `einshard` notation or in named helper functions.
-- Add parser support if this becomes notation.
-- Connect notation to the existing `identity_forward_allreduce_backward` primitive.
-- Define how autograd-only annotations interact with `//` partial outputs.
-
 ## Optimized Repartition
 
 Unary repartition semantics are covered today by gather-then-split, including a single logical axis moving from one mesh dimension to another.

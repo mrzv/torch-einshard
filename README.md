@@ -159,6 +159,12 @@ Shard-to-partial all-gather with reduce-scatter backward:
 z = es.einshard("a/tp b -> a b // tp", x, mesh=mesh, shapes=shapes)
 ```
 
+Full-to-partial output keeps the forward value unchanged and all-reduces gradients in backward:
+
+```python
+z = es.einshard("a b -> a b // tp", x, mesh=mesh)
+```
+
 Scalar reductions can also use partial notation:
 
 ```python
@@ -374,7 +380,6 @@ Full distributed test suite:
 
 - The grammar supports at most two input tensors.
 - Partial notation represents sum reductions only.
-- Autograd-only communication is available as low-level mappings, not as notation.
 - Repartition and `einroll` use correctness-first gather/split implementations rather than optimized all-to-all or neighbor exchange.
 - Multi-axis repartition swaps between mesh dimensions are not implemented.
 - Partial reductions over multiple mesh dimensions are applied sequentially; compound mesh-group resolution is not yet implemented.

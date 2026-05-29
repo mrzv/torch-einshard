@@ -123,6 +123,19 @@ def test_partial_to_full(dist_env, mesh_tp):
     assert_close(x.grad, torch.ones_like(x))
 
 
+def test_full_to_partial_allreduces_backward(dist_env, mesh_tp):
+    group = mesh_tp["tp"].get_group()
+    world_size = dist.get_world_size(group)
+
+    x = torch.randn(2, 3, requires_grad=True)
+    z = es.einshard("a b -> a b // tp", x, mesh=mesh_tp)
+
+    assert_close(z, x)
+
+    z.sum().backward()
+    assert_close(x.grad, torch.ones_like(x) * world_size)
+
+
 def test_partial_to_shard(dist_env, mesh_tp):
     group = mesh_tp["tp"].get_group()
     rank = dist.get_rank(group)
