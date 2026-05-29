@@ -96,6 +96,5 @@ Needed work:
 These are known cleanup items rather than new features.
 
 - Decide whether `src/torch_einshard/mesh.py` should be completed or removed in favor of PyTorch `DeviceMesh`.
-- Improve parser errors; Parsley failures are currently low-level.
 - Consider whether the grammar should support more than two input tensors.
 - Keep README examples aligned with tests as more distributed cases are added.

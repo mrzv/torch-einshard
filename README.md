@@ -384,3 +384,5 @@ Full distributed test suite:
 - Multi-axis repartition swaps between mesh dimensions are not implemented.
 - Partial reductions over multiple mesh dimensions are applied sequentially; compound mesh-group resolution is not yet implemented.
 - `src/torch_einshard/mesh.py` is incomplete; tests and examples use PyTorch `DeviceMesh`.
+
+Invalid public `einshard` and `einroll` expressions raise `ValueError` with the original expression included in the message.

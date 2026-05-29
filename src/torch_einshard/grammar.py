@@ -18,3 +18,10 @@ grammar = r"""
 """
 
 sharding = makeGrammar(grammar, globals(), name = "Einshard")
+
+
+def parse_sharding(expression):
+    try:
+        return sharding(expression).map()
+    except Exception as error:
+        raise ValueError(f"Invalid einshard expression {expression!r}: {error}") from error

@@ -1,5 +1,5 @@
 from .einsum import einsum
-from .grammar import sharding, Axes
+from .grammar import parse_sharding, Axes
 from .distributed import distributed_1d
 from .roll import einroll
 
@@ -25,7 +25,7 @@ def local_operation(shard):
         return Axes(set(_axes(shard[0])) & set(_axes(shard[1]))).local()
 
 def einshard(shard, *xs, mesh = None, shapes = None):
-    shard = sharding(shard).map()
+    shard = parse_sharding(shard)
 
     if local_operation(shard):
         return einsum(shard, *xs)

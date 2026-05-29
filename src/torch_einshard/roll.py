@@ -1,12 +1,12 @@
 import torch
 
-from .grammar import sharding
+from .grammar import parse_sharding
 from .helpers import resolve_split_shapes
 from .mappings import allgather_forward_split_backward, split_forward_allgather_backward
 
 
 def einroll(shard, x, shifts, *, mesh=None, shapes=None):
-    spec = sharding(f"{shard} -> {shard}").map()[0]
+    spec = parse_sharding(f"{shard} -> {shard}")[0]
     axes = spec.axes
     z = x
 

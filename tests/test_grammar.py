@@ -1,4 +1,7 @@
-from torch_einshard.grammar import sharding
+import pytest
+
+import torch_einshard as es
+from torch_einshard.grammar import parse_sharding, sharding
 
 
 def test_parse_single_partial():
@@ -45,3 +48,13 @@ def test_parse_hyphenated_mesh_dimension_in_partial_list():
     assert y is None
     assert x.partials == ("sp1-sp2", "dp-sp1-sp2")
     assert z.partials == ()
+
+
+def test_parse_sharding_wraps_parse_errors():
+    with pytest.raises(ValueError, match="Invalid einshard expression"):
+        parse_sharding("a b ->")
+
+
+def test_einshard_wraps_parse_errors():
+    with pytest.raises(ValueError, match="Invalid einshard expression"):
+        es.einshard("a b ->")
