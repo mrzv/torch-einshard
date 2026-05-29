@@ -83,6 +83,58 @@ def test_repartition_between_axes(dist_env, mesh_1d):
     assert_close(z, expected)
 
 
+def test_repartition_between_axes_uneven_shards(dist_env, mesh_1d):
+    group = mesh_1d["dp"].get_group()
+    rank = dist.get_rank(group)
+    world_size = dist.get_world_size(group)
+    rows = world_size * 2 + 1
+    cols = world_size * 3 + 2
+    row_shapes = es.helpers.compute_split_shapes(rows, world_size)
+    col_shapes = es.helpers.compute_split_shapes(cols, world_size)
+
+    full = torch.randn(rows, cols, requires_grad=True)
+    x = torch.split(full.detach(), row_shapes, dim=0)[rank].clone().requires_grad_(True)
+
+    z = es.einshard(
+        "a/dp b -> a b/dp",
+        x,
+        mesh=mesh_1d,
+        shapes={"dp": {"a": row_shapes, "b": col_shapes}},
+    )
+
+    expected = torch.split(full.detach(), col_shapes, dim=1)[rank]
+    assert_close(z, expected)
+
+    z.sum().backward()
+    assert_close(x.grad, torch.ones_like(x))
+
+
+def test_repartition_between_axes_uneven_shards_reverse_dims(dist_env, mesh_1d):
+    group = mesh_1d["dp"].get_group()
+    rank = dist.get_rank(group)
+    world_size = dist.get_world_size(group)
+    rows = world_size * 2 + 1
+    cols = world_size * 3 + 2
+    row_shapes = es.helpers.compute_split_shapes(rows, world_size)
+    col_shapes = es.helpers.compute_split_shapes(cols, world_size)
+
+    full = torch.randn(rows, cols, requires_grad=True)
+    x = torch.split(full.detach(), col_shapes, dim=1)[rank].clone().requires_grad_(True)
+
+    z = es.einshard(
+        "a b/dp -> a/dp b",
+        x,
+        mesh=mesh_1d,
+        shapes={"dp": {"a": row_shapes, "b": col_shapes}},
+    )
+
+    expected = torch.split(full.detach(), row_shapes, dim=0)[rank]
+    assert_close(z, expected)
+
+    z.sum().backward()
+    assert_close(x.grad, torch.ones_like(x))
+
+
 def test_repartition_between_mesh_dimensions(dist_env, mesh_2d):
     dp_group = mesh_2d["dp"].get_group()
     sp_group = mesh_2d["sp"].get_group()

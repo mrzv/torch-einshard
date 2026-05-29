@@ -139,7 +139,7 @@ z = es.einshard(
 )
 ```
 
-Current repartition semantics are correctness-first: gather the source sharded axis, then split the destination axis. Same-mesh, even-shard axis-to-axis repartition attempts an all-to-all path when the backend supports it, and falls back to gather/split otherwise.
+Current repartition semantics are correctness-first: gather the source sharded axis, then split the destination axis. Same-mesh axis-to-axis repartition uses a point-to-point all-to-all-style exchange when split metadata is available, and falls back to gather/split otherwise.
 
 Partial-to-full all-reduce:
 
@@ -273,7 +273,7 @@ z = es.einroll(
 )
 ```
 
-Current `einroll` semantics are correctness-first: gather each sharded rolled axis, apply `torch.roll`, then split back. Uneven shard sizes are supported through `shapes`. Shard-aligned rolls over evenly split axes use a rank exchange instead of gathering the full axis; non-shard-aligned rolls still use gather/roll/split.
+Current `einroll` semantics are correctness-first: gather each sharded rolled axis, apply `torch.roll`, then split back. Uneven shard sizes are supported through `shapes`. Rolls over evenly split axes use direct rank exchange instead of gathering the full axis; uneven rolls still use gather/roll/split.
 
 ## Low-Level Autograd Mappings
 

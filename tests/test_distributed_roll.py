@@ -25,6 +25,25 @@ def test_single_axis_distributed_roll(dist_env, mesh_1d):
     assert_close(x.grad, 2 * x)
 
 
+def test_single_axis_distributed_roll_negative_shift(dist_env, mesh_1d):
+    group = mesh_1d["dp"].get_group()
+    rank = dist.get_rank(group)
+    world_size = dist.get_world_size(group)
+    rows = world_size * 3
+    shapes = es.helpers.compute_split_shapes(rows, world_size)
+
+    full = torch.randn(rows, 5)
+    x = torch.split(full, shapes, dim=0)[rank].clone().requires_grad_(True)
+
+    z = es.einroll("a/dp b", x, {"a": -2}, mesh=mesh_1d, shapes=shapes)
+
+    expected = torch.split(torch.roll(full, shifts=-2, dims=0), shapes, dim=0)[rank]
+    assert_close(z, expected)
+
+    z.sum().backward()
+    assert_close(x.grad, torch.ones_like(x))
+
+
 def test_single_axis_distributed_roll_shard_aligned(dist_env, mesh_1d):
     group = mesh_1d["dp"].get_group()
     rank = dist.get_rank(group)

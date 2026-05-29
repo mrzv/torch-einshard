@@ -117,20 +117,38 @@ def all_to_all_repartition(input, group, source_dim, dest_dim, source_shapes, de
 
     if source_shapes is None or dest_shapes is None:
         return None
-    if len(set(source_shapes)) != 1 or len(set(dest_shapes)) != 1:
-        return None
     if input.shape[source_dim] != source_shapes[rank]:
         return None
     if input.shape[dest_dim] != sum(dest_shapes):
         return None
 
-    input_list = [chunk.contiguous() for chunk in torch.split(input.contiguous(), dest_shapes[0], dim=dest_dim)]
-    output_list = [torch.empty_like(input_list[0]) for _ in range(size)]
-    try:
-        dist.all_to_all(output_list, input_list, group=group)
-    except RuntimeError:
-        return None
-    return torch.cat(output_list, dim=source_dim).contiguous()
+    source_offsets = [sum(source_shapes[:i]) for i in range(size)]
+    dest_offsets = [sum(dest_shapes[:i]) for i in range(size)]
+    output_shape = list(input.shape)
+    output_shape[source_dim] = sum(source_shapes)
+    output_shape[dest_dim] = dest_shapes[rank]
+    output = torch.empty(output_shape, dtype=input.dtype, device=input.device)
+    ops = []
+    recv_targets = []
+
+    for peer in range(size):
+        send_chunk = input.narrow(dest_dim, dest_offsets[peer], dest_shapes[peer]).contiguous()
+        recv_chunk = output.narrow(source_dim, source_offsets[peer], source_shapes[peer])
+        if peer == rank:
+            recv_chunk.copy_(send_chunk)
+            continue
+
+        global_peer = dist.get_global_rank(group, peer)
+        ops.append(dist.P2POp(dist.isend, send_chunk, global_peer, group))
+        recv_buffer = torch.empty_like(recv_chunk)
+        recv_targets.append((recv_buffer, recv_chunk))
+        ops.append(dist.P2POp(dist.irecv, recv_buffer, global_peer, group))
+
+    for request in dist.batch_isend_irecv(ops):
+        request.wait()
+    for recv_buffer, recv_chunk in recv_targets:
+        recv_chunk.copy_(recv_buffer)
+    return output.contiguous()
 
 
 def roll_shards(input, group, shard_shift):
@@ -151,6 +169,59 @@ def roll_shards(input, group, shard_shift):
     for request in dist.batch_isend_irecv(ops):
         request.wait()
     return output
+
+
+def roll_even_shards(input, group, dim, shift, shard_size):
+    size = dist.get_world_size(group)
+    rank = dist.get_rank(group)
+    total_size = size * shard_size
+    shift = shift % total_size
+    if size == 1:
+        return torch.roll(input, shifts=shift, dims=dim)
+    if shift == 0:
+        return input
+    if input.shape[dim] != shard_size:
+        return None
+
+    def chunks_for(src_rank):
+        chunks = []
+        start = 0
+        while start < shard_size:
+            dest_global = (src_rank * shard_size + start + shift) % total_size
+            dest_rank = dest_global // shard_size
+            dest_offset = dest_global % shard_size
+            length = min(shard_size - start, shard_size - dest_offset)
+            chunks.append((start, length, dest_rank, dest_offset))
+            start += length
+        return chunks
+
+    output = torch.empty_like(input)
+    ops = []
+    recv_targets = []
+    for start, length, dest_rank, _ in chunks_for(rank):
+        if dest_rank == rank:
+            continue
+        global_peer = dist.get_global_rank(group, dest_rank)
+        ops.append(dist.P2POp(dist.isend, input.narrow(dim, start, length).contiguous(), global_peer, group))
+
+    for src_rank in range(size):
+        for start, length, dest_rank, dest_offset in chunks_for(src_rank):
+            if dest_rank != rank:
+                continue
+            recv_chunk = output.narrow(dim, dest_offset, length)
+            if src_rank == rank:
+                recv_chunk.copy_(input.narrow(dim, start, length))
+                continue
+            global_peer = dist.get_global_rank(group, src_rank)
+            recv_buffer = torch.empty_like(recv_chunk)
+            recv_targets.append((recv_buffer, recv_chunk))
+            ops.append(dist.P2POp(dist.irecv, recv_buffer, global_peer, group))
+
+    for request in dist.batch_isend_irecv(ops):
+        request.wait()
+    for recv_buffer, recv_chunk in recv_targets:
+        recv_chunk.copy_(recv_buffer)
+    return output.contiguous()
 
 
 def resolve_split_shapes(shapes, shard_dim, axis_name, group=None):

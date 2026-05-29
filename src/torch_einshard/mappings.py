@@ -1,5 +1,5 @@
 import torch
-from .helpers import all_reduce, all_gather, all_to_all_repartition, reduce_scatter, roll_shards, split
+from .helpers import all_reduce, all_gather, all_to_all_repartition, reduce_scatter, roll_even_shards, roll_shards, split
 
 class _AllReduceForwardIdentityBackward(torch.autograd.Function):
     """AllReduce in forward, Identity in backward"""
@@ -115,6 +115,20 @@ class _RollShards(torch.autograd.Function):
     def backward(ctx, grad_output):
         return roll_shards(grad_output, ctx.comm, -ctx.shard_shift), None, None
 
+
+class _RollEvenShards(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, input, comm, dim, shift, shard_size):
+        ctx.comm = comm
+        ctx.dim = dim
+        ctx.shift = shift
+        ctx.shard_size = shard_size
+        return roll_even_shards(input, comm, dim, shift, shard_size)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return roll_even_shards(grad_output, ctx.comm, ctx.dim, -ctx.shift, ctx.shard_size), None, None, None, None
+
 def allreduce_forward_identity_backward(input, comm):
     return _AllReduceForwardIdentityBackward.apply(input, comm)
 
@@ -138,3 +152,6 @@ def alltoall_repartition(input, comm, source_dim, dest_dim, source_shapes, dest_
 
 def roll_shards_forward_backward(input, comm, shard_shift):
     return _RollShards.apply(input, comm, shard_shift)
+
+def roll_even_shards_forward_backward(input, comm, dim, shift, shard_size):
+    return _RollEvenShards.apply(input, comm, dim, shift, shard_size)

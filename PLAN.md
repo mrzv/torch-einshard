@@ -25,7 +25,7 @@ Open questions:
 
 ## Further Repartition Optimization
 
-Unary repartition semantics are covered today by gather-then-split, including a single logical axis moving from one mesh dimension to another. A same-mesh, even-shard axis-to-axis repartition can use an all-to-all path when the backend supports it, with gather/split retained as fallback.
+Unary repartition semantics are covered today by gather-then-split, including a single logical axis moving from one mesh dimension to another. Same-mesh axis-to-axis repartition uses a point-to-point all-to-all-style exchange when metadata is available, with gather/split retained as fallback.
 
 Example:
 
@@ -43,15 +43,14 @@ b h/sp1 w/sp2 c -> b h/sp2 w/sp1 c
 ```
 
 - Preserve the current gather-then-split behavior as a correctness fallback for uneven or unsupported cases.
-- Expand all-to-all support to uneven split sizes if backend support and metadata semantics are clear.
 
 ## Optimized Distributed Roll
 
-`einroll` currently implements correct semantics by gathering sharded axes, applying `torch.roll`, and splitting back. Shard-aligned rolls over evenly split axes use a rank-exchange path instead of materializing the full axis.
+`einroll` currently implements correct semantics by gathering sharded axes, applying `torch.roll`, and splitting back. Rolls over evenly split axes use a point-to-point exchange path instead of materializing the full axis.
 
 Remaining optimization:
 
-- Implement neighbor exchange or all-to-all for non-shard-aligned sharded rolls without materializing the full axis on each rank.
+- Extend optimized roll to uneven shard sizes if the metadata and communication schedule stay simple enough.
 - Preserve the existing `einroll` API and test behavior.
 - Decide whether multi-axis sharded rolls should optimize one axis at a time or use a combined exchange.
 
