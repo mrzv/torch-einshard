@@ -74,3 +74,20 @@ def test_row_parallel_linear_pattern(dist_env, mesh_tp):
 
     expected = torch.einsum("bnc,hc->bnh", x, weight)
     assert_close(z, expected)
+
+
+def test_row_parallel_linear_explicit_partial_output(dist_env, mesh_tp):
+    group = mesh_tp["tp"].get_group()
+    rank = dist.get_rank(group)
+    world_size = dist.get_world_size(group)
+    channels = world_size * 3
+
+    x = torch.randn(2, 4, channels)
+    weight = torch.randn(7, channels)
+    x_shard = torch.split(x, channels // world_size, dim=2)[rank].contiguous()
+    weight_shard = torch.split(weight, channels // world_size, dim=1)[rank].contiguous()
+
+    z = es.einshard("b n c/tp, h c/tp -> b n h // tp", x_shard, weight_shard, mesh=mesh_tp)
+
+    expected = torch.einsum("bnc,hc->bnh", x_shard, weight_shard)
+    assert_close(z, expected)

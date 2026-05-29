@@ -14,7 +14,8 @@ def _shape_for(shapes, shard_dim, axis_name):
 
 
 def einroll(shard, x, shifts, *, mesh=None, shapes=None):
-    axes = sharding(f"{shard} -> {shard}").map()[0]
+    spec = sharding(f"{shard} -> {shard}").map()[0]
+    axes = spec.axes
     z = x
 
     for dim, axis in enumerate(axes):

@@ -1,7 +1,18 @@
 from .einsum import einsum
 from .mappings import allreduce_forward_identity_backward, \
-                      split_forward_allgather_backward, \
-                      allgather_forward_split_backward
+                       split_forward_allgather_backward, \
+                       allgather_forward_split_backward, \
+                       identity_forward_allreduce_backward, \
+                       reducescatter_forward_allgather_backward, \
+                       allgather_forward_reducescatter_backward
+
+
+def _axes(spec):
+    return spec.axes if hasattr(spec, "axes") else spec
+
+
+def _partials(spec):
+    return getattr(spec, "partials", ())
 
 def augment_parallelism(shard, mesh_dim_names):
     # TODO: add replication
@@ -24,7 +35,7 @@ def distributed_1d(shard, *xs, mesh, shapes):
 def distributed_1d_2(shard, x, y, mesh):
     # TODO: check the dimensions match sharding
 
-    intersection = set(shard[0]) & set(shard[1])
+    intersection = set(_axes(shard[0])) & set(_axes(shard[1]))
     # TODO: this will not catch different sharding for the same dimension,
     #       in case we want to support that
     assert len(intersection) == 1, f"Only 1D contraction is supported, but intersection = {intersection}"
@@ -36,19 +47,31 @@ def distributed_1d_2(shard, x, y, mesh):
     # ... X/P, ... X/P -> P * ...
     z = einsum(shard, x, y)    # perform the local operation
 
+    if common.shard_dim in _partials(shard[2]):
+        return z
+
     # all_reduce z over p
     return allreduce_forward_identity_backward(z, comm = mesh[common.shard_dim].get_group())
 
 def distributed_1d_1(shard, x, mesh, shapes = None):
-    assert len(shard[0]) == len(shard[2]), "Input and output dimensions must match in the equation"
-    assert len(shard[0]) == x.dim(), "Input dimensions must match those in the equation"
+    input_spec = shard[0]
+    output_spec = shard[2]
+    input_axes = _axes(input_spec)
+    output_axes = _axes(output_spec)
+    input_partials = list(_partials(input_spec))
+    output_partials = list(_partials(output_spec))
 
-    in_by_name = {axis.name: axis for axis in shard[0]}
-    out_by_name = {axis.name: axis for axis in shard[2]}
+    assert len(input_axes) == len(output_axes), "Input and output dimensions must match in the equation"
+    if not (x.dim() == 0 and len(input_axes) == 1 and input_axes[0].name == output_axes[0].name):
+        assert len(input_axes) == x.dim(), "Input dimensions must match those in the equation"
+
+    in_by_name = {axis.name: axis for axis in input_axes}
+    out_by_name = {axis.name: axis for axis in output_axes}
     assert in_by_name.keys() == out_by_name.keys(), "Input and output axes must match"
 
     z = x
-    current = list(shard[0])
+    current = list(input_axes)
+    current_partials = list(input_partials)
 
     def shapes_for(shard_dim, axis_name):
         if not isinstance(shapes, dict):
@@ -58,24 +81,66 @@ def distributed_1d_1(shard, x, mesh, shapes = None):
             return split_shapes.get(axis_name)
         return split_shapes
 
-    for out_axis in shard[2]:
-        in_axis = in_by_name[out_axis.name]
-        if in_axis.shard_dim == out_axis.shard_dim:
-            continue
-        assert in_axis.local() or out_axis.local(), "Cannot repartition between shard dimensions yet"
+    def group(shard_dim):
+        return mesh[shard_dim].get_group()
 
-        shard_dim = in_axis.shard_dim or out_axis.shard_dim
-        dim = next(i for i, axis in enumerate(current) if axis.name == out_axis.name)
+    def dim_of(axis_name):
+        return next(i for i, axis in enumerate(current) if axis.name == axis_name)
+
+    # Reduce input partials first. If the same mesh dimension appears on an
+    # output axis, reduce-scatter directly into that shard; otherwise all-reduce.
+    for partial in list(current_partials):
+        if partial in output_partials:
+            continue
+
+        scatter_axis = None
+        for out_axis in output_axes:
+            in_axis = next(axis for axis in current if axis.name == out_axis.name)
+            if in_axis.local() and out_axis.shard_dim == partial:
+                scatter_axis = out_axis
+                break
+
+        if scatter_axis is None:
+            z = allreduce_forward_identity_backward(z, group(partial))
+        else:
+            dim = dim_of(scatter_axis.name)
+            split_shapes = shapes_for(partial, scatter_axis.name)
+            z = reducescatter_forward_allgather_backward(z, group(partial), dim, split_shapes)
+            current[dim] = scatter_axis
+        current_partials.remove(partial)
+
+    for out_axis in output_axes:
+        in_axis = in_by_name[out_axis.name]
+        current_axis = next(axis for axis in current if axis.name == out_axis.name)
+        if current_axis.shard_dim == out_axis.shard_dim:
+            continue
+        assert current_axis.local() or out_axis.local(), "Cannot repartition between shard dimensions yet"
+
+        shard_dim = current_axis.shard_dim or out_axis.shard_dim
+        dim = dim_of(out_axis.name)
         split_shapes = shapes_for(shard_dim, out_axis.name)
 
-        if in_axis.local():
+        if current_axis.local():
             # P * X ... -> X/P ...
-            z = split_forward_allgather_backward(z, mesh[shard_dim].get_group(), dim, split_shapes)
+            z = split_forward_allgather_backward(z, group(shard_dim), dim, split_shapes)
         else:
             # X/P ... -> P * X ...
-            z = allgather_forward_split_backward(z, mesh[shard_dim].get_group(), dim, split_shapes)
+            if shard_dim in output_partials:
+                z = allgather_forward_reducescatter_backward(z, group(shard_dim), dim, split_shapes)
+                current_partials.append(shard_dim)
+            else:
+                z = allgather_forward_split_backward(z, group(shard_dim), dim, split_shapes)
 
         current[dim] = out_axis
+
+    for partial in output_partials:
+        if partial in current_partials:
+            continue
+        z = identity_forward_allreduce_backward(z, group(partial))
+        current_partials.append(partial)
+
+    if [axis.name for axis in current] == [axis.name for axis in output_axes]:
+        return z
 
     # permute if necessary
     return einsum(shard, z, name_only=True)

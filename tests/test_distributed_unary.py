@@ -81,3 +81,64 @@ def test_repartition_between_axes(dist_env, mesh_1d):
 
     expected = torch.split(full.detach(), col_shapes, dim=1)[rank]
     assert_close(z, expected)
+
+
+def test_partial_to_full(dist_env, mesh_tp):
+    group = mesh_tp["tp"].get_group()
+    rank = dist.get_rank(group)
+    world_size = dist.get_world_size(group)
+
+    x = torch.full((2, 3), float(rank + 1), requires_grad=True)
+    z = es.einshard("a b // tp -> a b", x, mesh=mesh_tp)
+
+    expected = torch.full_like(x, float(world_size * (world_size + 1) // 2))
+    assert_close(z, expected)
+
+    z.sum().backward()
+    assert_close(x.grad, torch.ones_like(x))
+
+
+def test_partial_to_shard(dist_env, mesh_tp):
+    group = mesh_tp["tp"].get_group()
+    rank = dist.get_rank(group)
+    world_size = dist.get_world_size(group)
+    rows = world_size * 2
+    shapes = es.helpers.compute_split_shapes(rows, world_size)
+
+    x = torch.full((rows, 3), float(rank + 1), requires_grad=True)
+    z = es.einshard("a b // tp -> a/tp b", x, mesh=mesh_tp, shapes=shapes)
+
+    reduced = torch.full_like(x, float(world_size * (world_size + 1) // 2))
+    expected = torch.split(reduced, shapes, dim=0)[rank]
+    assert_close(z, expected)
+
+    z.sum().backward()
+    assert_close(x.grad, torch.ones_like(x))
+
+
+def test_shard_to_partial(dist_env, mesh_tp):
+    group = mesh_tp["tp"].get_group()
+    rank = dist.get_rank(group)
+    world_size = dist.get_world_size(group)
+    rows = world_size * 2
+    shapes = es.helpers.compute_split_shapes(rows, world_size)
+
+    full = torch.arange(rows * 3, dtype=torch.float32).reshape(rows, 3)
+    x = torch.split(full, shapes, dim=0)[rank].clone().requires_grad_(True)
+    z = es.einshard("a/tp b -> a b // tp", x, mesh=mesh_tp, shapes=shapes)
+
+    assert_close(z, full)
+
+    z.sum().backward()
+    assert_close(x.grad, torch.ones_like(x) * world_size)
+
+
+def test_scalar_multiple_partials_to_full(dist_env, mesh_2d):
+    world_rank = dist.get_rank()
+    world_size = dist.get_world_size()
+
+    x = torch.tensor(float(world_rank + 1), requires_grad=True)
+    z = es.einshard("loss // (sp,dp) -> loss", x, mesh=mesh_2d)
+
+    expected = torch.tensor(float(world_size * (world_size + 1) // 2))
+    assert_close(z, expected)

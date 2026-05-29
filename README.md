@@ -22,6 +22,18 @@ This means:
 - axis `b` is sharded over mesh dimension `dp`
 - the contraction over `b/dp` produces a partial local result that is all-reduced over `dp`
 
+Tensor-level partial values use `//`. A partial tensor has the full logical shape locally, but each rank only holds one contribution to the value; the contributions must be summed over the named mesh dimension:
+
+```text
+b n h // tp -> b n h
+```
+
+Multiple partial dimensions are written with parentheses and are reduced in the listed order:
+
+```text
+loss // (sp,dp) -> loss
+```
+
 Distributed operations expect a PyTorch `DeviceMesh`:
 
 ```python
@@ -116,6 +128,30 @@ z = es.einshard(
 
 Current repartition semantics are correctness-first: gather the source sharded axis, then split the destination axis. A future implementation may replace this with all-to-all where possible.
 
+Partial-to-full all-reduce:
+
+```python
+z = es.einshard("a b // tp -> a b", x, mesh=mesh)
+```
+
+Partial-to-shard reduce-scatter:
+
+```python
+z = es.einshard("a b // tp -> a/tp b", x, mesh=mesh, shapes=shapes)
+```
+
+Shard-to-partial all-gather with reduce-scatter backward:
+
+```python
+z = es.einshard("a/tp b -> a b // tp", x, mesh=mesh, shapes=shapes)
+```
+
+Scalar reductions can also use partial notation:
+
+```python
+z = es.einshard("loss // (sp,dp) -> loss", loss, mesh=mesh)
+```
+
 ## Supported Distributed Binary Patterns
 
 Binary distributed contractions support one sharded contracted axis. The local contraction is computed first and then all-reduced over the contracted shard dimension.
@@ -134,6 +170,14 @@ z = es.einshard("a/sp b/dp, b/dp c -> a/sp c", x, y, mesh=mesh)
 
 This contracts `b/dp` and all-reduces the output over `dp`.
 
+The partial output can also be requested explicitly:
+
+```python
+z = es.einshard("a/sp b/dp, b/dp c -> a/sp c // dp", x, y, mesh=mesh)
+```
+
+In that case, `z` is the local partial contraction result and no forward all-reduce is applied.
+
 ## Tensor-Parallel Linear Patterns
 
 Column-parallel linear projection is supported by sharding the output feature axis:
@@ -151,6 +195,12 @@ z = es.einshard("b n c/tp, h c/tp -> b n h", x_shard, weight_shard, mesh=mesh)
 ```
 
 This contracts `c/tp` and all-reduces over `tp`.
+
+To keep the local partial output instead of all-reducing immediately:
+
+```python
+z = es.einshard("b n c/tp, h c/tp -> b n h // tp", x_shard, weight_shard, mesh=mesh)
+```
 
 A two-layer MLP can be expressed as:
 
@@ -284,7 +334,7 @@ Full distributed test suite:
 
 - The grammar supports at most two input tensors.
 - General multi-dimensional distributed contractions are not implemented.
-- Partial-value notation is not yet represented in `einshard` syntax.
 - Autograd-only communication is available as low-level mappings, not as notation.
 - Repartition and `einroll` use correctness-first gather/split implementations rather than optimized all-to-all or neighbor exchange.
+- Partial reductions over multiple mesh dimensions are applied sequentially; compound mesh-group resolution is not yet implemented.
 - `src/torch_einshard/mesh.py` is incomplete; tests and examples use PyTorch `DeviceMesh`.

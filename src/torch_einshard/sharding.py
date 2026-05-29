@@ -37,3 +37,27 @@ class Axes(list[Axis]):
 
     def all_shard_dims(self):
         return [x.shard_dim for x in self if x.shard_dim]
+
+class TensorSpec:
+    def __init__(self, axes: Axes, partials = None) -> None:
+        self.axes = axes
+        self.partials = tuple(partials or [])
+
+    def local(self):
+        return self.axes.local() and not self.partials
+
+    def __iter__(self):
+        return iter(self.axes)
+
+    def __len__(self):
+        return len(self.axes)
+
+    def __getitem__(self, key):
+        return self.axes[key]
+
+    def __repr__(self):
+        result = repr(self.axes)
+        if self.partials:
+            partials = self.partials[0] if len(self.partials) == 1 else f"({','.join(self.partials)})"
+            result += f" // {partials}"
+        return result

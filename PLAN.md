@@ -2,7 +2,7 @@
 
 This document tracks remaining distributed-pattern work inspired by `../MachineLearning/SciGPT/scaling-transformers-physical-sciences`.
 
-Implemented items have been removed from this plan. Current implemented coverage includes multi-axis unary split/gather, tensor-parallel linear contraction patterns, low-level identity/all-reduce and reduce-scatter autograd mappings, gather-then-split repartition semantics, and `einroll` with correctness-first gather/roll/split behavior.
+Implemented items have been removed from this plan. Current implemented coverage includes multi-axis unary split/gather, tensor-parallel linear contraction patterns, low-level identity/all-reduce and reduce-scatter autograd mappings, `//` partial-value notation, gather-then-split repartition semantics, and `einroll` with correctness-first gather/roll/split behavior.
 
 ## Factored Axes
 
@@ -19,25 +19,6 @@ Open questions:
 - How should factored axes map to concrete tensor dimensions?
 - Should factors be first-class grammar nodes or only local reshape annotations?
 - How should shape metadata be supplied for factored axes?
-
-## Partial Values
-
-The current notation distinguishes local axes and sharded axes, but not partial values that require reduction to recover the logical tensor.
-
-Possible notation:
-
-```text
-b n c / partial(tp) -> b n c
-loss partial(sp1-sp2) -> loss
-```
-
-This would make all-reduce, reduce-scatter, and loss/metric reductions explicit at the notation level instead of only available as low-level primitives.
-
-Needed work:
-
-- Add a representation for partial values in `Axis`/`Axes` or a separate tensor-state structure.
-- Define how partial values interact with contraction outputs.
-- Define backward semantics for partial-to-replicated and partial-to-sharded transitions.
 
 ## Autograd Annotations
 
@@ -98,7 +79,7 @@ b h/sp1 w/sp2 c -> b h w c
 Remaining work:
 
 - Decide how compound group names should be represented in notation.
-- Define scalar reductions over compound groups once partial values exist.
+- Optimize scalar reductions over compound groups instead of reducing listed partial dimensions sequentially.
 - Add tests for compound-group reductions and checkpoint-style shard metadata if needed.
 
 ## Parameter Metadata
