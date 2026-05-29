@@ -22,13 +22,13 @@ This means:
 - axis `b` is sharded over mesh dimension `dp`
 - the contraction over `b/dp` produces a partial local result that is all-reduced over `dp`
 
-Tensor-level partial values use `//`. A partial tensor has the full logical shape locally, but each rank only holds one contribution to the value; the contributions must be summed over the named mesh dimension:
+Tensor-level partial values use `//`. A partial tensor has the full logical shape locally, but each rank only holds one contribution to the value. The contributions are sum-reduced over the named mesh dimension when converting back to a non-partial tensor:
 
 ```text
 b n h // tp -> b n h
 ```
 
-Multiple partial dimensions are written with parentheses and are reduced in the listed order:
+Multiple partial dimensions are written with parentheses. They are currently reduced sequentially in the listed order:
 
 ```text
 loss // (sp,dp) -> loss
@@ -151,6 +151,8 @@ Scalar reductions can also use partial notation:
 ```python
 z = es.einshard("loss // (sp,dp) -> loss", loss, mesh=mesh)
 ```
+
+Partial notation currently represents sum reductions only.
 
 ## Supported Distributed Binary Patterns
 
@@ -284,6 +286,19 @@ allgather_forward_reducescatter_backward(x, comm, dim, shapes)
 
 The current `reduce_scatter` helper is implemented as all-reduce followed by split for backend portability.
 
+## Roadmap
+
+Remaining work is tracked in `PLAN.md`. The main open areas are:
+
+- Shared shape metadata validation and lookup helpers.
+- Factored-axis notation for patch/unpatch-style reshapes.
+- Optional notation for autograd-only communication.
+- Optimized all-to-all repartition instead of gather-then-split where possible.
+- Optimized sharded `einroll` using neighbor exchange or all-to-all.
+- General multi-dimensional distributed contractions.
+- Compound mesh groups instead of sequential reductions over listed partial dimensions.
+- A decision on parameter metadata APIs and the incomplete `mesh.py` module.
+
 ## Shape Metadata
 
 `shapes` controls split sizes. If omitted, split sizes are computed with `compute_split_shapes`.
@@ -334,7 +349,9 @@ Full distributed test suite:
 
 - The grammar supports at most two input tensors.
 - General multi-dimensional distributed contractions are not implemented.
+- Partial notation represents sum reductions only.
 - Autograd-only communication is available as low-level mappings, not as notation.
 - Repartition and `einroll` use correctness-first gather/split implementations rather than optimized all-to-all or neighbor exchange.
 - Partial reductions over multiple mesh dimensions are applied sequentially; compound mesh-group resolution is not yet implemented.
+- Shape metadata accepts several forms, but validation is still minimal.
 - `src/torch_einshard/mesh.py` is incomplete; tests and examples use PyTorch `DeviceMesh`.
