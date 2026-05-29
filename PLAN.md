@@ -1,197 +1,111 @@
 # Distributed Pattern Plan
 
-This document records notation ideas for distributed patterns observed in `../MachineLearning/SciGPT/scaling-transformers-physical-sciences` and how they could map into `torch-einshard`.
+This document tracks remaining distributed-pattern work inspired by `../MachineLearning/SciGPT/scaling-transformers-physical-sciences`.
 
-## Existing Notation Fits
+Implemented items have been removed from this plan. Current implemented coverage includes multi-axis unary split/gather, tensor-parallel linear contraction patterns, low-level identity/all-reduce and reduce-scatter autograd mappings, gather-then-split repartition semantics, and `einroll` with correctness-first gather/roll/split behavior.
 
-Unary split:
+## Factored Axes
 
-```text
-b h w c -> b h/sp1 w c
-b h w c -> b h w/sp2 c
-b h w c -> b/dp h w c
-```
+Patch expansion and unpatching would be clearer if notation could represent factored logical axes.
 
-Unary gather:
-
-```text
-b h/sp1 w c -> b h w c
-b h w/sp2 c -> b h w c
-b/dp h w c -> b h w c
-```
-
-Chained multi-axis spatial split:
-
-```text
-b h w c -> b h/sp1 w/sp2 c
-```
-
-Chained multi-axis spatial gather:
-
-```text
-b h/sp1 w/sp2 c -> b h w c
-```
-
-Patch/token layout transforms are local permutations once the tensor is already sharded:
-
-```text
-b t c h/sp1 w/sp2 -> b t h/sp1 w/sp2 c
-```
-
-If factored axes are added later, patch expansion/head reshape patterns could be represented as:
+Possible notation:
 
 ```text
 b t h w p q c -> b t c h p w q
 ```
 
-## Distributed Contractions
+Open questions:
 
-Tensor-parallel column-sharded linear or QKV projection:
+- How should factored axes map to concrete tensor dimensions?
+- Should factors be first-class grammar nodes or only local reshape annotations?
+- How should shape metadata be supplied for factored axes?
 
-```text
-b n c, o/tp c -> b n o/tp
-```
+## Partial Values
 
-This produces sharded output features and does not need a forward all-reduce.
+The current notation distinguishes local axes and sharded axes, but not partial values that require reduction to recover the logical tensor.
 
-Tensor-parallel row-sharded linear or output projection:
-
-```text
-b n c/tp, o c/tp -> b n o
-```
-
-The contracted `c/tp` axis disappears, so the local result must be all-reduced over `tp`.
-
-MLP as two contractions:
-
-```text
-b n c, h/tp c -> b n h/tp
-b n h/tp, c h/tp -> b n c
-```
-
-Attention Q/K/V projections:
-
-```text
-b l c, q/tp c -> b l q/tp
-b l c, k/tp c -> b l k/tp
-b l c, v/tp c -> b l v/tp
-```
-
-Attention output projection:
-
-```text
-b l v/tp, c v/tp -> b l c
-```
-
-Window attention can stay local per tensor-parallel shard when heads are sharded:
-
-```text
-b heads/tp l d, b heads/tp m d -> b heads/tp l m
-b heads/tp l m, b heads/tp m d -> b heads/tp l d
-```
-
-## Autograd-Only Communication
-
-SciGPT uses identity-forward/all-reduce-backward before tensor-parallel linears. The forward tensor layout does not change, so this needs an operation annotation rather than plain axis notation.
-
-Possible extension:
-
-```text
-b n c -> b n c :: backward_reduce(tp)
-```
-
-Alternative compact form:
-
-```text
-b n c -> b n c / grad:tp
-```
-
-Meaning:
-
-- forward: identity
-- backward: all-reduce over `tp`
-
-The reverse direction, all-reduce-forward/identity-backward, should eventually distinguish sharded axes from partial values:
+Possible notation:
 
 ```text
 b n c / partial(tp) -> b n c
+loss partial(sp1-sp2) -> loss
 ```
 
-## Reduce-Scatter Patterns
+This would make all-reduce, reduce-scatter, and loss/metric reductions explicit at the notation level instead of only available as low-level primitives.
 
-Reduce-scatter forward / all-gather backward:
+Needed work:
+
+- Add a representation for partial values in `Axis`/`Axes` or a separate tensor-state structure.
+- Define how partial values interact with contraction outputs.
+- Define backward semantics for partial-to-replicated and partial-to-sharded transitions.
+
+## Autograd Annotations
+
+Some communication patterns change only backward behavior while the forward tensor layout is unchanged.
+
+Possible notation:
 
 ```text
-b n c -> b n/tp c :: reduce_scatter(tp, n)
+b n c -> b n c :: backward_reduce(tp)
+b n c -> b n c / grad:tp
 ```
 
-All-gather forward / reduce-scatter backward:
+Needed work:
 
-```text
-b n/tp c -> b n c :: backward_reduce_scatter(tp, n)
-```
+- Decide whether autograd-only behavior belongs in `einshard` notation or in named helper functions.
+- Add parser support if this becomes notation.
+- Connect notation to the existing `identity_forward_allreduce_backward` primitive.
 
-These require a notion of partial values, since current gather/split semantics use split-backward rather than reduce-scatter-backward.
+## Optimized Repartition
 
-## Distributed Roll
+Unary repartition semantics are covered today by gather-then-split.
 
-Shifted-window attention needs cyclic shifts across spatial shards. This is a neighbor-exchange operation and should probably be a named operation instead of overloaded einsum syntax.
-
-Possible API:
-
-```python
-einroll("b t h/sp1 w/sp2 c", x, shifts={"h": -sh, "w": -sw}, mesh=mesh)
-```
-
-Possible compact notation:
-
-```text
-roll[b t h/sp1 w/sp2 c; h=-s1,w=-s2]
-```
-
-## Distributed Transpose / Repartition
-
-Repartitioning from one sharded axis to another over the same mesh dimension can be expressed directly:
+Example:
 
 ```text
 b h/sp1 w c -> b h w/sp1 c
 ```
 
-Swapping ownership of two spatial mesh dimensions:
+Remaining optimization:
+
+- Replace gather-then-split with all-to-all where the source and destination shard dimensions are compatible.
+- Support ownership swaps across spatial mesh dimensions:
 
 ```text
 b h/sp1 w/sp2 c -> b h/sp2 w/sp1 c
 ```
 
-These require all-to-all-style redistribution.
+## Optimized Distributed Roll
+
+`einroll` currently implements correct semantics by gathering sharded axes, applying `torch.roll`, and splitting back.
+
+Remaining optimization:
+
+- Implement neighbor exchange or all-to-all for sharded roll without materializing the full axis on each rank.
+- Preserve the existing `einroll` API and test behavior.
+- Add uneven-shard tests once backend support is explicit.
 
 ## Compound Groups
 
 SciGPT uses groups such as `sp1-sp2`, `tp-sp1-sp2`, and `dp-sp1-sp2`.
 
-Axis-wise notation can represent many compound operations:
+Axis-wise notation can already describe many operations over separate dimensions:
 
 ```text
 b h/sp1 w/sp2 c -> b h w c
 ```
 
-Scalar or loss reductions over compound groups need partial-value notation:
+Remaining work:
 
-```text
-loss partial(sp1-sp2) -> loss
-```
+- Decide how compound group names should be represented in notation.
+- Define scalar reductions over compound groups once partial values exist.
+- Add tests for compound-group reductions and checkpoint-style shard metadata if needed.
 
 ## Parameter Metadata
 
-Parameter sharding can be represented by tensor-axis notation:
+Parameter sharding is expressible with axis notation, but shared/reduced metadata is not yet represented.
 
-```text
-o/tp c
-o c/tp
-b t h/sp1 w/sp2 c
-```
-
-Shared/reduced parameter metadata likely needs module-level annotations:
+Possible module-level annotations:
 
 ```text
 [o c] shared(tp-sp1-sp2) reduce(sp1-sp2)
@@ -199,11 +113,8 @@ Shared/reduced parameter metadata likely needs module-level annotations:
 [o c/tp] shared(sp1-sp2) reduce(sp1-sp2)
 ```
 
-## First Implementation Targets
+Needed work:
 
-1. Multi-axis unary split/gather using existing notation.
-2. Identity-forward/all-reduce-backward mapping as a low-level primitive.
-3. Reduce-scatter mappings as low-level primitives.
-4. Repartition from `axis/p -> other_axis/p` using all-to-all.
-5. Distributed roll as a separate named operation.
-6. Higher-level tensor-parallel linear examples/tests using contraction notation.
+- Decide whether parameter metadata belongs in this package or a higher-level module layer.
+- Define synchronization and gradient-reduction semantics.
+- Add tests only after a concrete API is chosen.
