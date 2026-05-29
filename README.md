@@ -290,7 +290,6 @@ The current `reduce_scatter` helper is implemented as all-reduce followed by spl
 
 Remaining work is tracked in `PLAN.md`. The main open areas are:
 
-- Shared shape metadata validation and lookup helpers.
 - Factored-axis notation for patch/unpatch-style reshapes.
 - Optional notation for autograd-only communication.
 - Optimized all-to-all repartition instead of gather-then-split where possible.
@@ -317,6 +316,8 @@ shapes = {
     "dp": [8, 8, 8, 8],
 }
 ```
+
+When a dict form is supplied, missing mesh dimensions or missing axis-specific entries are reported as `ValueError`s before the collective runs.
 
 Same mesh dimension used for different logical axes:
 
@@ -353,5 +354,4 @@ Full distributed test suite:
 - Autograd-only communication is available as low-level mappings, not as notation.
 - Repartition and `einroll` use correctness-first gather/split implementations rather than optimized all-to-all or neighbor exchange.
 - Partial reductions over multiple mesh dimensions are applied sequentially; compound mesh-group resolution is not yet implemented.
-- Shape metadata accepts several forms, but validation is still minimal.
 - `src/torch_einshard/mesh.py` is incomplete; tests and examples use PyTorch `DeviceMesh`.

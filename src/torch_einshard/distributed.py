@@ -5,6 +5,7 @@ from .mappings import allreduce_forward_identity_backward, \
                        identity_forward_allreduce_backward, \
                        reducescatter_forward_allgather_backward, \
                        allgather_forward_reducescatter_backward
+from .helpers import resolve_split_shapes
 
 
 def _axes(spec):
@@ -73,14 +74,6 @@ def distributed_1d_1(shard, x, mesh, shapes = None):
     current = list(input_axes)
     current_partials = list(input_partials)
 
-    def shapes_for(shard_dim, axis_name):
-        if not isinstance(shapes, dict):
-            return shapes
-        split_shapes = shapes.get(shard_dim)
-        if isinstance(split_shapes, dict):
-            return split_shapes.get(axis_name)
-        return split_shapes
-
     def group(shard_dim):
         return mesh[shard_dim].get_group()
 
@@ -104,8 +97,9 @@ def distributed_1d_1(shard, x, mesh, shapes = None):
             z = allreduce_forward_identity_backward(z, group(partial))
         else:
             dim = dim_of(scatter_axis.name)
-            split_shapes = shapes_for(partial, scatter_axis.name)
-            z = reducescatter_forward_allgather_backward(z, group(partial), dim, split_shapes)
+            comm = group(partial)
+            split_shapes = resolve_split_shapes(shapes, partial, scatter_axis.name, comm)
+            z = reducescatter_forward_allgather_backward(z, comm, dim, split_shapes)
             current[dim] = scatter_axis
         current_partials.remove(partial)
 
@@ -118,18 +112,19 @@ def distributed_1d_1(shard, x, mesh, shapes = None):
 
         shard_dim = current_axis.shard_dim or out_axis.shard_dim
         dim = dim_of(out_axis.name)
-        split_shapes = shapes_for(shard_dim, out_axis.name)
+        comm = group(shard_dim)
+        split_shapes = resolve_split_shapes(shapes, shard_dim, out_axis.name, comm)
 
         if current_axis.local():
             # P * X ... -> X/P ...
-            z = split_forward_allgather_backward(z, group(shard_dim), dim, split_shapes)
+            z = split_forward_allgather_backward(z, comm, dim, split_shapes)
         else:
             # X/P ... -> P * X ...
             if shard_dim in output_partials:
-                z = allgather_forward_reducescatter_backward(z, group(shard_dim), dim, split_shapes)
+                z = allgather_forward_reducescatter_backward(z, comm, dim, split_shapes)
                 current_partials.append(shard_dim)
             else:
-                z = allgather_forward_split_backward(z, group(shard_dim), dim, split_shapes)
+                z = allgather_forward_split_backward(z, comm, dim, split_shapes)
 
         current[dim] = out_axis
 

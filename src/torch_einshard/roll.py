@@ -1,16 +1,8 @@
 import torch
 
 from .grammar import sharding
+from .helpers import resolve_split_shapes
 from .mappings import allgather_forward_split_backward, split_forward_allgather_backward
-
-
-def _shape_for(shapes, shard_dim, axis_name):
-    if not isinstance(shapes, dict):
-        return shapes
-    split_shapes = shapes.get(shard_dim)
-    if isinstance(split_shapes, dict):
-        return split_shapes.get(axis_name)
-    return split_shapes
 
 
 def einroll(shard, x, shifts, *, mesh=None, shapes=None):
@@ -27,8 +19,8 @@ def einroll(shard, x, shifts, *, mesh=None, shapes=None):
             z = torch.roll(z, shifts=shift, dims=dim)
             continue
 
-        split_shapes = _shape_for(shapes, axis.shard_dim, axis.name)
         group = mesh[axis.shard_dim].get_group()
+        split_shapes = resolve_split_shapes(shapes, axis.shard_dim, axis.name, group)
         z = allgather_forward_split_backward(z, group, dim, split_shapes)
         z = torch.roll(z, shifts=shift, dims=dim)
         z = split_forward_allgather_backward(z, group, dim, split_shapes)

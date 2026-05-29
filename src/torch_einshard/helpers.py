@@ -90,6 +90,30 @@ def reduce_scatter(input, group, dim, shapes):
     reduced = all_reduce(input, group)
     return split(reduced, group, dim, shapes)
 
+
+def resolve_split_shapes(shapes, shard_dim, axis_name, group=None):
+    if shapes is None:
+        return None
+
+    if isinstance(shapes, dict):
+        if shard_dim not in shapes:
+            raise ValueError(f"Missing split shapes for mesh dimension {shard_dim!r}")
+        shapes = shapes[shard_dim]
+
+        if isinstance(shapes, dict):
+            if axis_name not in shapes:
+                raise ValueError(
+                    f"Missing split shapes for axis {axis_name!r} on mesh dimension {shard_dim!r}"
+                )
+            shapes = shapes[axis_name]
+
+    if group is not None:
+        size = dist.get_world_size(group)
+        if len(shapes) != size:
+            raise ValueError(f"Error: passed shapes of size {len(shapes)} not equal to {size}")
+
+    return shapes
+
 # helper routine to compute uneven splitting in balanced way:
 def compute_split_shapes(size, num_chunks):
     if num_chunks == 1:

@@ -6,16 +6,6 @@ Implemented coverage includes local einsum-style operations, multi-axis unary sp
 
 The remaining work is mostly about broadening notation expressiveness, reducing communication overhead, and deciding whether higher-level model/parameter metadata belongs in this package.
 
-## Shared Shape Resolution
-
-Split and gather paths now accept several `shapes` forms, including per-mesh and per-axis metadata. The lookup logic is duplicated in distributed unary operations and `einroll`.
-
-Remaining work:
-
-- Move shape lookup into one internal helper shared by `distributed.py`, `roll.py`, and future collectives.
-- Validate shape metadata earlier with clear errors for missing mesh dimensions, missing axis names, and incorrect split counts.
-- Add focused tests for malformed shape metadata once validation behavior is defined.
-
 ## Factored Axes
 
 Patch expansion and unpatching would be clearer if notation could represent factored logical axes.

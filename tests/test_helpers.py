@@ -15,3 +15,40 @@ def test_compute_split_shapes_balanced_uneven_chunks():
 
 def test_compute_split_shapes_avoids_empty_last_chunk():
     assert es.helpers.compute_split_shapes(3, 4) == [0, 0, 0, 3]
+
+
+def test_resolve_split_shapes_none():
+    assert es.helpers.resolve_split_shapes(None, "dp", "a") is None
+
+
+def test_resolve_split_shapes_flat_list():
+    assert es.helpers.resolve_split_shapes([2, 3], "dp", "a") == [2, 3]
+
+
+def test_resolve_split_shapes_by_mesh_dimension():
+    shapes = {"dp": [2, 3], "sp": [4, 5]}
+    assert es.helpers.resolve_split_shapes(shapes, "sp", "a") == [4, 5]
+
+
+def test_resolve_split_shapes_by_mesh_dimension_and_axis():
+    shapes = {"dp": {"a": [2, 3], "b": [4, 5]}}
+    assert es.helpers.resolve_split_shapes(shapes, "dp", "b") == [4, 5]
+
+
+def test_resolve_split_shapes_missing_mesh_dimension():
+    try:
+        es.helpers.resolve_split_shapes({"dp": [2, 3]}, "sp", "a")
+    except ValueError as error:
+        assert "mesh dimension 'sp'" in str(error)
+    else:
+        raise AssertionError("Expected ValueError")
+
+
+def test_resolve_split_shapes_missing_axis():
+    try:
+        es.helpers.resolve_split_shapes({"dp": {"a": [2, 3]}}, "dp", "b")
+    except ValueError as error:
+        assert "axis 'b'" in str(error)
+        assert "mesh dimension 'dp'" in str(error)
+    else:
+        raise AssertionError("Expected ValueError")
