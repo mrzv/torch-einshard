@@ -265,7 +265,7 @@ z = es.einroll(
 )
 ```
 
-Current `einroll` semantics are correctness-first: gather each sharded rolled axis, apply `torch.roll`, then split back. A future implementation may optimize this with neighbor exchange or all-to-all.
+Current `einroll` semantics are correctness-first: gather each sharded rolled axis, apply `torch.roll`, then split back. Uneven shard sizes are supported through `shapes`. A future implementation may optimize this with neighbor exchange or all-to-all.
 
 ## Low-Level Autograd Mappings
 
@@ -307,7 +307,7 @@ All-gather in forward, reduce-scatter in backward:
 allgather_forward_reducescatter_backward(x, comm, dim, shapes)
 ```
 
-The current `reduce_scatter` helper is implemented as all-reduce followed by split for backend portability.
+The current `reduce_scatter` helper is implemented as all-reduce followed by split for backend portability. Uneven `all_gather` uses a padded equal-size gather internally for backends that reject variable-size gathers.
 
 ## Roadmap
 

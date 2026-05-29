@@ -70,6 +70,24 @@ def all_gather(input, group, dim, shapes):
     input = input.contiguous()
     input_shape = list(input.shape)
     if shapes is not None:
+        rank = dist.get_rank(group)
+        if input_shape[dim] != shapes[rank]:
+            raise ValueError(
+                f"Error: local tensor size {input_shape[dim]} does not match shapes[{rank}] = {shapes[rank]}"
+            )
+
+        if len(set(shapes)) != 1:
+            padded_shape = list(input_shape)
+            padded_shape[dim] = max(shapes)
+            padded = torch.zeros(padded_shape, dtype=input.dtype, device=input.device)
+            padded.narrow(dim, 0, input_shape[dim]).copy_(input)
+            input_list = [torch.empty_like(padded) for _ in range(size)]
+            dist.all_gather(input_list, padded, group = group)
+            return torch.cat(
+                [tensor.narrow(dim, 0, shapes[src]) for src, tensor in enumerate(input_list)],
+                dim=dim,
+            ).contiguous()
+
         input_list = []
         for src in range(size):
             input_shape[dim] = shapes[src]

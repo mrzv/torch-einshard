@@ -72,7 +72,6 @@ Remaining optimization:
 
 - Implement neighbor exchange or all-to-all for sharded roll without materializing the full axis on each rank.
 - Preserve the existing `einroll` API and test behavior.
-- Add uneven-shard tests once backend support is explicit.
 - Decide whether multi-axis sharded rolls should optimize one axis at a time or use a combined exchange.
 
 ## Compound Groups
