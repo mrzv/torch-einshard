@@ -23,9 +23,9 @@ Open questions:
 - How should shape metadata be supplied for factored axes?
 - How should factored axes compose with sharding, for example patching an axis that is already sharded?
 
-## Optimized Repartition
+## Further Repartition Optimization
 
-Unary repartition semantics are covered today by gather-then-split, including a single logical axis moving from one mesh dimension to another.
+Unary repartition semantics are covered today by gather-then-split, including a single logical axis moving from one mesh dimension to another. A same-mesh, even-shard axis-to-axis repartition can use an all-to-all path when the backend supports it, with gather/split retained as fallback.
 
 Example:
 
@@ -36,7 +36,6 @@ b h/sp1 w c -> b h/sp2 w c
 
 Remaining optimization:
 
-- Replace gather-then-split with all-to-all where the source and destination shard dimensions are compatible.
 - Support multi-axis ownership swaps across spatial mesh dimensions:
 
 ```text
@@ -44,15 +43,15 @@ b h/sp1 w/sp2 c -> b h/sp2 w/sp1 c
 ```
 
 - Preserve the current gather-then-split behavior as a correctness fallback for uneven or unsupported cases.
-- Add tests that compare optimized paths against the existing fallback.
+- Expand all-to-all support to uneven split sizes if backend support and metadata semantics are clear.
 
 ## Optimized Distributed Roll
 
-`einroll` currently implements correct semantics by gathering sharded axes, applying `torch.roll`, and splitting back.
+`einroll` currently implements correct semantics by gathering sharded axes, applying `torch.roll`, and splitting back. Shard-aligned rolls over evenly split axes use a rank-exchange path instead of materializing the full axis.
 
 Remaining optimization:
 
-- Implement neighbor exchange or all-to-all for sharded roll without materializing the full axis on each rank.
+- Implement neighbor exchange or all-to-all for non-shard-aligned sharded rolls without materializing the full axis on each rank.
 - Preserve the existing `einroll` API and test behavior.
 - Decide whether multi-axis sharded rolls should optimize one axis at a time or use a combined exchange.
 

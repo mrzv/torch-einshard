@@ -1,5 +1,5 @@
 import torch
-from .helpers import all_reduce, all_gather, reduce_scatter, split
+from .helpers import all_reduce, all_gather, all_to_all_repartition, reduce_scatter, roll_shards, split
 
 class _AllReduceForwardIdentityBackward(torch.autograd.Function):
     """AllReduce in forward, Identity in backward"""
@@ -81,6 +81,40 @@ class _AllGatherForwardReduceScatterBackward(torch.autograd.Function):
     def backward(ctx, grad_output):
         return reduce_scatter(grad_output, ctx.comm, ctx.dim, ctx.shapes), None, None, None
 
+
+class _AllToAllRepartition(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, input, comm, source_dim, dest_dim, source_shapes, dest_shapes):
+        ctx.comm = comm
+        ctx.source_dim = source_dim
+        ctx.dest_dim = dest_dim
+        ctx.source_shapes = source_shapes
+        ctx.dest_shapes = dest_shapes
+        return all_to_all_repartition(input, comm, source_dim, dest_dim, source_shapes, dest_shapes)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return all_to_all_repartition(
+            grad_output,
+            ctx.comm,
+            ctx.dest_dim,
+            ctx.source_dim,
+            ctx.dest_shapes,
+            ctx.source_shapes,
+        ), None, None, None, None, None
+
+
+class _RollShards(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, input, comm, shard_shift):
+        ctx.comm = comm
+        ctx.shard_shift = shard_shift
+        return roll_shards(input, comm, shard_shift)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return roll_shards(grad_output, ctx.comm, -ctx.shard_shift), None, None
+
 def allreduce_forward_identity_backward(input, comm):
     return _AllReduceForwardIdentityBackward.apply(input, comm)
 
@@ -98,3 +132,9 @@ def reducescatter_forward_allgather_backward(input, comm, dim, shapes):
 
 def allgather_forward_reducescatter_backward(input, comm, dim, shapes):
     return _AllGatherForwardReduceScatterBackward.apply(input, comm, dim, shapes)
+
+def alltoall_repartition(input, comm, source_dim, dest_dim, source_shapes, dest_shapes):
+    return _AllToAllRepartition.apply(input, comm, source_dim, dest_dim, source_shapes, dest_shapes)
+
+def roll_shards_forward_backward(input, comm, shard_shift):
+    return _RollShards.apply(input, comm, shard_shift)

@@ -4,7 +4,8 @@ from .mappings import allreduce_forward_identity_backward, \
                        allgather_forward_split_backward, \
                        identity_forward_allreduce_backward, \
                        reducescatter_forward_allgather_backward, \
-                       allgather_forward_reducescatter_backward
+                       allgather_forward_reducescatter_backward, \
+                       alltoall_repartition
 from .helpers import resolve_split_shapes
 
 
@@ -107,6 +108,40 @@ def distributed_1d_1(shard, x, mesh, shapes = None):
     def dim_of(axis_name):
         return next(i for i, axis in enumerate(current) if axis.name == axis_name)
 
+    def try_same_mesh_repartition():
+        if output_partials or [axis.name for axis in input_axes] != [axis.name for axis in output_axes]:
+            return None
+
+        gather_axes = []
+        split_axes = []
+        for out_axis in output_axes:
+            in_axis = in_by_name[out_axis.name]
+            if in_axis.shard_dim == out_axis.shard_dim:
+                continue
+            if in_axis.shard_dim and out_axis.local():
+                gather_axes.append(in_axis)
+            elif in_axis.local() and out_axis.shard_dim:
+                split_axes.append(out_axis)
+
+        if len(gather_axes) != 1 or len(split_axes) != 1:
+            return None
+        source_axis = gather_axes[0]
+        dest_axis = split_axes[0]
+        if source_axis.shard_dim != dest_axis.shard_dim:
+            return None
+
+        comm = group(source_axis.shard_dim)
+        source_shapes = resolve_split_shapes(shapes, source_axis.shard_dim, source_axis.name, comm)
+        dest_shapes = resolve_split_shapes(shapes, dest_axis.shard_dim, dest_axis.name, comm)
+        return alltoall_repartition(
+            z,
+            comm,
+            dim_of(source_axis.name),
+            dim_of(dest_axis.name),
+            source_shapes,
+            dest_shapes,
+        )
+
     # Reduce input partials first. If the same mesh dimension appears on an
     # output axis, reduce-scatter directly into that shard; otherwise all-reduce.
     for partial in list(current_partials):
@@ -129,6 +164,13 @@ def distributed_1d_1(shard, x, mesh, shapes = None):
             z = reducescatter_forward_allgather_backward(z, comm, dim, split_shapes)
             current[dim] = scatter_axis
         current_partials.remove(partial)
+
+    optimized = try_same_mesh_repartition()
+    if optimized is not None:
+        z = optimized
+        current = list(output_axes)
+        if [axis.name for axis in current] == [axis.name for axis in output_axes]:
+            return z
 
     for out_axis in output_axes:
         in_axis = in_by_name[out_axis.name]

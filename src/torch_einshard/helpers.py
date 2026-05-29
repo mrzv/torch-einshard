@@ -109,6 +109,50 @@ def reduce_scatter(input, group, dim, shapes):
     return split(reduced, group, dim, shapes)
 
 
+def all_to_all_repartition(input, group, source_dim, dest_dim, source_shapes, dest_shapes):
+    size = dist.get_world_size(group)
+    rank = dist.get_rank(group)
+    if size == 1:
+        return input
+
+    if source_shapes is None or dest_shapes is None:
+        return None
+    if len(set(source_shapes)) != 1 or len(set(dest_shapes)) != 1:
+        return None
+    if input.shape[source_dim] != source_shapes[rank]:
+        return None
+    if input.shape[dest_dim] != sum(dest_shapes):
+        return None
+
+    input_list = [chunk.contiguous() for chunk in torch.split(input.contiguous(), dest_shapes[0], dim=dest_dim)]
+    output_list = [torch.empty_like(input_list[0]) for _ in range(size)]
+    try:
+        dist.all_to_all(output_list, input_list, group=group)
+    except RuntimeError:
+        return None
+    return torch.cat(output_list, dim=source_dim).contiguous()
+
+
+def roll_shards(input, group, shard_shift):
+    size = dist.get_world_size(group)
+    if size == 1 or shard_shift % size == 0:
+        return input
+
+    rank = dist.get_rank(group)
+    send_rank = (rank + shard_shift) % size
+    recv_rank = (rank - shard_shift) % size
+    send_peer = dist.get_global_rank(group, send_rank)
+    recv_peer = dist.get_global_rank(group, recv_rank)
+    output = torch.empty_like(input)
+    ops = [
+        dist.P2POp(dist.isend, input.contiguous(), send_peer, group),
+        dist.P2POp(dist.irecv, output, recv_peer, group),
+    ]
+    for request in dist.batch_isend_irecv(ops):
+        request.wait()
+    return output
+
+
 def resolve_split_shapes(shapes, shard_dim, axis_name, group=None):
     if shapes is None:
         return None
