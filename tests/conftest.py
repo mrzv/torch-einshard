@@ -47,6 +47,11 @@ def mesh_1d(dist_env):
 
 
 @pytest.fixture(scope="session")
+def mesh_tp(dist_env):
+    return init_device_mesh(dist_env.device, (dist_env.world_size,), mesh_dim_names=("tp",))
+
+
+@pytest.fixture(scope="session")
 def mesh_2d(dist_env):
     if dist_env.world_size % 2 == 0:
         shape = (2, dist_env.world_size // 2)

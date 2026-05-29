@@ -1,4 +1,5 @@
 import torch
+import torch.distributed as dist
 
 import torch_einshard as es
 
@@ -39,3 +40,37 @@ def test_sharded_contraction_matches_gathered_reference(dist_env, mesh_2d):
 
     split_grad = es.einshard("a/sp b -> a/sp b/dp", x_all.grad.detach().clone(), mesh=mesh_2d)
     assert_close(split_grad, x.grad)
+
+
+def test_column_parallel_linear_pattern(dist_env, mesh_tp):
+    group = mesh_tp["tp"].get_group()
+    rank = dist.get_rank(group)
+    world_size = dist.get_world_size(group)
+    hidden = world_size * 3
+
+    x = torch.randn(2, 4, 5)
+    weight = torch.randn(hidden, 5)
+    weight_shard = torch.split(weight, hidden // world_size, dim=0)[rank].contiguous()
+
+    z = es.einshard("b n c, h/tp c -> b n h/tp", x, weight_shard, mesh=mesh_tp)
+
+    expected_full = torch.einsum("bnc,hc->bnh", x, weight)
+    expected = torch.split(expected_full, hidden // world_size, dim=2)[rank]
+    assert_close(z, expected)
+
+
+def test_row_parallel_linear_pattern(dist_env, mesh_tp):
+    group = mesh_tp["tp"].get_group()
+    rank = dist.get_rank(group)
+    world_size = dist.get_world_size(group)
+    channels = world_size * 3
+
+    x = torch.randn(2, 4, channels)
+    weight = torch.randn(7, channels)
+    x_shard = torch.split(x, channels // world_size, dim=2)[rank].contiguous()
+    weight_shard = torch.split(weight, channels // world_size, dim=1)[rank].contiguous()
+
+    z = es.einshard("b n c/tp, h c/tp -> b n h", x_shard, weight_shard, mesh=mesh_tp)
+
+    expected = torch.einsum("bnc,hc->bnh", x, weight)
+    assert_close(z, expected)
