@@ -43,18 +43,19 @@ Needed work:
 
 ## Optimized Repartition
 
-Unary repartition semantics are covered today by gather-then-split.
+Unary repartition semantics are covered today by gather-then-split, including a single logical axis moving from one mesh dimension to another.
 
 Example:
 
 ```text
 b h/sp1 w c -> b h w/sp1 c
+b h/sp1 w c -> b h/sp2 w c
 ```
 
 Remaining optimization:
 
 - Replace gather-then-split with all-to-all where the source and destination shard dimensions are compatible.
-- Support ownership swaps across spatial mesh dimensions:
+- Support multi-axis ownership swaps across spatial mesh dimensions:
 
 ```text
 b h/sp1 w/sp2 c -> b h/sp2 w/sp1 c

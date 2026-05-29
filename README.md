@@ -126,6 +126,17 @@ z = es.einshard(
 )
 ```
 
+Repartition one logical axis from one mesh dimension to another:
+
+```python
+z = es.einshard(
+    "a/dp b -> a/sp b",
+    x,
+    mesh=mesh,
+    shapes={"dp": {"a": dp_shapes}, "sp": {"a": sp_shapes}},
+)
+```
+
 Current repartition semantics are correctness-first: gather the source sharded axis, then split the destination axis. A future implementation may replace this with all-to-all where possible.
 
 Partial-to-full all-reduce:
@@ -363,5 +374,6 @@ Full distributed test suite:
 - Partial notation represents sum reductions only.
 - Autograd-only communication is available as low-level mappings, not as notation.
 - Repartition and `einroll` use correctness-first gather/split implementations rather than optimized all-to-all or neighbor exchange.
+- Multi-axis repartition swaps between mesh dimensions are not implemented.
 - Partial reductions over multiple mesh dimensions are applied sequentially; compound mesh-group resolution is not yet implemented.
 - `src/torch_einshard/mesh.py` is incomplete; tests and examples use PyTorch `DeviceMesh`.

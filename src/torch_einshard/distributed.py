@@ -93,6 +93,14 @@ def distributed_1d_1(shard, x, mesh, shapes = None):
     current = list(input_axes)
     current_partials = list(input_partials)
 
+    shard_dim_changes = [
+        out_axis.name for out_axis in output_axes
+        if in_by_name[out_axis.name].shard_dim
+        and out_axis.shard_dim
+        and in_by_name[out_axis.name].shard_dim != out_axis.shard_dim
+    ]
+    assert len(shard_dim_changes) <= 1, "Cannot repartition multiple sharded axes between shard dimensions yet"
+
     def group(shard_dim):
         return mesh[shard_dim].get_group()
 
@@ -127,23 +135,34 @@ def distributed_1d_1(shard, x, mesh, shapes = None):
         current_axis = next(axis for axis in current if axis.name == out_axis.name)
         if current_axis.shard_dim == out_axis.shard_dim:
             continue
-        assert current_axis.local() or out_axis.local(), "Cannot repartition between shard dimensions yet"
 
-        shard_dim = current_axis.shard_dim or out_axis.shard_dim
         dim = dim_of(out_axis.name)
-        comm = group(shard_dim)
-        split_shapes = resolve_split_shapes(shapes, shard_dim, out_axis.name, comm)
 
         if current_axis.local():
             # P * X ... -> X/P ...
+            shard_dim = out_axis.shard_dim
+            comm = group(shard_dim)
+            split_shapes = resolve_split_shapes(shapes, shard_dim, out_axis.name, comm)
             z = split_forward_allgather_backward(z, comm, dim, split_shapes)
-        else:
+        elif out_axis.local():
             # X/P ... -> P * X ...
+            shard_dim = current_axis.shard_dim
+            comm = group(shard_dim)
+            split_shapes = resolve_split_shapes(shapes, shard_dim, out_axis.name, comm)
             if shard_dim in output_partials:
                 z = allgather_forward_reducescatter_backward(z, comm, dim, split_shapes)
                 current_partials.append(shard_dim)
             else:
                 z = allgather_forward_split_backward(z, comm, dim, split_shapes)
+        else:
+            # X/P ... -> Q * X ... -> X/Q ...
+            source_comm = group(current_axis.shard_dim)
+            source_shapes = resolve_split_shapes(shapes, current_axis.shard_dim, out_axis.name, source_comm)
+            z = allgather_forward_split_backward(z, source_comm, dim, source_shapes)
+
+            dest_comm = group(out_axis.shard_dim)
+            dest_shapes = resolve_split_shapes(shapes, out_axis.shard_dim, out_axis.name, dest_comm)
+            z = split_forward_allgather_backward(z, dest_comm, dim, dest_shapes)
 
         current[dim] = out_axis
 
