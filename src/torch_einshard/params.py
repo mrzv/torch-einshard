@@ -6,6 +6,9 @@ from .grammar import parse_sharding
 from .helpers import all_reduce
 
 
+PARAM_SPEC_ATTR = "einshard_spec"
+
+
 def _tuple(value):
     if value is None:
         return ()
@@ -66,3 +69,28 @@ def reduce_grad_(param, spec, mesh):
     for name in spec.reduce:
         param.grad = all_reduce(param.grad, _group(mesh, name))
     return param
+
+
+def set_param_spec(param, spec):
+    setattr(param, PARAM_SPEC_ATTR, spec)
+    return param
+
+
+def get_param_spec(param):
+    return getattr(param, PARAM_SPEC_ATTR, None)
+
+
+def sync_module_params_(module, mesh):
+    for param in module.parameters():
+        spec = get_param_spec(param)
+        if spec is not None:
+            sync_param_(param, spec, mesh)
+    return module
+
+
+def reduce_module_grads_(module, mesh):
+    for param in module.parameters():
+        spec = get_param_spec(param)
+        if spec is not None:
+            reduce_grad_(param, spec, mesh)
+    return module

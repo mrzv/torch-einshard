@@ -1,5 +1,6 @@
 import torch
 import torch.distributed as dist
+from torch import nn
 
 import torch_einshard as es
 
@@ -34,6 +35,22 @@ def test_sync_param_broadcasts_shared_values(dist_env, mesh_2d):
     es.sync_param_(param, spec, mesh)
 
     assert_close(param, torch.ones_like(param))
+
+
+def test_module_param_helpers_use_attached_specs(dist_env, mesh_2d):
+    mesh = es.wrap_mesh(mesh_2d)
+    module = nn.Linear(3, 2, bias=False)
+    es.set_param_spec(module.weight, es.ParamSpec("o c", shared="dp-sp", reduce="dp-sp"))
+    module.weight.data.fill_(float(dist.get_rank() + 1))
+
+    assert es.get_param_spec(module.weight).shared == ("dp-sp",)
+    assert es.sync_module_params_(module, mesh) is module
+    assert_close(module.weight, torch.ones_like(module.weight))
+
+    module.weight.grad = torch.full_like(module.weight, float(dist.get_rank() + 1))
+    es.reduce_module_grads_(module, mesh)
+    expected = float(dist.get_world_size() * (dist.get_world_size() + 1) // 2)
+    assert_close(module.weight.grad, torch.full_like(module.weight, expected))
 
 
 def test_reduce_grad_allreduces_reduce_groups(dist_env, mesh_2d):

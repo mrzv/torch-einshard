@@ -310,3 +310,13 @@ def compute_split_shapes(size, num_chunks):
     sections = [chunk_size for _ in range(num_chunks - 1)] + [last_chunk_size]
 
     return sections
+
+
+def compute_split_shapes_for_factors(size, num_chunks, factor):
+    result = compute_split_shapes(size // factor, num_chunks)
+    if factor == 1:
+        return result
+
+    result = [section * factor for section in result]
+    result[-1] += size % factor
+    return result

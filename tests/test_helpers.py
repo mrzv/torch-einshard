@@ -17,6 +17,14 @@ def test_compute_split_shapes_avoids_empty_last_chunk():
     assert es.helpers.compute_split_shapes(3, 4) == [0, 0, 0, 3]
 
 
+def test_compute_split_shapes_for_factors_preserves_factor_boundaries():
+    assert es.helpers.compute_split_shapes_for_factors(721, 4, 4) == [180, 180, 180, 181]
+
+
+def test_compute_split_shapes_for_factors_matches_base_for_unit_factor():
+    assert es.helpers.compute_split_shapes_for_factors(10, 4, 1) == es.helpers.compute_split_shapes(10, 4)
+
+
 def test_resolve_split_shapes_none():
     assert es.helpers.resolve_split_shapes(None, "dp", "a") is None
 
