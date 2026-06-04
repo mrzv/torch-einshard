@@ -376,6 +376,23 @@ es.reduce_grad_(weight, weight_spec, mesh)
 
 `shared` dimensions cannot overlap with axis shard dimensions in the layout. For example, `ParamSpec("out/tp in", shared="tp")` is rejected because `out` is already sharded over `tp`.
 
+For modules, attach specs to parameters and use the module-level helpers:
+
+```python
+es.set_param_spec(weight, weight_spec)
+es.sync_module_params_(module, mesh)
+es.reduce_module_grads_(module, mesh)
+```
+
+When using PyTorch DDP, SciGPT-style extra gradient reductions can be registered as a DDP communication hook:
+
+```python
+ddp = torch.nn.parallel.DistributedDataParallel(module, process_group=mesh["dp"].get_group())
+es.register_grad_reduction_hook_(ddp, mesh, ddp_group="dp")
+```
+
+The hook performs DDP-style averaging over `ddp_group`, then applies sum all-reduces for attached `ParamSpec.reduce` groups.
+
 ## Shape Metadata
 
 `shapes` controls split sizes. If omitted, split sizes are computed with `compute_split_shapes`.
@@ -406,6 +423,13 @@ shapes = {
         "b": b_shapes,
     }
 }
+```
+
+Factor-aware split sizes preserve divisibility for patch/factor operations before assigning any remainder to the final shard:
+
+```python
+shapes = es.helpers.compute_split_shapes_for_factors(size=721, num_chunks=4, factor=4)
+# [180, 180, 180, 181]
 ```
 
 ## Running Tests

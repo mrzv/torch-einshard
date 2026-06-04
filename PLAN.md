@@ -89,8 +89,11 @@ Implemented behavior:
 
 - `sync_param_` broadcasts parameter values from group rank 0 over `shared` mesh groups.
 - `reduce_grad_` sum-all-reduces `param.grad` over `reduce` mesh groups.
+- `sync_module_params_` and `reduce_module_grads_` apply attached specs over a whole module.
+- `register_grad_reduction_hook_` adds DDP-style averaging plus extra `ParamSpec.reduce` reductions as a DDP communication hook.
 - Compound names work through `wrap_mesh`.
 - `shared` metadata is rejected when it overlaps with axis shard dimensions.
+- SciGPT-style tensor-parallel MLP and attention projection patterns are covered by tests using explicit `einshard` calls.
 
 Deferred string notation:
 
@@ -104,7 +107,7 @@ Remaining work:
 
 - Decide whether bracketed string notation is needed in addition to the Python API.
 - Add checkpoint-style shard metadata helpers if checkpoint integration needs them.
-- Add module-wide registration helpers if model integration needs them.
+- Add higher-level module/layer wrappers only if model integration needs them.
 
 ## Deferred Cleanup
 
