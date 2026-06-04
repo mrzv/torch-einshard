@@ -11,23 +11,36 @@ def _normalize_families(families):
     return {name: tuple(axes) for name, axes in families.items()}
 
 
-def _expand_sizes(sizes, families):
-    if not isinstance(sizes, dict) or not families:
-        return sizes
+def _axis_name(axis):
+    return axis.split("/", 1)[0].strip()
+
+
+def expand_family_mapping(mapping, families, *, label):
+    families = _normalize_families(families)
+    if not isinstance(mapping, dict) or not families:
+        return mapping
 
     result = {}
-    for key, value in sizes.items():
+    for key, value in mapping.items():
         if key not in families:
             result[key] = value
             continue
 
         axes = families[key]
-        if len(value) != len(axes):
-            raise ValueError(f"Size family {key!r} has {len(value)} values for {len(axes)} axes")
-        for axis, axis_size in zip(axes, value):
-            if axis in result and result[axis] != axis_size:
-                raise ValueError(f"Conflicting sizes for expanded axis {axis!r}")
-            result[axis] = axis_size
+        if isinstance(value, (str, bytes)):
+            values = (value,) * len(axes)
+        else:
+            try:
+                values = tuple(value)
+            except TypeError:
+                values = (value,) * len(axes)
+        if len(values) != len(axes):
+            raise ValueError(f"{label} family {key!r} has {len(values)} values for {len(axes)} axes")
+        for axis, axis_value in zip(axes, values):
+            axis = _axis_name(axis)
+            if axis in result and result[axis] != axis_value:
+                raise ValueError(f"Conflicting {label.lower()} for expanded axis {axis!r}")
+            result[axis] = axis_value
     return result
 
 
@@ -64,4 +77,4 @@ def expand_axis_families(expression, sizes=None, families=None):
 
     expression = _ZIPPED.sub(lambda match: _expand_zipped(match, families), expression)
     expression = _FAMILY.sub(expand_family, expression)
-    return expression, _expand_sizes(sizes, families)
+    return expression, expand_family_mapping(sizes, families, label="Size")

@@ -7,6 +7,19 @@ import torch_einshard as es
 from conftest import assert_close
 
 
+def test_local_roll_axis_family():
+    x = torch.randn(2, 3, 4, 5, 6, 7)
+
+    z = es.einroll(
+        "b t *spatial c",
+        x,
+        {"spatial": (1, -2, 3)},
+        families={"spatial": ("h", "w", "d")},
+    )
+
+    assert_close(z, torch.roll(x, shifts=(1, -2, 3), dims=(2, 3, 4)))
+
+
 def test_single_axis_distributed_roll(dist_env, mesh_1d):
     group = mesh_1d["dp"].get_group()
     rank = dist.get_rank(group)
@@ -115,6 +128,35 @@ def test_multi_axis_distributed_roll(dist_env, mesh_2d):
     x = torch.split(x, shapes["dp"], dim=1)[dp_rank].contiguous().requires_grad_(True)
 
     z = es.einroll("a/sp b/dp", x, {"a": -2, "b": 3}, mesh=mesh_2d, shapes=shapes)
+
+    expected = torch.roll(full, shifts=(-2, 3), dims=(0, 1))
+    expected = torch.split(expected, shapes["sp"], dim=0)[sp_rank]
+    expected = torch.split(expected, shapes["dp"], dim=1)[dp_rank]
+    assert_close(z, expected)
+
+
+def test_multi_axis_distributed_roll_axis_family(dist_env, mesh_2d):
+    sp_group = mesh_2d["sp"].get_group()
+    dp_group = mesh_2d["dp"].get_group()
+    sp_rank = dist.get_rank(sp_group)
+    dp_rank = dist.get_rank(dp_group)
+    shapes = {
+        "sp": es.helpers.compute_split_shapes(12, dist.get_world_size(sp_group)),
+        "dp": es.helpers.compute_split_shapes(16, dist.get_world_size(dp_group)),
+    }
+
+    full = torch.randn(12, 16)
+    x = torch.split(full, shapes["sp"], dim=0)[sp_rank]
+    x = torch.split(x, shapes["dp"], dim=1)[dp_rank].contiguous().requires_grad_(True)
+
+    z = es.einroll(
+        "*spatial",
+        x,
+        {"spatial": (-2, 3)},
+        mesh=mesh_2d,
+        shapes=shapes,
+        families={"spatial": ("a/sp", "b/dp")},
+    )
 
     expected = torch.roll(full, shifts=(-2, 3), dims=(0, 1))
     expected = torch.split(expected, shapes["sp"], dim=0)[sp_rank]

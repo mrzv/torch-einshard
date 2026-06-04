@@ -63,6 +63,7 @@ Implemented behavior:
 - `*family` expands to a sequence of axis names.
 - `[*a *b]` zips equal-length families into repeated factored groups, for example `(h wh) (w ww)`.
 - `sizes={"family": values}` expands to per-axis sizes for the family members.
+- `einroll` also accepts `families` and expands family-valued `shifts` entries to per-axis shifts.
 
 Remaining work:
 

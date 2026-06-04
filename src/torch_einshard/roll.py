@@ -2,11 +2,14 @@ import torch
 import warnings
 
 from .grammar import parse_sharding
+from .families import expand_axis_families, expand_family_mapping
 from .helpers import resolve_split_shapes
 from .mappings import allgather_forward_split_backward, roll_sharded_forward_backward, split_forward_allgather_backward
 
 
-def einroll(shard, x, shifts, *, mesh=None, shapes=None):
+def einroll(shard, x, shifts, *, mesh=None, shapes=None, families=None):
+    shard, _ = expand_axis_families(shard, families=families)
+    shifts = expand_family_mapping(shifts, families, label="Shift")
     spec = parse_sharding(f"{shard} -> {shard}")[0]
     axes = spec.axes
     z = x
