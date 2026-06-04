@@ -106,6 +106,22 @@ z = es.einshard("b h p c -> b (h p) c", z)
 
 Factor sizes are inferred from tensor dimensions when exactly one factor in a group is omitted from `sizes`. Supplying no sizes for a group such as `(h p)` is ambiguous and raises `ValueError`.
 
+Axis families remove repeated 2D/3D notation boilerplate. `*family` expands to a sequence of axes, and `[*spatial *window]` zips families into repeated factored groups:
+
+```python
+spatial = ("h", "w", "d")[:dim]
+window = ("wh", "ww", "wd")[:dim]
+
+windows = es.einshard(
+    "b t [*spatial *window] c -> (b *spatial) t *window c",
+    x,
+    families={"spatial": spatial, "window": window},
+    sizes={"window": window_size},
+)
+```
+
+For `dim == 2`, this expands to `b t (h wh) (w ww) c -> (b h w) t wh ww c`. For `dim == 3`, it expands to `b t (h wh) (w ww) (d wd) c -> (b h w d) t wh ww wd c`.
+
 ## Supported Distributed Unary Patterns
 
 Unary distributed operations support split, gather, multi-axis split/gather, optimized ownership swaps, and gather-then-split repartition.
@@ -467,6 +483,7 @@ Full distributed test suite:
 - The grammar supports at most two input tensors.
 - Partial notation represents sum reductions only.
 - Factored axes support one-level parenthesized groups; grouped transformations are local reshape operations around `torch.einsum`.
+- Axis families are a pre-parse notation expansion; expanded expressions must still be valid `einshard` notation.
 - Repartition and `einroll` still use correctness-first gather/split fallbacks for unsupported cases or missing shape metadata; performance-sensitive fallbacks emit `RuntimeWarning`.
 - Multi-axis repartition swaps are currently limited to pure ownership swaps across equal-sized mesh dimensions with matching split metadata.
 - Parenthesized partial reductions over multiple mesh dimensions are applied sequentially; use `wrap_mesh` with a compound name for a single compound group reduction.

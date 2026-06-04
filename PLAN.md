@@ -2,7 +2,7 @@
 
 This document tracks remaining distributed-pattern work inspired by `../MachineLearning/SciGPT/scaling-transformers-physical-sciences`.
 
-Implemented coverage includes local einsum-style operations, einsum ellipses for local and supported distributed patterns, local one-level factored axes, multi-axis unary split/gather, tensor-parallel linear contraction patterns, distributed contractions over one or more sharded contracted axes, low-level identity/all-reduce and reduce-scatter autograd mappings, `//` partial-value notation, gather-then-split repartition semantics, optimized same-mesh repartition, pure multi-axis ownership swaps, compound mesh groups, and `einroll` with correctness-first gather/roll/split behavior.
+Implemented coverage includes local einsum-style operations, einsum ellipses for local and supported distributed patterns, local one-level factored axes, axis-family notation expansion, multi-axis unary split/gather, tensor-parallel linear contraction patterns, distributed contractions over one or more sharded contracted axes, low-level identity/all-reduce and reduce-scatter autograd mappings, `//` partial-value notation, gather-then-split repartition semantics, optimized same-mesh repartition, pure multi-axis ownership swaps, compound mesh groups, and `einroll` with correctness-first gather/roll/split behavior.
 
 The remaining work is mostly about broadening notation expressiveness, reducing communication overhead, and deciding whether higher-level model/parameter metadata belongs in this package.
 
@@ -42,6 +42,31 @@ Implemented behavior:
 Remaining work:
 
 - Decide whether distributed unary operations should support reducing or introducing ellipsis dimensions, for example `... c -> c` with sharded named axes.
+
+## Axis Families
+
+Axis-family expansion removes repeated 2D/3D notation boilerplate before parsing.
+
+Implemented notation:
+
+```python
+es.einshard(
+    "b t [*spatial *window] c -> (b *spatial) t *window c",
+    x,
+    families={"spatial": ("h", "w", "d"), "window": ("wh", "ww", "wd")},
+    sizes={"window": window_size},
+)
+```
+
+Implemented behavior:
+
+- `*family` expands to a sequence of axis names.
+- `[*a *b]` zips equal-length families into repeated factored groups, for example `(h wh) (w ww)`.
+- `sizes={"family": values}` expands to per-axis sizes for the family members.
+
+Remaining work:
+
+- Decide whether sharded axis-family syntax is needed, rather than expanding to explicit sharded axes before calling `einshard`.
 
 ## Further Repartition Optimization
 

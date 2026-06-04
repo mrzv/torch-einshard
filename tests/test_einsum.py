@@ -63,6 +63,79 @@ def test_ellipsis_with_factored_axis():
     torch.testing.assert_close(z, x.reshape(2, 3, 3, 4, 5))
 
 
+def test_axis_families_window_partition_2d():
+    x = torch.randn(2, 3, 8, 10, 5)
+    families = {"spatial": ("h", "w"), "window": ("wh", "ww")}
+    sizes = {"window": (4, 5)}
+
+    z = es.einshard(
+        "b t [*spatial *window] c -> (b *spatial) t *window c",
+        x,
+        families=families,
+        sizes=sizes,
+    )
+
+    expected = x.reshape(2, 3, 2, 4, 2, 5, 5).permute(0, 2, 4, 1, 3, 5, 6).reshape(8, 3, 4, 5, 5)
+    torch.testing.assert_close(z, expected)
+
+
+def test_axis_families_window_partition_3d():
+    x = torch.randn(2, 3, 8, 10, 6, 5)
+    families = {"spatial": ("h", "w", "d"), "window": ("wh", "ww", "wd")}
+    sizes = {"window": (4, 5, 3)}
+
+    z = es.einshard(
+        "b t [*spatial *window] c -> (b *spatial) t *window c",
+        x,
+        families=families,
+        sizes=sizes,
+    )
+
+    expected = x.reshape(2, 3, 2, 4, 2, 5, 2, 3, 5)
+    expected = expected.permute(0, 2, 4, 6, 1, 3, 5, 7, 8).reshape(16, 3, 4, 5, 3, 5)
+    torch.testing.assert_close(z, expected)
+
+
+def test_axis_families_window_reverse_3d():
+    families = {"spatial": ("h", "w", "d"), "window": ("wh", "ww", "wd")}
+    sizes = {"b": 2, "h": 2, "w": 2, "d": 2}
+    windows = torch.randn(16, 3, 4, 5, 3, 5)
+
+    z = es.einshard(
+        "(b *spatial) t *window c -> b t [*spatial *window] c",
+        windows,
+        families=families,
+        sizes=sizes,
+    )
+
+    expected = windows.reshape(2, 2, 2, 2, 3, 4, 5, 3, 5)
+    expected = expected.permute(0, 4, 1, 5, 2, 6, 3, 7, 8).reshape(2, 3, 8, 10, 6, 5)
+    torch.testing.assert_close(z, expected)
+
+
+def test_axis_family_sizes_expand_by_family_name():
+    x = torch.randn(2, 12, 5)
+
+    z = es.einshard(
+        "b (*factors) c -> b *factors c",
+        x,
+        families={"factors": ("h", "p")},
+        sizes={"factors": (3, 4)},
+    )
+    torch.testing.assert_close(z, x.reshape(2, 3, 4, 5))
+
+
+def test_axis_family_rejects_mismatched_zipped_lengths():
+    x = torch.randn(2, 3, 8, 10, 5)
+
+    with pytest.raises(ValueError, match="matching lengths"):
+        es.einshard(
+            "b t [*spatial *window] c -> b t *spatial *window c",
+            x,
+            families={"spatial": ("h", "w"), "window": ("wh",)},
+        )
+
+
 def test_expand_factored_axis():
     x = torch.randn(2, 12, 5)
 
