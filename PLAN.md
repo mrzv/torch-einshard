@@ -2,7 +2,7 @@
 
 This document tracks remaining distributed-pattern work inspired by `../MachineLearning/SciGPT/scaling-transformers-physical-sciences`.
 
-Implemented coverage includes local einsum-style operations, multi-axis unary split/gather, tensor-parallel linear contraction patterns, distributed contractions over one or more sharded contracted axes, low-level identity/all-reduce and reduce-scatter autograd mappings, `//` partial-value notation, gather-then-split repartition semantics, compound mesh groups, and `einroll` with correctness-first gather/roll/split behavior.
+Implemented coverage includes local einsum-style operations, multi-axis unary split/gather, tensor-parallel linear contraction patterns, distributed contractions over one or more sharded contracted axes, low-level identity/all-reduce and reduce-scatter autograd mappings, `//` partial-value notation, gather-then-split repartition semantics, optimized same-mesh repartition, pure multi-axis ownership swaps, compound mesh groups, and `einroll` with correctness-first gather/roll/split behavior.
 
 The remaining work is mostly about broadening notation expressiveness, reducing communication overhead, and deciding whether higher-level model/parameter metadata belongs in this package.
 
@@ -25,7 +25,7 @@ Open questions:
 
 ## Further Repartition Optimization
 
-Unary repartition semantics are covered today by gather-then-split, including a single logical axis moving from one mesh dimension to another. Same-mesh axis-to-axis repartition uses a point-to-point all-to-all-style exchange when metadata is available, with gather/split retained as fallback.
+Unary repartition semantics are covered today by gather-then-split, including a single logical axis moving from one mesh dimension to another. Same-mesh axis-to-axis repartition uses a point-to-point all-to-all-style exchange when metadata is available, with gather/split retained as fallback. Pure multi-axis ownership swaps across equal-sized mesh dimensions directly exchange local blocks when matching split metadata is available.
 
 Example:
 
@@ -34,14 +34,17 @@ b h/sp1 w c -> b h w/sp1 c
 b h/sp1 w c -> b h/sp2 w c
 ```
 
-Remaining optimization:
+Implemented ownership swap:
 
-- Support multi-axis ownership swaps across spatial mesh dimensions:
+- Multi-axis ownership swaps across spatial mesh dimensions:
 
 ```text
 b h/sp1 w/sp2 c -> b h/sp2 w/sp1 c
 ```
 
+Remaining optimization:
+
+- Support more general multi-axis repartition where changed mesh dimensions are not a pure permutation or split metadata differs between source and destination ownership.
 - Preserve the current gather-then-split behavior as a correctness fallback for uneven or unsupported cases, with warnings when the fallback may be expensive.
 
 ## Compound Groups

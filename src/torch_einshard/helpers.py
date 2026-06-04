@@ -151,6 +151,37 @@ def all_to_all_repartition(input, group, source_dim, dest_dim, source_shapes, de
     return output.contiguous()
 
 
+def owner_swap(input, mesh, source_shard_dims, dest_shard_dims, output_shape):
+    device_mesh = getattr(mesh, "device_mesh", mesh)
+    mesh_tensor = device_mesh.mesh
+    dim_names = device_mesh.mesh_dim_names
+    name_to_dim = {name: i for i, name in enumerate(dim_names)}
+    rank = dist.get_rank()
+    coord = (mesh_tensor == rank).nonzero()[0].tolist()
+
+    send_coord = list(coord)
+    recv_coord = list(coord)
+    for source_shard_dim, dest_shard_dim in zip(source_shard_dims, dest_shard_dims):
+        source_mesh_dim = name_to_dim[source_shard_dim]
+        dest_mesh_dim = name_to_dim[dest_shard_dim]
+        send_coord[dest_mesh_dim] = coord[source_mesh_dim]
+        recv_coord[source_mesh_dim] = coord[dest_mesh_dim]
+
+    send_rank = int(mesh_tensor[tuple(send_coord)].item())
+    recv_rank = int(mesh_tensor[tuple(recv_coord)].item())
+    if send_rank == rank and recv_rank == rank:
+        return input.contiguous()
+
+    output = torch.empty(output_shape, dtype=input.dtype, device=input.device)
+    ops = [
+        dist.P2POp(dist.isend, input.contiguous(), send_rank),
+        dist.P2POp(dist.irecv, output, recv_rank),
+    ]
+    for request in dist.batch_isend_irecv(ops):
+        request.wait()
+    return output.contiguous()
+
+
 def roll_shards(input, group, shard_shift):
     size = dist.get_world_size(group)
     if size == 1 or shard_shift % size == 0:

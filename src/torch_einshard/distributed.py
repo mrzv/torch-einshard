@@ -1,13 +1,15 @@
 import warnings
+import torch.distributed as dist
 
 from .einsum import einsum
 from .mappings import allreduce_forward_identity_backward, \
                        split_forward_allgather_backward, \
                        allgather_forward_split_backward, \
-                       identity_forward_allreduce_backward, \
-                       reducescatter_forward_allgather_backward, \
-                       allgather_forward_reducescatter_backward, \
-                       alltoall_repartition
+                        identity_forward_allreduce_backward, \
+                        reducescatter_forward_allgather_backward, \
+                        allgather_forward_reducescatter_backward, \
+                        alltoall_repartition, \
+                        owner_swap_forward_backward
 from .helpers import resolve_split_shapes
 
 
@@ -102,7 +104,6 @@ def distributed_1d_1(shard, x, mesh, shapes = None):
         and out_axis.shard_dim
         and in_by_name[out_axis.name].shard_dim != out_axis.shard_dim
     ]
-    assert len(shard_dim_changes) <= 1, "Cannot repartition multiple sharded axes between shard dimensions yet"
 
     def group(shard_dim):
         return mesh[shard_dim].get_group()
@@ -160,6 +161,44 @@ def distributed_1d_1(shard, x, mesh, shapes = None):
             dest_shapes,
         )
 
+    def try_multi_axis_owner_swap():
+        if output_partials or [axis.name for axis in input_axes] != [axis.name for axis in output_axes]:
+            return None
+        if len(shard_dim_changes) < 2:
+            return None
+
+        changed = [(in_by_name[name], out_by_name[name]) for name in shard_dim_changes]
+        source_shard_dims = tuple(in_axis.shard_dim for in_axis, _ in changed)
+        dest_shard_dims = tuple(out_axis.shard_dim for _, out_axis in changed)
+        if set(source_shard_dims) != set(dest_shard_dims):
+            return None
+
+        mesh_shape = mesh.mesh.shape
+        mesh_dim_names = mesh.mesh_dim_names
+        for source_shard_dim, dest_shard_dim in zip(source_shard_dims, dest_shard_dims):
+            source_mesh_dim = mesh_dim_names.index(source_shard_dim)
+            dest_mesh_dim = mesh_dim_names.index(dest_shard_dim)
+            if mesh_shape[source_mesh_dim] != mesh_shape[dest_mesh_dim]:
+                return None
+
+        output_shape = list(z.shape)
+        for in_axis, out_axis in changed:
+            source_comm = group(in_axis.shard_dim)
+            dest_comm = group(out_axis.shard_dim)
+            source_shapes = resolve_split_shapes(shapes, in_axis.shard_dim, in_axis.name, source_comm)
+            dest_shapes = resolve_split_shapes(shapes, out_axis.shard_dim, out_axis.name, dest_comm)
+            if source_shapes is None or dest_shapes is None or source_shapes != dest_shapes:
+                return None
+            output_shape[dim_of(out_axis.name)] = dest_shapes[dist.get_rank(dest_comm)]
+
+        return owner_swap_forward_backward(
+            z,
+            mesh,
+            source_shard_dims,
+            dest_shard_dims,
+            tuple(output_shape),
+        )
+
     # Reduce input partials first. If the same mesh dimension appears on an
     # output axis, reduce-scatter directly into that shard; otherwise all-reduce.
     for partial in list(current_partials):
@@ -182,6 +221,15 @@ def distributed_1d_1(shard, x, mesh, shapes = None):
             z = reducescatter_forward_allgather_backward(z, comm, dim, split_shapes)
             current[dim] = scatter_axis
         current_partials.remove(partial)
+
+    optimized = try_multi_axis_owner_swap()
+    if optimized is not None:
+        z = optimized
+        current = list(output_axes)
+        if [axis.name for axis in current] == [axis.name for axis in output_axes]:
+            return z
+
+    assert len(shard_dim_changes) <= 1, "Cannot repartition multiple sharded axes between shard dimensions yet"
 
     optimized = try_same_mesh_repartition()
     if optimized is not None:

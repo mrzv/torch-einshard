@@ -1,5 +1,5 @@
 import torch
-from .helpers import all_reduce, all_gather, all_to_all_repartition, reduce_scatter, roll_sharded, roll_shards, split
+from .helpers import all_reduce, all_gather, all_to_all_repartition, owner_swap, reduce_scatter, roll_sharded, roll_shards, split
 
 class _AllReduceForwardIdentityBackward(torch.autograd.Function):
     """AllReduce in forward, Identity in backward"""
@@ -104,6 +104,26 @@ class _AllToAllRepartition(torch.autograd.Function):
         ), None, None, None, None, None
 
 
+class _OwnerSwap(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, input, mesh, source_shard_dims, dest_shard_dims, output_shape):
+        ctx.mesh = mesh
+        ctx.source_shard_dims = source_shard_dims
+        ctx.dest_shard_dims = dest_shard_dims
+        ctx.input_shape = tuple(input.shape)
+        return owner_swap(input, mesh, source_shard_dims, dest_shard_dims, output_shape)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return owner_swap(
+            grad_output,
+            ctx.mesh,
+            ctx.dest_shard_dims,
+            ctx.source_shard_dims,
+            ctx.input_shape,
+        ), None, None, None, None, None
+
+
 class _RollShards(torch.autograd.Function):
     @staticmethod
     def forward(ctx, input, comm, shard_shift):
@@ -149,6 +169,9 @@ def allgather_forward_reducescatter_backward(input, comm, dim, shapes):
 
 def alltoall_repartition(input, comm, source_dim, dest_dim, source_shapes, dest_shapes):
     return _AllToAllRepartition.apply(input, comm, source_dim, dest_dim, source_shapes, dest_shapes)
+
+def owner_swap_forward_backward(input, mesh, source_shard_dims, dest_shard_dims, output_shape):
+    return _OwnerSwap.apply(input, mesh, source_shard_dims, dest_shard_dims, output_shape)
 
 def roll_shards_forward_backward(input, comm, shard_shift):
     return _RollShards.apply(input, comm, shard_shift)

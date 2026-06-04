@@ -85,7 +85,7 @@ z = es.einshard("b t c h w -> b t h w c", x)
 
 ## Supported Distributed Unary Patterns
 
-Unary distributed operations support split, gather, multi-axis split/gather, and gather-then-split repartition.
+Unary distributed operations support split, gather, multi-axis split/gather, optimized ownership swaps, and gather-then-split repartition.
 
 Single-axis split:
 
@@ -149,7 +149,7 @@ z = es.einshard(
 )
 ```
 
-Current repartition semantics are correctness-first: gather the source sharded axis, then split the destination axis. Same-mesh axis-to-axis repartition uses a point-to-point all-to-all-style exchange when split metadata is available, and falls back to gather/split otherwise. Performance-sensitive repartition fallbacks emit `RuntimeWarning`.
+Current repartition semantics are correctness-first: gather the source sharded axis, then split the destination axis. Same-mesh axis-to-axis repartition uses a point-to-point all-to-all-style exchange when split metadata is available, and falls back to gather/split otherwise. Pure multi-axis ownership swaps across equal-sized mesh dimensions, such as `b h/sp1 w/sp2 c -> b h/sp2 w/sp1 c`, exchange local blocks directly when matching split metadata is available. Performance-sensitive repartition fallbacks emit `RuntimeWarning`.
 
 Partial-to-full all-reduce:
 
@@ -391,7 +391,7 @@ Full distributed test suite:
 - The grammar supports at most two input tensors.
 - Partial notation represents sum reductions only.
 - Repartition and `einroll` still use correctness-first gather/split fallbacks for unsupported cases or missing shape metadata; performance-sensitive fallbacks emit `RuntimeWarning`.
-- Multi-axis repartition swaps between mesh dimensions are not implemented.
+- Multi-axis repartition swaps are currently limited to pure ownership swaps across equal-sized mesh dimensions with matching split metadata.
 - Parenthesized partial reductions over multiple mesh dimensions are applied sequentially; use `wrap_mesh` with a compound name for a single compound group reduction.
 
 Invalid public `einshard` and `einroll` expressions raise `ValueError` with the original expression included in the message.

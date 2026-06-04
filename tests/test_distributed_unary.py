@@ -1,6 +1,7 @@
 import pytest
 import torch
 import torch.distributed as dist
+from torch.distributed.device_mesh import init_device_mesh
 
 import torch_einshard as es
 
@@ -160,6 +161,44 @@ def test_repartition_between_mesh_dimensions(dist_env, mesh_2d):
 
     expected = torch.split(full.detach(), sp_shapes, dim=0)[sp_rank]
     assert_close(z, expected)
+
+
+def test_multi_axis_ownership_swap(dist_env):
+    if dist_env.world_size == 1:
+        mesh_shape = (1, 1, 1)
+    elif dist_env.world_size % 4 == 0:
+        mesh_shape = (dist_env.world_size // 4, 2, 2)
+    else:
+        pytest.skip("test requires one process or a world size divisible by 4")
+    mesh = init_device_mesh(dist_env.device, mesh_shape, mesh_dim_names=("dp", "sp1", "sp2"))
+    sp1_group = mesh["sp1"].get_group()
+    sp2_group = mesh["sp2"].get_group()
+    sp1_rank = dist.get_rank(sp1_group)
+    sp2_rank = dist.get_rank(sp2_group)
+    sp_size = dist.get_world_size(sp1_group)
+    h_shapes = es.helpers.compute_split_shapes(5, sp_size)
+    w_shapes = es.helpers.compute_split_shapes(7, sp_size)
+
+    full = torch.randn(2, 5, 7, 3, requires_grad=True)
+    x = torch.split(full.detach(), h_shapes, dim=1)[sp1_rank]
+    x = torch.split(x, w_shapes, dim=2)[sp2_rank].clone().requires_grad_(True)
+
+    z = es.einshard(
+        "b h/sp1 w/sp2 c -> b h/sp2 w/sp1 c",
+        x,
+        mesh=mesh,
+        shapes={
+            "sp1": {"h": h_shapes, "w": w_shapes},
+            "sp2": {"h": h_shapes, "w": w_shapes},
+        },
+    )
+
+    expected = torch.split(full.detach(), h_shapes, dim=1)[sp2_rank]
+    expected = torch.split(expected, w_shapes, dim=2)[sp1_rank]
+    assert_close(z, expected)
+
+    z.sum().backward()
+    assert_close(x.grad, torch.ones_like(x))
 
 
 def test_partial_to_full(dist_env, mesh_tp):
