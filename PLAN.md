@@ -75,9 +75,24 @@ Remaining work:
 
 ## Parameter Metadata
 
-Parameter sharding is expressible with axis notation, but shared/reduced metadata is not yet represented.
+Parameter sharding is expressible with axis notation. `ParamSpec` now represents persistent parameter layout plus shared-value and gradient-reduction metadata.
 
-Possible module-level annotations:
+Implemented Python API:
+
+```python
+es.ParamSpec("o c", shared=("tp-sp1-sp2",), reduce=("sp1-sp2",))
+es.ParamSpec("o/tp c", shared=("sp1-sp2",), reduce=("sp1-sp2",))
+es.ParamSpec("o c/tp", shared=("sp1-sp2",), reduce=("sp1-sp2",))
+```
+
+Implemented behavior:
+
+- `sync_param_` broadcasts parameter values from group rank 0 over `shared` mesh groups.
+- `reduce_grad_` sum-all-reduces `param.grad` over `reduce` mesh groups.
+- Compound names work through `wrap_mesh`.
+- `shared` metadata is rejected when it overlaps with axis shard dimensions.
+
+Deferred string notation:
 
 ```text
 [o c] shared(tp-sp1-sp2) reduce(sp1-sp2)
@@ -85,11 +100,11 @@ Possible module-level annotations:
 [o c/tp] shared(sp1-sp2) reduce(sp1-sp2)
 ```
 
-Needed work:
+Remaining work:
 
-- Decide whether parameter metadata belongs in this package or a higher-level module layer.
-- Define synchronization and gradient-reduction semantics.
-- Add tests only after a concrete API is chosen.
+- Decide whether bracketed string notation is needed in addition to the Python API.
+- Add checkpoint-style shard metadata helpers if checkpoint integration needs them.
+- Add module-wide registration helpers if model integration needs them.
 
 ## Deferred Cleanup
 

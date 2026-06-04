@@ -340,12 +340,41 @@ The current `reduce_scatter` helper is implemented as all-reduce followed by spl
 
 Remaining work is tracked in `PLAN.md`. The main open areas are:
 
-- Factored-axis notation for patch/unpatch-style reshapes.
 - Optional notation for autograd-only communication.
-- Optimized all-to-all repartition instead of gather-then-split where possible.
-- Optimized sharded `einroll` using neighbor exchange or all-to-all.
-- Compound mesh groups instead of sequential reductions over listed partial dimensions.
-- A decision on parameter metadata APIs and the incomplete `mesh.py` module.
+- More general multi-axis repartition where changed mesh dimensions are not a pure ownership swap.
+- Nested or nonlocal distributed factored-axis transforms, if concrete use cases need them.
+- Checkpoint-style shard metadata derived from parameter specs.
+
+## Parameter Metadata
+
+`ParamSpec` describes persistent parameter layout plus synchronization and gradient-reduction metadata. It does not replace `einshard`; tensor computations still use explicit `einshard(...)` expressions.
+
+```python
+mesh = es.wrap_mesh(mesh)
+weight_spec = es.ParamSpec(
+    "out/tp in",
+    shared=("sp1-sp2",),
+    reduce=("sp1-sp2",),
+)
+
+weight = torch.nn.Parameter(local_weight)
+es.sync_param_(weight, weight_spec, mesh)
+
+y = es.einshard(
+    "batch in, out/tp in -> batch out/tp",
+    x,
+    weight,
+    mesh=mesh,
+    shapes={"tp": {"out": out_shapes}},
+)
+loss = y.sum()
+loss.backward()
+es.reduce_grad_(weight, weight_spec, mesh)
+```
+
+`shared` uses broadcast from group rank 0 to make replicated parameter values identical. `reduce` uses sum all-reduce on `param.grad`. Compound names such as `sp1-sp2` work with `wrap_mesh` and reuse the wrapped mesh's cached compound process groups.
+
+`shared` dimensions cannot overlap with axis shard dimensions in the layout. For example, `ParamSpec("out/tp in", shared="tp")` is rejected because `out` is already sharded over `tp`.
 
 ## Shape Metadata
 
