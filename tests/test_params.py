@@ -1,6 +1,7 @@
 import torch
 import torch.distributed as dist
 from torch import nn
+from torch.nn.parallel import DistributedDataParallel
 
 import torch_einshard as es
 
@@ -72,3 +73,24 @@ def test_reduce_grad_allows_missing_grad(dist_env, mesh_2d):
 
     assert es.reduce_grad_(param, spec, mesh_2d) is param
     assert param.grad is None
+
+
+def test_ddp_grad_reduction_hook_uses_param_specs(dist_env, mesh_2d):
+    model = nn.Linear(1, 1, bias=False)
+    model.weight.data.fill_(1.0)
+    es.set_param_spec(model.weight, es.ParamSpec("o c", reduce="sp"))
+    ddp = DistributedDataParallel(model, process_group=mesh_2d["dp"].get_group())
+    es.register_grad_reduction_hook_(ddp, mesh_2d, ddp_group="dp")
+
+    x = torch.tensor([[float(dist.get_rank() + 1)]])
+    ddp(x).sum().backward()
+
+    dp_size = dist.get_world_size(mesh_2d["dp"].get_group())
+    sp_size = dist.get_world_size(mesh_2d["sp"].get_group())
+    sp_rank = dist.get_rank(mesh_2d["sp"].get_group())
+    expected = 0.0
+    for peer_sp_rank in range(sp_size):
+        expected += 1.0 + peer_sp_rank + sp_size * (dp_size - 1) / 2
+
+    assert sp_rank < sp_size
+    assert_close(model.weight.grad, torch.full_like(model.weight.grad, expected))

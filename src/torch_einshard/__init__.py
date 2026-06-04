@@ -2,7 +2,7 @@ from .einsum import einsum
 from .grammar import parse_sharding, Axes
 from .distributed import distributed_1d
 from .mesh import CompoundDeviceMesh, wrap_mesh
-from .params import ParamSpec, get_param_spec, reduce_grad_, reduce_module_grads_, set_param_spec, sync_module_params_, sync_param_
+from .params import ParamSpec, get_param_spec, reduce_grad_, reduce_module_grads_, register_grad_reduction_hook_, set_param_spec, sync_module_params_, sync_param_
 from .roll import einroll
 from .sharding import AxisGroup
 

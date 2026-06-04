@@ -1,6 +1,7 @@
 from dataclasses import dataclass, field
 
 import torch.distributed as dist
+import torch
 
 from .grammar import parse_sharding
 from .helpers import all_reduce
@@ -94,3 +95,57 @@ def reduce_module_grads_(module, mesh):
         if spec is not None:
             reduce_grad_(param, spec, mesh)
     return module
+
+
+def register_grad_reduction_hook_(ddp_model, mesh, ddp_group="dp"):
+    def bucket_views(bucket):
+        offset = 0
+        views = []
+        buffer = bucket.buffer()
+        for param in bucket.parameters():
+            view = buffer.narrow(0, offset, param.numel()).view_as(param)
+            views.append((param, view))
+            offset += param.numel()
+        return views
+
+    def reduction_hook(state, bucket):
+        buffer = bucket.buffer()
+        group = _group(mesh, ddp_group) if ddp_group is not None else None
+        group_size = dist.get_world_size(group)
+
+        if group_size == 1:
+            future = torch.futures.Future()
+            future.set_result(buffer)
+        else:
+            future = dist.all_reduce(buffer, group=group, async_op=True).get_future()
+
+        def finish(future):
+            if group_size > 1:
+                buffer.div_(group_size)
+
+            views = bucket_views(bucket)
+            groups = sorted({
+                name
+                for param, _ in views
+                for name in (get_param_spec(param).reduce if get_param_spec(param) is not None else ())
+            })
+            for name in groups:
+                grad_views = [
+                    view
+                    for param, view in views
+                    if get_param_spec(param) is not None and name in get_param_spec(param).reduce
+                ]
+                if not grad_views:
+                    continue
+                coalesced = torch.cat([view.reshape(-1) for view in grad_views])
+                dist.all_reduce(coalesced, group=_group(mesh, name))
+                offset = 0
+                for view in grad_views:
+                    view.copy_(coalesced.narrow(0, offset, view.numel()).view_as(view))
+                    offset += view.numel()
+            return buffer
+
+        return future.then(finish)
+
+    ddp_model.register_comm_hook(None, reduction_hook)
+    return ddp_model
