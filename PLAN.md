@@ -2,7 +2,7 @@
 
 This document tracks remaining distributed-pattern work inspired by `../MachineLearning/SciGPT/scaling-transformers-physical-sciences`.
 
-Implemented coverage includes local einsum-style operations, multi-axis unary split/gather, tensor-parallel linear contraction patterns, distributed contractions over one or more sharded contracted axes, low-level identity/all-reduce and reduce-scatter autograd mappings, `//` partial-value notation, gather-then-split repartition semantics, and `einroll` with correctness-first gather/roll/split behavior.
+Implemented coverage includes local einsum-style operations, multi-axis unary split/gather, tensor-parallel linear contraction patterns, distributed contractions over one or more sharded contracted axes, low-level identity/all-reduce and reduce-scatter autograd mappings, `//` partial-value notation, gather-then-split repartition semantics, compound mesh groups, and `einroll` with correctness-first gather/roll/split behavior.
 
 The remaining work is mostly about broadening notation expressiveness, reducing communication overhead, and deciding whether higher-level model/parameter metadata belongs in this package.
 
@@ -46,7 +46,7 @@ b h/sp1 w/sp2 c -> b h/sp2 w/sp1 c
 
 ## Compound Groups
 
-SciGPT uses groups such as `sp1-sp2`, `tp-sp1-sp2`, and `dp-sp1-sp2`. Hyphenated names are accepted in sharding and `//` notation, and `wrap_mesh` resolves them as compound groups over PyTorch `DeviceMesh` dimensions.
+SciGPT uses groups such as `sp1-sp2`, `tp-sp1-sp2`, and `dp-sp1-sp2`. Hyphenated names are accepted in sharding and `//` notation, and `wrap_mesh` resolves them as lazily cached compound groups over PyTorch `DeviceMesh` dimensions.
 
 Axis-wise notation can already describe many operations over separate dimensions:
 
@@ -54,11 +54,15 @@ Axis-wise notation can already describe many operations over separate dimensions
 b h/sp1 w/sp2 c -> b h w c
 ```
 
+Implemented behavior:
+
+- `// (sp1,sp2)` reduces sequentially in the listed order.
+- `// sp1-sp2` reduces over one compound group when the mesh is wrapped with `wrap_mesh`.
+- Equivalent compound names such as `sp1-sp2` and `sp2-sp1` share a cached process group on the wrapped mesh.
+
 Remaining work:
 
-- Optimize scalar reductions over compound groups instead of reducing listed partial dimensions sequentially.
-- Add tests for compound-group reductions and checkpoint-style shard metadata if needed.
-- Decide whether `// (sp1,sp2)` remains the user-facing compound syntax or whether named compound groups should also be accepted.
+- Add checkpoint-style shard metadata tests if a concrete metadata API is added.
 
 ## Parameter Metadata
 
