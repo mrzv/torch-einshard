@@ -1,7 +1,7 @@
 from parsley import makeGrammar
-from .sharding import Axis, Axes, AxisGroup, TensorSpec
+from .sharding import Axis, Axes, AxisGroup, EllipsisAxis, TensorSpec
 
-# TODO: add subscript-notation for parallelism and ellipsis
+# TODO: add subscript-notation for parallelism
 # TODO: for now only two tensors
 grammar = r"""
     ws = (' ' | '\r' | '\n' | '\t')*
@@ -9,9 +9,10 @@ grammar = r"""
     id = <letterOrDigit+>
     mesh_id = <letterOrDigit+ ('-' letterOrDigit+)*>
     sharded = id:a ws '/' ws mesh_id:p -> Axis(a,p)
+    ellipsis = '...' -> EllipsisAxis()
     axis = sharded | id:a -> Axis(a)
     group = '(' (ws axis)+:axs ws ')' -> AxisGroup(axs)
-    axes = (ws (group | axis))+:axs -> Axes(axs)
+    axes = (ws (group | ellipsis | axis))+:axs -> Axes(axs)
     partial_many = '(' ws mesh_id:first (ws ',' ws mesh_id)*:rest ws ')' -> [first] + rest
     partial = ws '//' ws (partial_many | mesh_id:p -> [p])
     tensor = axes:a (partial:p -> p)?:p -> TensorSpec(a, p or [])

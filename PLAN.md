@@ -2,7 +2,7 @@
 
 This document tracks remaining distributed-pattern work inspired by `../MachineLearning/SciGPT/scaling-transformers-physical-sciences`.
 
-Implemented coverage includes local einsum-style operations, local one-level factored axes, multi-axis unary split/gather, tensor-parallel linear contraction patterns, distributed contractions over one or more sharded contracted axes, low-level identity/all-reduce and reduce-scatter autograd mappings, `//` partial-value notation, gather-then-split repartition semantics, optimized same-mesh repartition, pure multi-axis ownership swaps, compound mesh groups, and `einroll` with correctness-first gather/roll/split behavior.
+Implemented coverage includes local einsum-style operations, einsum ellipses for local and supported distributed patterns, local one-level factored axes, multi-axis unary split/gather, tensor-parallel linear contraction patterns, distributed contractions over one or more sharded contracted axes, low-level identity/all-reduce and reduce-scatter autograd mappings, `//` partial-value notation, gather-then-split repartition semantics, optimized same-mesh repartition, pure multi-axis ownership swaps, compound mesh groups, and `einroll` with correctness-first gather/roll/split behavior.
 
 The remaining work is mostly about broadening notation expressiveness, reducing communication overhead, and deciding whether higher-level model/parameter metadata belongs in this package.
 
@@ -28,6 +28,20 @@ Remaining work:
 
 - Decide whether nested groups are needed.
 - Decide whether nonlocal distributed operations should allow grouped axes beyond local reshape-only transformations.
+
+## Ellipses
+
+Einsum-style `...` notation represents unnamed local dimensions.
+
+Implemented behavior:
+
+- Local einsum operations pass ellipses through to `torch.einsum`.
+- Distributed unary split/gather/repartition can use ellipses when input and output both include them.
+- Distributed binary tensor-parallel contraction patterns ignore ellipses in sharding metadata and let local `torch.einsum` handle the unnamed dimensions.
+
+Remaining work:
+
+- Decide whether distributed unary operations should support reducing or introducing ellipsis dimensions, for example `... c -> c` with sharded named axes.
 
 ## Further Repartition Optimization
 

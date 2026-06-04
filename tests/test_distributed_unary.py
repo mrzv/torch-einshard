@@ -26,6 +26,24 @@ def test_single_axis_split_gather_round_trip(dist_env, mesh_1d):
     assert_close(x.grad, 2 * x)
 
 
+def test_ellipsis_single_axis_split_gather_round_trip(dist_env, mesh_1d):
+    group = mesh_1d["dp"].get_group()
+    rank = dist.get_rank(group)
+    rows = dist.get_world_size(group) * 2
+    shapes = es.helpers.compute_split_shapes(rows, dist.get_world_size(group))
+
+    x = torch.randn(2, 3, rows, requires_grad=True)
+    z = es.einshard("... a -> ... a/dp", x, mesh=mesh_1d, shapes=shapes)
+
+    assert z.shape == (2, 3, shapes[rank])
+
+    zz = es.einshard("... a/dp -> ... a", z, mesh=mesh_1d, shapes=shapes)
+    assert_close(zz, x)
+
+    (z ** 2).sum().backward()
+    assert_close(x.grad, 2 * x)
+
+
 def test_multi_axis_split_gather_round_trip(dist_env, mesh_2d):
     sp_group = mesh_2d["sp"].get_group()
     dp_group = mesh_2d["dp"].get_group()

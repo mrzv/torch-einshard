@@ -11,6 +11,7 @@ from .mappings import allreduce_forward_identity_backward, \
                         alltoall_repartition, \
                         owner_swap_forward_backward
 from .helpers import resolve_split_shapes
+from .sharding import Axis, Axes, EllipsisAxis
 
 
 def _axes(spec):
@@ -19,6 +20,36 @@ def _axes(spec):
 
 def _partials(spec):
     return getattr(spec, "partials", ())
+
+
+def _without_ellipsis(axes):
+    return Axes(axis for axis in axes if not isinstance(axis, EllipsisAxis))
+
+
+def _expand_unary_ellipsis(input_axes, output_axes, x):
+    input_has_ellipsis = any(isinstance(axis, EllipsisAxis) for axis in input_axes)
+    output_has_ellipsis = any(isinstance(axis, EllipsisAxis) for axis in output_axes)
+    if not input_has_ellipsis and not output_has_ellipsis:
+        return input_axes, output_axes
+    if input_has_ellipsis != output_has_ellipsis:
+        raise NotImplementedError("Distributed unary ellipsis requires ellipsis in both input and output")
+
+    input_width = x.dim() - (len(input_axes) - 1)
+    output_width = x.dim() - (len(output_axes) - 1)
+    if input_width < 0 or output_width < 0 or input_width != output_width:
+        raise ValueError("Input tensor rank is incompatible with ellipsis notation")
+    ellipsis_axes = Axes(Axis(f"__ellipsis{i}") for i in range(input_width))
+
+    def expand(axes):
+        expanded = Axes()
+        for axis in axes:
+            if isinstance(axis, EllipsisAxis):
+                expanded.extend(ellipsis_axes)
+            else:
+                expanded.append(axis)
+        return expanded
+
+    return expand(input_axes), expand(output_axes)
 
 def augment_parallelism(shard, mesh_dim_names):
     # TODO: add replication
@@ -41,18 +72,21 @@ def distributed_1d(shard, *xs, mesh, shapes):
 def distributed_1d_2(shard, x, y, mesh):
     # TODO: check the dimensions match sharding
 
-    input0_by_name = {axis.name: axis for axis in _axes(shard[0])}
-    input1_by_name = {axis.name: axis for axis in _axes(shard[1])}
-    output_by_name = {axis.name: axis for axis in _axes(shard[2])}
-    output_names = {axis.name for axis in _axes(shard[2])}
+    input0_axes = _without_ellipsis(_axes(shard[0]))
+    input1_axes = _without_ellipsis(_axes(shard[1]))
+    output_axes = _without_ellipsis(_axes(shard[2]))
+    input0_by_name = {axis.name: axis for axis in input0_axes}
+    input1_by_name = {axis.name: axis for axis in input1_axes}
+    output_by_name = {axis.name: axis for axis in output_axes}
+    output_names = {axis.name for axis in output_axes}
     contracted_names = [
-        axis.name for axis in _axes(shard[0])
+        axis.name for axis in input0_axes
         if axis.name in input1_by_name and axis.name not in output_names
     ]
     assert contracted_names, "Expected a contraction axis"
 
     shared_output_names = [
-        axis.name for axis in _axes(shard[0])
+        axis.name for axis in input0_axes
         if axis.name in input1_by_name and axis.name in output_names
     ]
 
@@ -83,6 +117,7 @@ def distributed_1d_1(shard, x, mesh, shapes = None):
     output_spec = shard[2]
     input_axes = _axes(input_spec)
     output_axes = _axes(output_spec)
+    input_axes, output_axes = _expand_unary_ellipsis(input_axes, output_axes, x)
     input_partials = list(_partials(input_spec))
     output_partials = list(_partials(output_spec))
 

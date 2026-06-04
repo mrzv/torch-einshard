@@ -1,7 +1,7 @@
 import string
 import torch
 
-from .sharding import AxisGroup
+from .sharding import AxisGroup, EllipsisAxis
 
 
 def _axes(spec):
@@ -15,6 +15,17 @@ def _flat_axes(spec):
 
 def _has_groups(spec):
     return any(isinstance(axis, AxisGroup) for axis in _axes(spec))
+
+
+def _append_axis(equation, axis, shard_to_einsum, idx, name_only):
+    if isinstance(axis, EllipsisAxis):
+        return equation + "...", idx
+    if name_only:
+        axis = axis.name
+    if axis not in shard_to_einsum:
+        shard_to_einsum[axis] = string.ascii_lowercase[idx]
+        idx += 1
+    return equation + shard_to_einsum[axis], idx
 
 
 def _resolve_group_shape(dim_size, group, sizes):
@@ -48,12 +59,18 @@ def _expand_groups(input, spec, sizes):
 
     shape = []
     dim = 0
+    fixed_dims = sum(1 for axis in _axes(spec) if not isinstance(axis, EllipsisAxis))
+    ellipsis_dims = input.dim() - fixed_dims
     for axis in _axes(spec):
-        if isinstance(axis, AxisGroup):
+        if isinstance(axis, EllipsisAxis):
+            shape.extend(input.shape[dim:dim + ellipsis_dims])
+            dim += ellipsis_dims
+        elif isinstance(axis, AxisGroup):
             shape.extend(_resolve_group_shape(input.shape[dim], axis, sizes))
+            dim += 1
         else:
             shape.append(input.shape[dim])
-        dim += 1
+            dim += 1
     return input.reshape(shape)
 
 
@@ -63,8 +80,13 @@ def _pack_groups(output, spec):
 
     shape = []
     dim = 0
+    fixed_dims = sum(len(axis) if isinstance(axis, AxisGroup) else 1 for axis in _axes(spec) if not isinstance(axis, EllipsisAxis))
+    ellipsis_dims = output.dim() - fixed_dims
     for axis in _axes(spec):
-        if isinstance(axis, AxisGroup):
+        if isinstance(axis, EllipsisAxis):
+            shape.extend(output.shape[dim:dim + ellipsis_dims])
+            dim += ellipsis_dims
+        elif isinstance(axis, AxisGroup):
             size = 1
             for _ in axis:
                 size *= output.shape[dim]
@@ -92,28 +114,20 @@ def einsum(shard, *xs, name_only = False, sizes = None):
             xs[1] = _expand_groups(xs[1], shard[1], sizes)
 
     for i,n in enumerate(_flat_axes(shard[0])):
-        if name_only:
-            n = n.name
-        if n not in shard_to_einsum:
-            shard_to_einsum[n] = string.ascii_lowercase[idx]
-            idx += 1
-        equation += shard_to_einsum[n]
+        equation, idx = _append_axis(equation, n, shard_to_einsum, idx, name_only)
 
     if shard[1] is not None:
         equation += ','
         for i,n in enumerate(_flat_axes(shard[1])):
-            if name_only:
-                n = n.name
-            if n not in shard_to_einsum:
-                shard_to_einsum[n] = string.ascii_lowercase[idx]
-                idx += 1
-            equation += shard_to_einsum[n]
+            equation, idx = _append_axis(equation, n, shard_to_einsum, idx, name_only)
     equation += '->'
     for i,n in enumerate(_flat_axes(shard[2])):
-        if name_only:
-            n = n.name
-        assert n in shard_to_einsum, f"Output dimension {n} must be present in input"
-        equation += shard_to_einsum[n]
+        if isinstance(n, EllipsisAxis):
+            equation += "..."
+            continue
+        key = n.name if name_only else n
+        assert key in shard_to_einsum, f"Output dimension {n} must be present in input"
+        equation += shard_to_einsum[key]
 
     output = torch.einsum(equation, *xs)
     if name_only:

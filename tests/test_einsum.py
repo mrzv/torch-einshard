@@ -35,6 +35,34 @@ def test_diagonal():
     torch.testing.assert_close(z, zz)
 
 
+def test_ellipsis_contract():
+    x = torch.randn(2, 3, 4)
+    w = torch.randn(4, 5)
+
+    z = es.einshard("... c, c o -> ... o", x, w)
+    torch.testing.assert_close(z, torch.einsum("...c,co->...o", x, w))
+
+
+def test_ellipsis_reduction():
+    x = torch.randn(2, 3, 4)
+
+    z = es.einshard("... c -> c", x)
+    torch.testing.assert_close(z, torch.einsum("...c->c", x))
+
+
+def test_ellipsis_permutation():
+    x = torch.randn(2, 3, 4, 5)
+
+    z = es.einshard("b ... c -> ... b c", x)
+    torch.testing.assert_close(z, torch.einsum("b...c->...bc", x))
+
+
+def test_ellipsis_with_factored_axis():
+    x = torch.randn(2, 3, 12, 5)
+    z = es.einshard("... (h p) c -> ... h p c", x, sizes={"p": 4})
+    torch.testing.assert_close(z, x.reshape(2, 3, 3, 4, 5))
+
+
 def test_expand_factored_axis():
     x = torch.randn(2, 12, 5)
 

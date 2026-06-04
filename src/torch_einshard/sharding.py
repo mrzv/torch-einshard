@@ -25,6 +25,23 @@ class Axis:
         return self.name == other.name and self.shard_dim == other.shard_dim
 
 
+class EllipsisAxis:
+    name = "..."
+    shard_dim = ""
+
+    def local(self) -> bool:
+        return True
+
+    def __repr__(self):
+        return "..."
+
+    def __hash__(self):
+        return hash(EllipsisAxis)
+
+    def __eq__(self, other: object):
+        return isinstance(other, EllipsisAxis)
+
+
 class AxisGroup:
     def __init__(self, axes) -> None:
         self.axes = Axes(axes)
@@ -70,6 +87,8 @@ class Axes(list):
 
 class TensorSpec:
     def __init__(self, axes: Axes, partials = None) -> None:
+        if sum(isinstance(axis, EllipsisAxis) for axis in axes) > 1:
+            raise ValueError("Tensor specs may contain at most one ellipsis")
         self.axes = axes
         self.partials = tuple(partials or [])
 

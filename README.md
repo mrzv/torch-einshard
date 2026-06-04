@@ -83,6 +83,20 @@ Local axis permutation:
 z = es.einshard("b t c h w -> b t h w c", x)
 ```
 
+Einsum ellipses are supported for unnamed local dimensions:
+
+```python
+z = es.einshard("... c, c o -> ... o", x, w)
+z = es.einshard("... c -> c", x)
+```
+
+Distributed unary split/gather and tensor-parallel binary contractions can also use ellipses for unsharded leading dimensions:
+
+```python
+z = es.einshard("... a -> ... a/dp", x, mesh=mesh, shapes=shapes)
+z = es.einshard("... c, h/tp c -> ... h/tp", x, w, mesh=mesh)
+```
+
 Factored axes use one-level parenthesized groups. Grouped input dimensions are expanded before the local `einsum`, and grouped output dimensions are packed after it:
 
 ```python

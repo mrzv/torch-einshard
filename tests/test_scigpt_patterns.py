@@ -35,6 +35,29 @@ def test_tensor_parallel_mlp_pattern(dist_env, mesh_tp):
     assert_close(y, expected)
 
 
+def test_tensor_parallel_mlp_pattern_with_ellipsis(dist_env, mesh_tp):
+    group = mesh_tp["tp"].get_group()
+    rank = dist.get_rank(group)
+    size = dist.get_world_size(group)
+    batch, seq, channels, out_channels = 2, 3, 4, 5
+    hidden = size * 3
+    hidden_shapes = es.helpers.compute_split_shapes(hidden, size)
+
+    x = torch.randn(batch, seq, channels)
+    w1 = torch.randn(hidden, channels)
+    w2 = torch.randn(out_channels, hidden)
+    w1_shard = torch.split(w1, hidden_shapes, dim=0)[rank].contiguous()
+    w2_shard = torch.split(w2, hidden_shapes, dim=1)[rank].contiguous()
+
+    h = es.einshard("... c, h/tp c -> ... h/tp", x, w1_shard, mesh=mesh_tp)
+    y_partial = es.einshard("... h/tp, o h/tp -> ... o // tp", h, w2_shard, mesh=mesh_tp)
+    y = es.einshard("... o // tp -> ... o", y_partial, mesh=mesh_tp)
+
+    expected = torch.einsum("...c,hc->...h", x, w1)
+    expected = torch.einsum("...h,oh->...o", expected, w2)
+    assert_close(y, expected)
+
+
 def test_tensor_parallel_attention_projection_pattern(dist_env, mesh_tp):
     group = mesh_tp["tp"].get_group()
     rank = dist.get_rank(group)

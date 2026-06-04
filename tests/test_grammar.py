@@ -42,6 +42,19 @@ def test_parse_axis_group():
     assert [axis.name for axis in z.axes] == ["b", "h", "p", "c"]
 
 
+def test_parse_ellipsis_axis():
+    x, y, z = sharding("... c -> ... c").map()
+
+    assert y is None
+    assert [axis.name for axis in x.axes] == ["...", "c"]
+    assert [axis.name for axis in z.axes] == ["...", "c"]
+
+
+def test_parse_rejects_multiple_ellipsis_axes():
+    with pytest.raises(ValueError, match="at most one ellipsis"):
+        sharding("... a ... -> a").map()
+
+
 def test_parse_sharded_axis_in_group():
     x, y, z = sharding("b (h/sp p) c -> b h/sp p c").map()
 
