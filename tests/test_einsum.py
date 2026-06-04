@@ -1,4 +1,5 @@
 import torch
+import pytest
 import torch_einshard as es
 
 
@@ -32,3 +33,51 @@ def test_diagonal():
     zz = torch.einsum('ii->i', x)
 
     torch.testing.assert_close(z, zz)
+
+
+def test_expand_factored_axis():
+    x = torch.randn(2, 12, 5)
+
+    z = es.einshard("b (h p) c -> b h p c", x, sizes={"p": 4})
+
+    torch.testing.assert_close(z, x.reshape(2, 3, 4, 5))
+
+
+def test_pack_factored_axis():
+    x = torch.randn(2, 3, 4, 5)
+
+    z = es.einshard("b h p c -> b (h p) c", x)
+
+    torch.testing.assert_close(z, x.reshape(2, 12, 5))
+
+
+def test_factored_axis_with_permutation():
+    x = torch.randn(2, 12, 5)
+    z = es.einshard("b (h p) c -> b c h p", x, sizes={"h": 3})
+
+    torch.testing.assert_close(z, x.reshape(2, 3, 4, 5).permute(0, 3, 1, 2))
+
+
+def test_factored_axis_requires_unique_inference():
+    x = torch.randn(2, 12, 5)
+
+    try:
+        es.einshard("b (h p) c -> b h p c", x)
+    except ValueError as error:
+        assert "Cannot infer multiple factor sizes" in str(error)
+    else:
+        raise AssertionError("Expected ambiguous factor sizes to fail")
+
+
+def test_factored_axis_allows_sharded_annotation_locally():
+    x = torch.randn(2, 12, 5)
+
+    z = es.einshard("b (h/sp p) c -> b h/sp p c", x, sizes={"p": 4})
+    torch.testing.assert_close(z, x.reshape(2, 3, 4, 5))
+
+
+def test_factored_axis_rejects_nonlocal_distributed_transform():
+    x = torch.randn(2, 12, 5)
+
+    with pytest.raises(NotImplementedError, match="local reshape operations"):
+        es.einshard("b (h p) c -> b h/sp p c", x, sizes={"p": 4})

@@ -2,26 +2,32 @@
 
 This document tracks remaining distributed-pattern work inspired by `../MachineLearning/SciGPT/scaling-transformers-physical-sciences`.
 
-Implemented coverage includes local einsum-style operations, multi-axis unary split/gather, tensor-parallel linear contraction patterns, distributed contractions over one or more sharded contracted axes, low-level identity/all-reduce and reduce-scatter autograd mappings, `//` partial-value notation, gather-then-split repartition semantics, optimized same-mesh repartition, pure multi-axis ownership swaps, compound mesh groups, and `einroll` with correctness-first gather/roll/split behavior.
+Implemented coverage includes local einsum-style operations, local one-level factored axes, multi-axis unary split/gather, tensor-parallel linear contraction patterns, distributed contractions over one or more sharded contracted axes, low-level identity/all-reduce and reduce-scatter autograd mappings, `//` partial-value notation, gather-then-split repartition semantics, optimized same-mesh repartition, pure multi-axis ownership swaps, compound mesh groups, and `einroll` with correctness-first gather/roll/split behavior.
 
 The remaining work is mostly about broadening notation expressiveness, reducing communication overhead, and deciding whether higher-level model/parameter metadata belongs in this package.
 
 ## Factored Axes
 
-Patch expansion and unpatching would be clearer if notation could represent factored logical axes.
+Patch expansion and unpatching use one-level parenthesized groups to represent factored logical axes.
 
-Possible notation:
+Implemented notation:
 
 ```text
-b t h w p q c -> b t c h p w q
+b t (h p) (w q) c -> b t c h p w q
+b t h p w q c -> b t (h p) (w q) c
 ```
 
-Open questions:
+Implemented behavior:
 
-- How should factored axes map to concrete tensor dimensions?
-- Should factors be first-class grammar nodes or only local reshape annotations?
-- How should shape metadata be supplied for factored axes?
-- How should factored axes compose with sharding, for example patching an axis that is already sharded?
+- Factor groups are first-class parser nodes but lower to local reshape operations around `torch.einsum`.
+- Factor sizes are supplied with the public `sizes` argument.
+- Exactly one omitted factor size per group can be inferred from the concrete tensor dimension.
+- Sharded annotations inside a group are allowed when the operation remains local, for example `(h/sp p) -> h/sp p`.
+
+Remaining work:
+
+- Decide whether nested groups are needed.
+- Decide whether nonlocal distributed operations should allow grouped axes beyond local reshape-only transformations.
 
 ## Further Repartition Optimization
 

@@ -33,6 +33,24 @@ def test_parse_shard_to_partial():
     assert z.partials == ("tp",)
 
 
+def test_parse_axis_group():
+    x, y, z = sharding("b (h p) c -> b h p c").map()
+
+    assert y is None
+    assert [axis.name for axis in x.axes[1].axes] == ["h", "p"]
+    assert [axis.name for axis in x.axes.flat()] == ["b", "h", "p", "c"]
+    assert [axis.name for axis in z.axes] == ["b", "h", "p", "c"]
+
+
+def test_parse_sharded_axis_in_group():
+    x, y, z = sharding("b (h/sp p) c -> b h/sp p c").map()
+
+    assert y is None
+    assert x.axes[1].axes[0].name == "h"
+    assert x.axes[1].axes[0].shard_dim == "sp"
+    assert z.axes[1].shard_dim == "sp"
+
+
 def test_parse_hyphenated_mesh_dimension_name():
     x, y, z = sharding("b n/tp-sp h -> b n h // tp-sp").map()
 

@@ -24,8 +24,25 @@ class Axis:
 
         return self.name == other.name and self.shard_dim == other.shard_dim
 
+
+class AxisGroup:
+    def __init__(self, axes) -> None:
+        self.axes = Axes(axes)
+
+    def local(self) -> bool:
+        return self.axes.local()
+
+    def __iter__(self):
+        return iter(self.axes)
+
+    def __len__(self):
+        return len(self.axes)
+
+    def __repr__(self):
+        return f"({' '.join(str(axis) for axis in self.axes)})"
+
 # TODO: eventually add replication, so this won't be just a list
-class Axes(list[Axis]):
+class Axes(list):
     def __repr__(self):
         return " × ".join(str(x) for x in self)
 
@@ -36,7 +53,20 @@ class Axes(list[Axis]):
         return True
 
     def all_shard_dims(self):
-        return [x.shard_dim for x in self if x.shard_dim]
+        dims = []
+        for x in self:
+            axes = x.axes if isinstance(x, AxisGroup) else [x]
+            dims.extend(axis.shard_dim for axis in axes if axis.shard_dim)
+        return dims
+
+    def flat(self):
+        axes = []
+        for x in self:
+            if isinstance(x, AxisGroup):
+                axes.extend(x.axes)
+            else:
+                axes.append(x)
+        return Axes(axes)
 
 class TensorSpec:
     def __init__(self, axes: Axes, partials = None) -> None:

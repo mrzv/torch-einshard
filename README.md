@@ -83,6 +83,15 @@ Local axis permutation:
 z = es.einshard("b t c h w -> b t h w c", x)
 ```
 
+Factored axes use one-level parenthesized groups. Grouped input dimensions are expanded before the local `einsum`, and grouped output dimensions are packed after it:
+
+```python
+z = es.einshard("b (h p) c -> b h p c", x, sizes={"p": 4})
+z = es.einshard("b h p c -> b (h p) c", z)
+```
+
+Factor sizes are inferred from tensor dimensions when exactly one factor in a group is omitted from `sizes`. Supplying no sizes for a group such as `(h p)` is ambiguous and raises `ValueError`.
+
 ## Supported Distributed Unary Patterns
 
 Unary distributed operations support split, gather, multi-axis split/gather, optimized ownership swaps, and gather-then-split repartition.
@@ -390,6 +399,7 @@ Full distributed test suite:
 
 - The grammar supports at most two input tensors.
 - Partial notation represents sum reductions only.
+- Factored axes support one-level parenthesized groups; grouped transformations are local reshape operations around `torch.einsum`.
 - Repartition and `einroll` still use correctness-first gather/split fallbacks for unsupported cases or missing shape metadata; performance-sensitive fallbacks emit `RuntimeWarning`.
 - Multi-axis repartition swaps are currently limited to pure ownership swaps across equal-sized mesh dimensions with matching split metadata.
 - Parenthesized partial reductions over multiple mesh dimensions are applied sequentially; use `wrap_mesh` with a compound name for a single compound group reduction.

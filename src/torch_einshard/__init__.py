@@ -3,10 +3,18 @@ from .grammar import parse_sharding, Axes
 from .distributed import distributed_1d
 from .mesh import CompoundDeviceMesh, wrap_mesh
 from .roll import einroll
+from .sharding import AxisGroup
 
 
 def _axes(spec):
     return spec.axes if hasattr(spec, "axes") else spec
+
+def _flat_axes(spec):
+    axes = _axes(spec)
+    return axes.flat() if hasattr(axes, "flat") else axes
+
+def _has_groups(spec):
+    return any(isinstance(axis, AxisGroup) for axis in _axes(spec))
 
 def all_local(shard):
     for s in shard:
@@ -20,15 +28,18 @@ def local_operation(shard):
 
     if shard[1] is None:
         # X -> Z
-        return Axes(set(_axes(shard[0])) ^ set(_axes(shard[2]))).local()
+        return Axes(set(_flat_axes(shard[0])) ^ set(_flat_axes(shard[2]))).local()
     else:
         # X,Y -> Z
-        return Axes(set(_axes(shard[0])) & set(_axes(shard[1]))).local()
+        return Axes(set(_flat_axes(shard[0])) & set(_flat_axes(shard[1]))).local()
 
-def einshard(shard, *xs, mesh = None, shapes = None):
+def einshard(shard, *xs, mesh = None, shapes = None, sizes = None):
     shard = parse_sharding(shard)
 
     if local_operation(shard):
-        return einsum(shard, *xs)
+        return einsum(shard, *xs, sizes=sizes)
+
+    if any(_has_groups(s) for s in shard if s is not None):
+        raise NotImplementedError("Factored axes are currently supported only for local reshape operations")
 
     return distributed_1d(shard, *xs, mesh = mesh, shapes = shapes)
