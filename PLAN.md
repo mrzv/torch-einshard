@@ -46,7 +46,7 @@ b h/sp1 w/sp2 c -> b h/sp2 w/sp1 c
 
 ## Compound Groups
 
-SciGPT uses groups such as `sp1-sp2`, `tp-sp1-sp2`, and `dp-sp1-sp2`. Hyphenated names are accepted in sharding and `//` notation when they correspond to actual mesh-dimension names.
+SciGPT uses groups such as `sp1-sp2`, `tp-sp1-sp2`, and `dp-sp1-sp2`. Hyphenated names are accepted in sharding and `//` notation, and `wrap_mesh` resolves them as compound groups over PyTorch `DeviceMesh` dimensions.
 
 Axis-wise notation can already describe many operations over separate dimensions:
 
@@ -56,7 +56,6 @@ b h/sp1 w/sp2 c -> b h w c
 
 Remaining work:
 
-- Decide whether hyphenated names should also be resolved automatically as compound groups built from multiple mesh dimensions.
 - Optimize scalar reductions over compound groups instead of reducing listed partial dimensions sequentially.
 - Add tests for compound-group reductions and checkpoint-style shard metadata if needed.
 - Decide whether `// (sp1,sp2)` remains the user-facing compound syntax or whether named compound groups should also be accepted.
@@ -83,6 +82,5 @@ Needed work:
 
 These are known cleanup items rather than new features.
 
-- Decide whether `src/torch_einshard/mesh.py` should be completed or removed in favor of PyTorch `DeviceMesh`.
 - Consider whether the grammar should support more than two input tensors.
 - Keep README examples aligned with tests as more distributed cases are added.

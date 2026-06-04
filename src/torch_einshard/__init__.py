@@ -1,6 +1,7 @@
 from .einsum import einsum
 from .grammar import parse_sharding, Axes
 from .distributed import distributed_1d
+from .mesh import CompoundDeviceMesh, wrap_mesh
 from .roll import einroll
 
 

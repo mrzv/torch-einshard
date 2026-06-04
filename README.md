@@ -45,6 +45,15 @@ mesh = init_device_mesh("cpu", (2, 4), mesh_dim_names=("dp", "sp"))
 z = es.einshard("a/sp b/dp, b/dp c -> a/sp c", x, y, mesh=mesh)
 ```
 
+Compound mesh groups can be enabled by wrapping a PyTorch `DeviceMesh`:
+
+```python
+mesh = es.wrap_mesh(mesh)
+z = es.einshard("loss // dp-sp -> loss", loss, mesh=mesh)
+```
+
+Compound names such as `dp-sp` span the listed mesh dimensions while preserving any remaining mesh coordinates.
+
 ## Supported Local Patterns
 
 Local operations are translated to `torch.einsum`.
@@ -382,7 +391,6 @@ Full distributed test suite:
 - Partial notation represents sum reductions only.
 - Repartition and `einroll` still use correctness-first gather/split fallbacks for unsupported cases or missing shape metadata; performance-sensitive fallbacks emit `RuntimeWarning`.
 - Multi-axis repartition swaps between mesh dimensions are not implemented.
-- Partial reductions over multiple mesh dimensions are applied sequentially; compound mesh-group resolution is not yet implemented.
-- `src/torch_einshard/mesh.py` is incomplete; tests and examples use PyTorch `DeviceMesh`.
+- Parenthesized partial reductions over multiple mesh dimensions are applied sequentially; use `wrap_mesh` with a compound name for a single compound group reduction.
 
 Invalid public `einshard` and `einroll` expressions raise `ValueError` with the original expression included in the message.

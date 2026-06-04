@@ -234,3 +234,18 @@ def test_scalar_multiple_partials_to_full(dist_env, mesh_2d):
 
     expected = torch.tensor(float(world_size * (world_size + 1) // 2))
     assert_close(z, expected)
+
+
+def test_scalar_compound_partial_to_full(dist_env, mesh_2d):
+    mesh = es.wrap_mesh(mesh_2d)
+    world_rank = dist.get_rank()
+    world_size = dist.get_world_size()
+
+    x = torch.tensor(float(world_rank + 1), requires_grad=True)
+    z = es.einshard("loss // dp-sp -> loss", x, mesh=mesh)
+
+    expected = torch.tensor(float(world_size * (world_size + 1) // 2))
+    assert_close(z, expected)
+
+    z.backward()
+    assert_close(x.grad, torch.ones_like(x))
