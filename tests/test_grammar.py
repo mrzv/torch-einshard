@@ -1,6 +1,7 @@
 import pytest
 
 import torch_einshard as es
+from torch_einshard.families import cached_expand_axis_families
 from torch_einshard.grammar import parse_sharding, sharding
 
 
@@ -84,6 +85,21 @@ def test_parse_hyphenated_mesh_dimension_in_partial_list():
 def test_parse_sharding_wraps_parse_errors():
     with pytest.raises(ValueError, match="Invalid einshard expression"):
         parse_sharding("a b ->")
+
+
+def test_parse_sharding_reuses_cached_result():
+    assert parse_sharding("a b -> b a") is parse_sharding("a b -> b a")
+
+
+def test_cached_axis_family_expansion_accepts_list_values():
+    expression = "b [*spatial *window] c -> b *spatial *window c"
+    families = {"spatial": ["h", "w"], "window": ["wh", "ww"]}
+    sizes = {"window": [4, 5]}
+
+    expanded, expanded_sizes = cached_expand_axis_families(expression, sizes, families)
+
+    assert expanded == "b (h wh) (w ww) c -> b h w wh ww c"
+    assert expanded_sizes == {"wh": 4, "ww": 5}
 
 
 def test_einshard_wraps_parse_errors():
