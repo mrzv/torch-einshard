@@ -23,3 +23,10 @@ def test_wrap_mesh_compound_group(dist_env, mesh_2d):
     es.helpers.all_reduce(x, group)
 
     assert_close(x, torch.tensor(float(world_size * (world_size + 1) // 2)))
+
+
+def test_wrap_mesh_caches_compound_groups(dist_env, mesh_2d):
+    mesh = es.wrap_mesh(mesh_2d)
+
+    assert mesh["dp-sp"].get_group() is mesh["dp-sp"].get_group()
+    assert mesh["dp-sp"].get_group() is mesh["sp-dp"].get_group()

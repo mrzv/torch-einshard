@@ -32,6 +32,7 @@ class CompoundDeviceMesh:
         return _MeshDim(self._compound_group(dim_names))
 
     def _compound_group(self, dim_names):
+        dim_names = tuple(sorted(dim_names, key=self._name_to_dim.__getitem__))
         if dim_names in self._compound_groups:
             return self._compound_groups[dim_names]
         if not dist.is_initialized():

@@ -53,6 +53,7 @@ z = es.einshard("loss // dp-sp -> loss", loss, mesh=mesh)
 ```
 
 Compound names such as `dp-sp` span the listed mesh dimensions while preserving any remaining mesh coordinates.
+Compound process groups are created lazily on first lookup and cached on the wrapped mesh. Reuse the wrapped mesh instance instead of calling `wrap_mesh` repeatedly; equivalent names such as `dp-sp` and `sp-dp` share the same cached group.
 
 ## Supported Local Patterns
 
