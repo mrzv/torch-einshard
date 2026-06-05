@@ -3,7 +3,21 @@ from .grammar import parse_sharding, Axes
 from .distributed import distributed_1d
 from .families import cached_expand_axis_families
 from .mesh import CompoundDeviceMesh, wrap_mesh
-from .params import ParamSpec, get_param_spec, reduce_grad_, reduce_module_grads_, register_grad_reduction_hook_, set_param_spec, sync_module_params_, sync_param_
+from .params import (
+    ParamShardMetadata,
+    ParamSpec,
+    get_param_spec,
+    param_local_shape,
+    param_local_slices,
+    param_shard_dims,
+    param_shard_metadata,
+    reduce_grad_,
+    reduce_module_grads_,
+    register_grad_reduction_hook_,
+    set_param_spec,
+    sync_module_params_,
+    sync_param_,
+)
 from .roll import einroll
 from .sharding import AxisGroup
 

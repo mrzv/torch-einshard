@@ -28,6 +28,80 @@ def test_param_spec_rejects_shared_sharded_axis_overlap():
         raise AssertionError("Expected overlapping shared and sharded metadata to fail")
 
 
+def test_param_shard_dims_reads_specs_from_params():
+    param = torch.nn.Parameter(torch.zeros(2, 3))
+    spec = es.ParamSpec("o/tp c/sp")
+    es.set_param_spec(param, spec)
+
+    assert es.param_shard_dims(spec) == ("tp", "sp")
+    assert es.param_shard_dims(param) == ("tp", "sp")
+
+
+def test_param_shard_dims_requires_attached_spec():
+    param = torch.nn.Parameter(torch.zeros(2, 3))
+
+    try:
+        es.param_shard_dims(param)
+    except ValueError as error:
+        assert "ParamSpec" in str(error)
+    else:
+        raise AssertionError("Expected missing ParamSpec to fail")
+
+
+def test_param_local_slices_uses_mesh_coordinates(dist_env, mesh_2d):
+    spec = es.ParamSpec("o/dp c/sp")
+    global_shape = (5, 7)
+    coord = (mesh_2d.mesh == dist.get_rank()).nonzero()[0].tolist()
+    dp_sections = es.helpers.compute_split_shapes_for_factors(
+        global_shape[0], mesh_2d.mesh.shape[0], 1
+    )
+    sp_sections = es.helpers.compute_split_shapes_for_factors(
+        global_shape[1], mesh_2d.mesh.shape[1], 1
+    )
+    expected = (
+        slice(sum(dp_sections[:coord[0]]), sum(dp_sections[:coord[0] + 1])),
+        slice(sum(sp_sections[:coord[1]]), sum(sp_sections[:coord[1] + 1])),
+    )
+
+    assert es.param_local_slices(spec, global_shape, mesh_2d) == expected
+    assert es.param_local_shape(spec, global_shape, mesh_2d) == (
+        dp_sections[coord[0]],
+        sp_sections[coord[1]],
+    )
+
+
+def test_param_shard_metadata_supports_compound_groups(dist_env, mesh_2d):
+    mesh = es.wrap_mesh(mesh_2d)
+    spec = es.ParamSpec("o/dp-sp c")
+    global_shape = (dist_env.world_size + 3, 2)
+    group = mesh["dp-sp"].get_group()
+    rank = dist.get_rank(group)
+    sections = es.helpers.compute_split_shapes_for_factors(
+        global_shape[0], dist.get_world_size(group), 1
+    )
+
+    metadata = es.param_shard_metadata(spec, global_shape, mesh)
+
+    assert metadata.global_shape == global_shape
+    assert metadata.local_slices == (
+        slice(sum(sections[:rank]), sum(sections[:rank + 1])),
+        slice(None),
+    )
+    assert metadata.local_shape == (sections[rank], 2)
+    assert metadata.shard_dims == ("dp-sp",)
+
+
+def test_param_local_slices_rejects_sharded_factored_axes(dist_env, mesh_2d):
+    spec = es.ParamSpec("(a/dp b) c")
+
+    try:
+        es.param_local_slices(spec, (6, 2), mesh_2d)
+    except NotImplementedError as error:
+        assert "factored-axis" in str(error)
+    else:
+        raise AssertionError("Expected sharded factored-axis metadata to fail")
+
+
 def test_sync_param_broadcasts_shared_values(dist_env, mesh_2d):
     mesh = es.wrap_mesh(mesh_2d)
     spec = es.ParamSpec("o c", shared="dp-sp")

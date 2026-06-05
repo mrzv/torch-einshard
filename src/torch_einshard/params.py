@@ -4,7 +4,8 @@ import torch.distributed as dist
 import torch
 
 from .grammar import parse_sharding
-from .helpers import all_reduce
+from .helpers import all_reduce, compute_split_shapes_for_factors
+from .sharding import AxisGroup, EllipsisAxis
 
 
 PARAM_SPEC_ATTR = "einshard_spec"
@@ -51,6 +52,14 @@ class ParamSpec:
         object.__setattr__(self, "reduce", reduce)
 
 
+@dataclass(frozen=True)
+class ParamShardMetadata:
+    global_shape: tuple[int, ...]
+    local_slices: tuple[slice, ...]
+    local_shape: tuple[int, ...]
+    shard_dims: tuple[str, ...]
+
+
 def _group(mesh, name):
     return mesh[name].get_group()
 
@@ -79,6 +88,93 @@ def set_param_spec(param, spec):
 
 def get_param_spec(param):
     return getattr(param, PARAM_SPEC_ATTR, None)
+
+
+def _require_spec(param_or_spec):
+    if isinstance(param_or_spec, ParamSpec):
+        return param_or_spec
+    spec = get_param_spec(param_or_spec)
+    if spec is None:
+        raise ValueError("Parameter does not have an attached ParamSpec")
+    return spec
+
+
+def param_shard_dims(param_or_spec):
+    spec = _require_spec(param_or_spec)
+    return tuple(spec.axes.all_shard_dims())
+
+
+def _mesh_rank_and_size(mesh, shard_dim):
+    device_mesh = getattr(mesh, "device_mesh", mesh)
+    if shard_dim in device_mesh.mesh_dim_names:
+        mesh_dim = device_mesh.mesh_dim_names.index(shard_dim)
+        rank = dist.get_rank()
+        coord = (device_mesh.mesh == rank).nonzero()[0].tolist()
+        return coord[mesh_dim], device_mesh.mesh.shape[mesh_dim]
+
+    group = mesh[shard_dim].get_group()
+    return dist.get_rank(group), dist.get_world_size(group)
+
+
+def _axis_shard_dim(axis):
+    if isinstance(axis, EllipsisAxis):
+        raise ValueError("Parameter shard metadata does not support ellipsis axes")
+    if isinstance(axis, AxisGroup):
+        shard_dims = axis.axes.all_shard_dims()
+        if shard_dims:
+            raise NotImplementedError(
+                "Parameter shard metadata does not support sharded factored-axis groups"
+            )
+        return ""
+    return axis.shard_dim
+
+
+def param_local_slices(param_or_spec, global_shape, mesh):
+    spec = _require_spec(param_or_spec)
+    global_shape = tuple(int(size) for size in global_shape)
+    if len(global_shape) != len(spec.axes):
+        raise ValueError(
+            f"Global shape rank {len(global_shape)} does not match ParamSpec rank {len(spec.axes)}"
+        )
+
+    slices = []
+    for axis, size in zip(spec.axes, global_shape):
+        shard_dim = _axis_shard_dim(axis)
+        if not shard_dim:
+            slices.append(slice(None))
+            continue
+
+        rank, chunks = _mesh_rank_and_size(mesh, shard_dim)
+        sections = compute_split_shapes_for_factors(size, chunks, 1)
+        start = sum(sections[:rank])
+        slices.append(slice(start, start + sections[rank]))
+    return tuple(slices)
+
+
+def param_local_shape(param_or_spec, global_shape, mesh):
+    slices = param_local_slices(param_or_spec, global_shape, mesh)
+    return _shape_from_slices(global_shape, slices)
+
+
+def _shape_from_slices(global_shape, slices):
+    shape = []
+    for size, local_slice in zip(global_shape, slices):
+        start = 0 if local_slice.start is None else local_slice.start
+        stop = size if local_slice.stop is None else local_slice.stop
+        shape.append(stop - start)
+    return tuple(shape)
+
+
+def param_shard_metadata(param_or_spec, global_shape, mesh):
+    spec = _require_spec(param_or_spec)
+    global_shape = tuple(int(size) for size in global_shape)
+    local_slices = param_local_slices(spec, global_shape, mesh)
+    return ParamShardMetadata(
+        global_shape=global_shape,
+        local_slices=local_slices,
+        local_shape=_shape_from_slices(global_shape, local_slices),
+        shard_dims=param_shard_dims(spec),
+    )
 
 
 def sync_module_params_(module, mesh):

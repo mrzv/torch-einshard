@@ -386,7 +386,6 @@ Remaining work is tracked in `PLAN.md`. The main open areas are:
 - Optional notation for autograd-only communication.
 - More general multi-axis repartition where changed mesh dimensions are not a pure ownership swap.
 - Nested or nonlocal distributed factored-axis transforms, if concrete use cases need them.
-- Checkpoint-style shard metadata derived from parameter specs.
 
 ## Parameter Metadata
 
@@ -435,6 +434,16 @@ es.register_grad_reduction_hook_(ddp, mesh, ddp_group="dp")
 ```
 
 The hook performs DDP-style averaging over `ddp_group`, then applies sum all-reduces for attached `ParamSpec.reduce` groups.
+
+Parameter specs can also derive checkpoint/test-copy shard metadata:
+
+```python
+metadata = es.param_shard_metadata(weight_spec, global_shape=(1024, 2048), mesh=mesh)
+local_slices = metadata.local_slices
+local_shape = metadata.local_shape
+```
+
+Use `es.param_local_slices(...)`, `es.param_local_shape(...)`, or `es.param_shard_dims(...)` when only one piece of metadata is needed. These helpers support single mesh dimensions and compound names such as `dp-sp` via `wrap_mesh`. Sharded factored-axis groups are intentionally rejected until factor sizes are part of parameter metadata.
 
 ## Shape Metadata
 
