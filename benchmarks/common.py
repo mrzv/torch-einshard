@@ -6,6 +6,7 @@ from contextlib import nullcontext
 
 import torch
 import torch.distributed as dist
+from torch.distributed.device_mesh import init_device_mesh
 
 
 def add_common_args(parser):
@@ -37,8 +38,26 @@ def init_seed(seed):
 def init_distributed(device):
     if dist.is_initialized():
         return
+    if device.type == "cuda":
+        local_rank = int(__import__("os").environ.get("LOCAL_RANK", "0"))
+        torch.cuda.set_device(local_rank)
     backend = "nccl" if device.type == "cuda" else "gloo"
     dist.init_process_group(backend=backend)
+
+
+def destroy_distributed():
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def mesh_1d(device, name="dp"):
+    return init_device_mesh(device.type, (world_size(),), mesh_dim_names=(name,))
+
+
+def mesh_2d(device, names=("dp", "sp")):
+    size = world_size()
+    shape = (2, size // 2) if size % 2 == 0 else (1, size)
+    return init_device_mesh(device.type, shape, mesh_dim_names=names)
 
 
 def rank0():
@@ -68,8 +87,9 @@ def percentile(values, pct):
     return values[index]
 
 
-def time_call(fn, *, warmup, iters, device):
-    with torch.no_grad():
+def time_call(fn, *, warmup, iters, device, grad=False):
+    context = nullcontext() if grad else torch.no_grad()
+    with context:
         for _ in range(warmup):
             fn()
         sync(device)
@@ -127,8 +147,8 @@ class JsonlWriter:
             self._handle.flush()
 
 
-def benchmark(name, fn, *, args, device, writer, extra=None, baselines=None):
-    times = time_call(fn, warmup=args.warmup, iters=args.iters, device=device)
+def benchmark(name, fn, *, args, device, writer, extra=None, baselines=None, grad=False):
+    times = time_call(fn, warmup=args.warmup, iters=args.iters, device=device, grad=grad)
     record = {
         "name": name,
         "device": str(device),
@@ -165,4 +185,11 @@ WINDOW_SHAPES = {
     "small": (2, 1, 16, 16, 32, (4, 4)),
     "medium": (4, 2, 64, 64, 64, (8, 8)),
     "large": (4, 2, 128, 128, 128, (8, 8)),
+}
+
+
+DISTRIBUTED_SHAPES = {
+    "small": {"rows": 128, "cols": 96, "hidden": 128, "batch": 4, "seq": 16},
+    "medium": {"rows": 1024, "cols": 768, "hidden": 1024, "batch": 8, "seq": 64},
+    "large": {"rows": 4096, "cols": 3072, "hidden": 4096, "batch": 16, "seq": 128},
 }
