@@ -1,4 +1,4 @@
-# Performance Test Plan
+# Performance Benchmarks
 
 This repository should keep correctness tests as the default test suite and add performance coverage as explicit opt-in benchmarks. Performance tests should be stable enough to catch large regressions without making normal CI noisy.
 
@@ -11,13 +11,14 @@ This repository should keep correctness tests as the default test suite and add 
 
 ## Structure
 
-Add a `benchmarks/` directory with small standalone scripts rather than pytest tests initially:
+Benchmarks live in standalone scripts rather than pytest tests:
 
 ```text
 benchmarks/
   bench_local.py
   bench_distributed.py
   bench_ddp_hook.py
+  compare.py
   common.py
 ```
 
@@ -35,9 +36,9 @@ Run with `uv run python benchmarks/bench_local.py`.
 
 Cases:
 
-- Tiny local `einshard("... c, c o -> ... o")` versus `torch.einsum` to track parser/cache overhead.
-- Axis-family window partition and reverse for 2D and 3D shapes.
-- Factored-axis pack/unpack with and without `sizes` inference.
+- Linear baselines: `torch.nn.functional.linear`, direct matmul, `torch.einsum`, and equivalent `einshard` notation for both `out,in` and `in,out` weight layouts.
+- Axis-family window partition and reverse.
+- Factored-axis pack/unpack with and without size inference.
 - `einroll` fallback-free local roll patterns.
 
 Report both absolute time and overhead versus the equivalent PyTorch primitive when practical.
@@ -75,17 +76,27 @@ Cases:
 - Mixed buckets where the combined option should fall back.
 - Bucket-size sensitivity by varying `bucket_cap_mb`.
 
-Primary metric: backward step wall time after warmup. Secondary metrics: number of buckets and whether the combined path was eligible for each bucket. If needed, expose lightweight debug counters from the hook state rather than relying on profiler traces.
+Primary metric: backward step wall time after warmup. If needed, expose lightweight debug counters from the hook state later rather than relying on profiler traces.
+
+## Runner
+
+Run all benchmark scripts with:
+
+```bash
+NPROC=8 ./run_benchmarks.sh --device cpu --size small --output results.jsonl
+```
+
+The runner executes local benchmarks, distributed benchmarks, and DDP hook benchmarks in `per-spec`, `combined`, and `mixed` modes. Pass `--device cuda` on CUDA hosts.
 
 ## CI Policy
 
 - Do not run performance benchmarks in the default `uv run pytest` or `./run_tests.sh` suites.
-- Add a manual CI job or script later, for example `./run_benchmarks.sh`, once baseline hardware is known.
+- `./run_benchmarks.sh` is intended for manual or dedicated benchmark CI use once baseline hardware is known.
 - Store baseline JSONL artifacts outside the repository or under a clearly named `benchmarks/baselines/` directory only if they are stable and useful.
 
 ## Regression Thresholds
 
-Start without hard pass/fail thresholds. After collecting several runs on the same host, add optional comparison tooling:
+Start without hard pass/fail thresholds. After collecting several runs on the same host, compare JSONL outputs with:
 
 ```bash
 uv run python benchmarks/compare.py baseline.jsonl current.jsonl --max-regression 1.25
