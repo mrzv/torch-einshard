@@ -7,6 +7,7 @@ from .params import (
     ParamShardMetadata,
     ParamSpec,
     get_param_spec,
+    iter_param_specs,
     param_local_shape,
     param_local_slices,
     param_shard_dims,

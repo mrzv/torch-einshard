@@ -422,6 +422,8 @@ For modules, attach specs to parameters and use the module-level helpers:
 
 ```python
 es.set_param_spec(weight, weight_spec)
+for name, param, spec in es.iter_param_specs(module):
+    print(name, spec.layout)
 es.sync_module_params_(module, mesh)
 es.reduce_module_grads_(module, mesh)
 ```
@@ -434,6 +436,20 @@ es.register_grad_reduction_hook_(ddp, mesh, ddp_group="dp")
 ```
 
 The hook performs DDP-style averaging over `ddp_group`, then applies sum all-reduces for attached `ParamSpec.reduce` groups.
+
+For buckets where every parameter has the same extra reduction metadata, the hook can combine DDP averaging and the extra reduction into one all-reduce over a compound group:
+
+```python
+es.register_grad_reduction_hook_(
+    ddp,
+    mesh,
+    ddp_group="dp",
+    combined_reduce_group="dp-sp1-sp2",
+    combined_reduce="sp1-sp2",
+)
+```
+
+This fast path is used only when all parameters in a bucket have exactly `reduce=("sp1-sp2",)`. Mixed buckets fall back to the per-parameter-spec reductions.
 
 Parameter specs can also derive checkpoint/test-copy shard metadata:
 

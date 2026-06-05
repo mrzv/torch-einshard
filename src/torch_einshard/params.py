@@ -90,6 +90,13 @@ def get_param_spec(param):
     return getattr(param, PARAM_SPEC_ATTR, None)
 
 
+def iter_param_specs(module):
+    for name, param in module.named_parameters():
+        spec = get_param_spec(param)
+        if spec is not None:
+            yield name, param, spec
+
+
 def _require_spec(param_or_spec):
     if isinstance(param_or_spec, ParamSpec):
         return param_or_spec
@@ -193,7 +200,17 @@ def reduce_module_grads_(module, mesh):
     return module
 
 
-def register_grad_reduction_hook_(ddp_model, mesh, ddp_group="dp"):
+def register_grad_reduction_hook_(
+    ddp_model,
+    mesh,
+    ddp_group="dp",
+    combined_reduce_group=None,
+    combined_reduce=None,
+):
+    combined_reduce = _tuple(combined_reduce)
+    if combined_reduce_group is not None and not combined_reduce:
+        raise ValueError("combined_reduce must be provided with combined_reduce_group")
+
     def bucket_views(bucket):
         offset = 0
         views = []
@@ -204,10 +221,64 @@ def register_grad_reduction_hook_(ddp_model, mesh, ddp_group="dp"):
             offset += param.numel()
         return views
 
+    def can_use_combined_reduce(views):
+        if combined_reduce_group is None:
+            return False
+        if not views:
+            return False
+        expected = set(combined_reduce)
+        for param, _ in views:
+            spec = get_param_spec(param)
+            if spec is None or set(spec.reduce) != expected:
+                return False
+        return True
+
+    def reduce_by_param_specs(buffer, views):
+        groups = sorted({
+            name
+            for param, _ in views
+            for name in (get_param_spec(param).reduce if get_param_spec(param) is not None else ())
+        })
+        for name in groups:
+            grad_views = [
+                view
+                for param, view in views
+                if get_param_spec(param) is not None and name in get_param_spec(param).reduce
+            ]
+            if not grad_views:
+                continue
+            coalesced = torch.cat([view.reshape(-1) for view in grad_views])
+            dist.all_reduce(coalesced, group=_group(mesh, name))
+            offset = 0
+            for view in grad_views:
+                view.copy_(coalesced.narrow(0, offset, view.numel()).view_as(view))
+                offset += view.numel()
+        return buffer
+
     def reduction_hook(state, bucket):
         buffer = bucket.buffer()
         group = _group(mesh, ddp_group) if ddp_group is not None else None
         group_size = dist.get_world_size(group)
+        views = bucket_views(bucket)
+
+        if can_use_combined_reduce(views):
+            combined_group = _group(mesh, combined_reduce_group)
+            combined_group_size = dist.get_world_size(combined_group)
+            if combined_group_size == 1 and group_size == 1:
+                future = torch.futures.Future()
+                future.set_result(buffer)
+            elif combined_group_size > 1:
+                future = dist.all_reduce(buffer, group=combined_group, async_op=True).get_future()
+            else:
+                future = None
+
+            if future is not None:
+                def finish_combined(future):
+                    if group_size > 1:
+                        buffer.div_(group_size)
+                    return buffer
+
+                return future.then(finish_combined)
 
         if group_size == 1:
             future = torch.futures.Future()
@@ -219,27 +290,7 @@ def register_grad_reduction_hook_(ddp_model, mesh, ddp_group="dp"):
             if group_size > 1:
                 buffer.div_(group_size)
 
-            views = bucket_views(bucket)
-            groups = sorted({
-                name
-                for param, _ in views
-                for name in (get_param_spec(param).reduce if get_param_spec(param) is not None else ())
-            })
-            for name in groups:
-                grad_views = [
-                    view
-                    for param, view in views
-                    if get_param_spec(param) is not None and name in get_param_spec(param).reduce
-                ]
-                if not grad_views:
-                    continue
-                coalesced = torch.cat([view.reshape(-1) for view in grad_views])
-                dist.all_reduce(coalesced, group=_group(mesh, name))
-                offset = 0
-                for view in grad_views:
-                    view.copy_(coalesced.narrow(0, offset, view.numel()).view_as(view))
-                    offset += view.numel()
-            return buffer
+            return reduce_by_param_specs(buffer, views)
 
         return future.then(finish)
 

@@ -48,6 +48,19 @@ def test_param_shard_dims_requires_attached_spec():
         raise AssertionError("Expected missing ParamSpec to fail")
 
 
+def test_iter_param_specs_yields_only_attached_specs():
+    module = nn.Sequential(nn.Linear(3, 2), nn.Linear(2, 1))
+    spec = es.ParamSpec("o c")
+    es.set_param_spec(module[0].weight, spec)
+
+    entries = list(es.iter_param_specs(module))
+    assert len(entries) == 1
+    name, param, actual_spec = entries[0]
+    assert name == "0.weight"
+    assert param is module[0].weight
+    assert actual_spec is spec
+
+
 def test_param_local_slices_uses_mesh_coordinates(dist_env, mesh_2d):
     spec = es.ParamSpec("o/dp c/sp")
     global_shape = (5, 7)
@@ -70,6 +83,24 @@ def test_param_local_slices_uses_mesh_coordinates(dist_env, mesh_2d):
     )
 
 
+def test_param_local_slices_accepts_attached_params(dist_env, mesh_2d):
+    param = torch.nn.Parameter(torch.zeros(2, 3))
+    es.set_param_spec(param, es.ParamSpec("o/dp c"))
+
+    assert es.param_local_slices(param, (2, 3), mesh_2d)[1] == slice(None)
+
+
+def test_param_local_slices_rejects_rank_mismatch(dist_env, mesh_2d):
+    spec = es.ParamSpec("o/dp c")
+
+    try:
+        es.param_local_slices(spec, (2,), mesh_2d)
+    except ValueError as error:
+        assert "rank" in str(error)
+    else:
+        raise AssertionError("Expected rank mismatch to fail")
+
+
 def test_param_shard_metadata_supports_compound_groups(dist_env, mesh_2d):
     mesh = es.wrap_mesh(mesh_2d)
     spec = es.ParamSpec("o/dp-sp c")
@@ -89,6 +120,17 @@ def test_param_shard_metadata_supports_compound_groups(dist_env, mesh_2d):
     )
     assert metadata.local_shape == (sections[rank], 2)
     assert metadata.shard_dims == ("dp-sp",)
+
+
+def test_param_shard_metadata_normalizes_compound_group_order(dist_env, mesh_2d):
+    mesh = es.wrap_mesh(mesh_2d)
+    global_shape = (dist_env.world_size + 3, 2)
+
+    dp_sp = es.param_shard_metadata(es.ParamSpec("o/dp-sp c"), global_shape, mesh)
+    sp_dp = es.param_shard_metadata(es.ParamSpec("o/sp-dp c"), global_shape, mesh)
+
+    assert dp_sp.local_slices == sp_dp.local_slices
+    assert dp_sp.local_shape == sp_dp.local_shape
 
 
 def test_param_local_slices_rejects_sharded_factored_axes(dist_env, mesh_2d):
@@ -168,3 +210,70 @@ def test_ddp_grad_reduction_hook_uses_param_specs(dist_env, mesh_2d):
 
     assert sp_rank < sp_size
     assert_close(model.weight.grad, torch.full_like(model.weight.grad, expected))
+
+
+def test_ddp_grad_reduction_hook_combines_uniform_reduce_specs(dist_env, mesh_2d):
+    mesh = es.wrap_mesh(mesh_2d)
+    model = nn.Linear(1, 1, bias=False)
+    model.weight.data.fill_(1.0)
+    es.set_param_spec(model.weight, es.ParamSpec("o c", reduce="sp"))
+    ddp = DistributedDataParallel(model, process_group=mesh_2d["dp"].get_group())
+    es.register_grad_reduction_hook_(
+        ddp,
+        mesh,
+        ddp_group="dp",
+        combined_reduce_group="dp-sp",
+        combined_reduce="sp",
+    )
+
+    x = torch.tensor([[float(dist.get_rank() + 1)]])
+    ddp(x).sum().backward()
+
+    dp_size = dist.get_world_size(mesh_2d["dp"].get_group())
+    sp_size = dist.get_world_size(mesh_2d["sp"].get_group())
+    sp_rank = dist.get_rank(mesh_2d["sp"].get_group())
+    expected = 0.0
+    for peer_sp_rank in range(sp_size):
+        expected += 1.0 + peer_sp_rank + sp_size * (dp_size - 1) / 2
+
+    assert_close(model.weight.grad, torch.full_like(model.weight.grad, expected))
+
+
+def test_ddp_grad_reduction_hook_combined_option_falls_back_for_mixed_specs(dist_env, mesh_2d):
+    mesh = es.wrap_mesh(mesh_2d)
+    model = nn.Linear(1, 1, bias=True)
+    model.weight.data.fill_(1.0)
+    model.bias.data.zero_()
+    es.set_param_spec(model.weight, es.ParamSpec("o c", reduce="sp"))
+    ddp = DistributedDataParallel(model, process_group=mesh_2d["dp"].get_group())
+    es.register_grad_reduction_hook_(
+        ddp,
+        mesh,
+        ddp_group="dp",
+        combined_reduce_group="dp-sp",
+        combined_reduce="sp",
+    )
+
+    x = torch.tensor([[float(dist.get_rank() + 1)]])
+    ddp(x).sum().backward()
+
+    dp_size = dist.get_world_size(mesh_2d["dp"].get_group())
+    sp_size = dist.get_world_size(mesh_2d["sp"].get_group())
+    expected_weight = 0.0
+    for peer_sp_rank in range(sp_size):
+        expected_weight += 1.0 + peer_sp_rank + sp_size * (dp_size - 1) / 2
+
+    assert_close(model.weight.grad, torch.full_like(model.weight.grad, expected_weight))
+    assert_close(model.bias.grad, torch.ones_like(model.bias.grad))
+
+
+def test_ddp_grad_reduction_hook_validates_combined_reduce_args(mesh_2d):
+    model = nn.Linear(1, 1, bias=False)
+    ddp = DistributedDataParallel(model, process_group=mesh_2d["dp"].get_group())
+
+    try:
+        es.register_grad_reduction_hook_(ddp, mesh_2d, combined_reduce_group="dp-sp")
+    except ValueError as error:
+        assert "combined_reduce" in str(error)
+    else:
+        raise AssertionError("Expected missing combined_reduce to fail")
