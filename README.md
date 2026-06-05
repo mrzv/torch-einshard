@@ -449,7 +449,7 @@ es.register_grad_reduction_hook_(
 )
 ```
 
-This fast path is used only when all parameters in a bucket have exactly `reduce=("sp1-sp2",)`. Mixed buckets fall back to the per-parameter-spec reductions.
+This is equivalent to summing the bucket over `dp-sp1-sp2` and then dividing by the `dp` group size. It avoids a separate `dp` all-reduce followed by an `sp1-sp2` all-reduce. The fast path is used only when all parameters in a bucket have exactly `reduce=("sp1-sp2",)`. Mixed buckets fall back to the per-parameter-spec reductions.
 
 Parameter specs can also derive checkpoint/test-copy shard metadata:
 
@@ -459,7 +459,18 @@ local_slices = metadata.local_slices
 local_shape = metadata.local_shape
 ```
 
-Use `es.param_local_slices(...)`, `es.param_local_shape(...)`, or `es.param_shard_dims(...)` when only one piece of metadata is needed. These helpers support single mesh dimensions and compound names such as `dp-sp` via `wrap_mesh`. Sharded factored-axis groups are intentionally rejected until factor sizes are part of parameter metadata.
+Use `es.param_local_slices(...)`, `es.param_local_shape(...)`, or `es.param_shard_dims(...)` when only one piece of metadata is needed. These helpers support single mesh dimensions and compound names such as `dp-sp` via `wrap_mesh`. Factor-aware splits can be requested for patch-like cases:
+
+```python
+local_slices = es.param_local_slices(
+    es.ParamSpec("height/sp1 width/sp2"),
+    global_shape=(721, 1440),
+    mesh=mesh,
+    factors={"height": 4, "width": 4},
+)
+```
+
+Shard metadata helpers require an initialized process group and report missing mesh dimensions or raw `DeviceMesh` compound-group use as explicit errors. Sharded factored-axis groups are intentionally rejected until factored parameter metadata is represented directly.
 
 ## Shape Metadata
 
@@ -515,6 +526,8 @@ Full distributed test suite:
 ```
 
 `run_tests.sh` uses `torchrun --nproc-per-node 8`.
+
+Performance benchmark structure and CI policy are planned in `PERFORMANCE.md`. Benchmarks should remain opt-in and separate from the correctness test suites.
 
 ## Current Limitations
 

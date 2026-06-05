@@ -22,6 +22,16 @@ def _tuple(value):
     return result
 
 
+def _duplicates(values):
+    seen = set()
+    result = []
+    for value in values:
+        if value in seen and value not in result:
+            result.append(value)
+        seen.add(value)
+    return result
+
+
 def _parse_axes(spec):
     input_spec, other, output_spec = parse_sharding(f"{spec} -> {spec}")
     if other is not None or input_spec.partials or output_spec.partials:
@@ -40,7 +50,12 @@ class ParamSpec:
         axes = _parse_axes(layout)
         shared = _tuple(shared)
         reduce = _tuple(reduce)
-        shard_dims = set(axes.all_shard_dims())
+        all_shard_dims = axes.all_shard_dims()
+        duplicate_shard_dims = _duplicates(all_shard_dims)
+        if duplicate_shard_dims:
+            dims = ", ".join(sorted(duplicate_shard_dims))
+            raise ValueError(f"Parameter specs cannot shard multiple axes over the same mesh dimension: {dims}")
+        shard_dims = set(all_shard_dims)
         for name in shared:
             overlap = shard_dims.intersection(name.split("-"))
             if overlap:
@@ -50,6 +65,14 @@ class ParamSpec:
         object.__setattr__(self, "axes", axes)
         object.__setattr__(self, "shared", shared)
         object.__setattr__(self, "reduce", reduce)
+
+    def __repr__(self):
+        args = [repr(self.layout)]
+        if self.shared:
+            args.append(f"shared={self.shared!r}")
+        if self.reduce:
+            args.append(f"reduce={self.reduce!r}")
+        return f"ParamSpec({', '.join(args)})"
 
 
 @dataclass(frozen=True)
@@ -61,7 +84,14 @@ class ParamShardMetadata:
 
 
 def _group(mesh, name):
-    return mesh[name].get_group()
+    try:
+        return mesh[name].get_group()
+    except (KeyError, RuntimeError) as error:
+        if "-" in name and not hasattr(mesh, "device_mesh"):
+            raise ValueError(
+                f"Compound mesh group {name!r} requires es.wrap_mesh(mesh)"
+            ) from error
+        raise ValueError(f"Mesh does not contain parameter metadata group {name!r}") from error
 
 
 def sync_param_(param, spec, mesh):
@@ -112,12 +142,21 @@ def param_shard_dims(param_or_spec):
 
 
 def _mesh_rank_and_size(mesh, shard_dim):
+    if not dist.is_initialized():
+        raise RuntimeError("Parameter shard metadata requires an initialized process group")
     device_mesh = getattr(mesh, "device_mesh", mesh)
+    if not hasattr(device_mesh, "mesh_dim_names") or not hasattr(device_mesh, "mesh"):
+        raise TypeError("mesh must be a PyTorch DeviceMesh or torch_einshard.wrap_mesh(mesh)")
     if shard_dim in device_mesh.mesh_dim_names:
         mesh_dim = device_mesh.mesh_dim_names.index(shard_dim)
         rank = dist.get_rank()
         coord = (device_mesh.mesh == rank).nonzero()[0].tolist()
         return coord[mesh_dim], device_mesh.mesh.shape[mesh_dim]
+
+    if "-" not in shard_dim:
+        raise ValueError(f"Mesh does not contain sharded parameter dimension {shard_dim!r}")
+    if not hasattr(mesh, "device_mesh"):
+        raise ValueError(f"Compound sharded parameter dimension {shard_dim!r} requires es.wrap_mesh(mesh)")
 
     group = mesh[shard_dim].get_group()
     return dist.get_rank(group), dist.get_world_size(group)
@@ -136,7 +175,22 @@ def _axis_shard_dim(axis):
     return axis.shard_dim
 
 
-def param_local_slices(param_or_spec, global_shape, mesh):
+def _axis_name(axis):
+    if isinstance(axis, EllipsisAxis):
+        raise ValueError("Parameter shard metadata does not support ellipsis axes")
+    if isinstance(axis, AxisGroup):
+        raise NotImplementedError("Parameter shard metadata does not support factored-axis groups")
+    return axis.name
+
+
+def _factor_for(axis, factors):
+    if not factors:
+        return 1
+    name = _axis_name(axis)
+    return int(factors.get(name, 1))
+
+
+def param_local_slices(param_or_spec, global_shape, mesh, factors=None):
     spec = _require_spec(param_or_spec)
     global_shape = tuple(int(size) for size in global_shape)
     if len(global_shape) != len(spec.axes):
@@ -152,14 +206,14 @@ def param_local_slices(param_or_spec, global_shape, mesh):
             continue
 
         rank, chunks = _mesh_rank_and_size(mesh, shard_dim)
-        sections = compute_split_shapes_for_factors(size, chunks, 1)
+        sections = compute_split_shapes_for_factors(size, chunks, _factor_for(axis, factors))
         start = sum(sections[:rank])
         slices.append(slice(start, start + sections[rank]))
     return tuple(slices)
 
 
-def param_local_shape(param_or_spec, global_shape, mesh):
-    slices = param_local_slices(param_or_spec, global_shape, mesh)
+def param_local_shape(param_or_spec, global_shape, mesh, factors=None):
+    slices = param_local_slices(param_or_spec, global_shape, mesh, factors=factors)
     return _shape_from_slices(global_shape, slices)
 
 
@@ -172,10 +226,10 @@ def _shape_from_slices(global_shape, slices):
     return tuple(shape)
 
 
-def param_shard_metadata(param_or_spec, global_shape, mesh):
+def param_shard_metadata(param_or_spec, global_shape, mesh, factors=None):
     spec = _require_spec(param_or_spec)
     global_shape = tuple(int(size) for size in global_shape)
-    local_slices = param_local_slices(spec, global_shape, mesh)
+    local_slices = param_local_slices(spec, global_shape, mesh, factors=factors)
     return ParamShardMetadata(
         global_shape=global_shape,
         local_slices=local_slices,
@@ -217,7 +271,7 @@ def register_grad_reduction_hook_(
         buffer = bucket.buffer()
         for param in bucket.parameters():
             view = buffer.narrow(0, offset, param.numel()).view_as(param)
-            views.append((param, view))
+            views.append((param, view, get_param_spec(param)))
             offset += param.numel()
         return views
 
@@ -227,8 +281,7 @@ def register_grad_reduction_hook_(
         if not views:
             return False
         expected = set(combined_reduce)
-        for param, _ in views:
-            spec = get_param_spec(param)
+        for _, _, spec in views:
             if spec is None or set(spec.reduce) != expected:
                 return False
         return True
@@ -236,14 +289,14 @@ def register_grad_reduction_hook_(
     def reduce_by_param_specs(buffer, views):
         groups = sorted({
             name
-            for param, _ in views
-            for name in (get_param_spec(param).reduce if get_param_spec(param) is not None else ())
+            for _, _, spec in views
+            for name in (spec.reduce if spec is not None else ())
         })
         for name in groups:
             grad_views = [
                 view
-                for param, view in views
-                if get_param_spec(param) is not None and name in get_param_spec(param).reduce
+                for _, view, spec in views
+                if spec is not None and name in spec.reduce
             ]
             if not grad_views:
                 continue

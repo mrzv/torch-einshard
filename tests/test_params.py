@@ -19,6 +19,12 @@ def test_param_spec_parses_layout_and_metadata():
     assert spec.reduce == ("sp1-sp2",)
 
 
+def test_param_spec_repr_includes_nondefault_metadata():
+    spec = es.ParamSpec("o/tp c", shared="sp", reduce="sp")
+
+    assert repr(spec) == "ParamSpec('o/tp c', shared=('sp',), reduce=('sp',))"
+
+
 def test_param_spec_rejects_shared_sharded_axis_overlap():
     try:
         es.ParamSpec("o/tp c", shared="tp")
@@ -26,6 +32,15 @@ def test_param_spec_rejects_shared_sharded_axis_overlap():
         assert "overlaps" in str(error)
     else:
         raise AssertionError("Expected overlapping shared and sharded metadata to fail")
+
+
+def test_param_spec_rejects_duplicate_shard_dims():
+    try:
+        es.ParamSpec("o/tp c/tp")
+    except ValueError as error:
+        assert "same mesh dimension" in str(error)
+    else:
+        raise AssertionError("Expected duplicate parameter shard dimensions to fail")
 
 
 def test_param_shard_dims_reads_specs_from_params():
@@ -83,6 +98,24 @@ def test_param_local_slices_uses_mesh_coordinates(dist_env, mesh_2d):
     )
 
 
+def test_param_local_slices_supports_factor_aware_splits(dist_env, mesh_2d):
+    spec = es.ParamSpec("o/dp c")
+    global_shape = (10, 3)
+    coord = (mesh_2d.mesh == dist.get_rank()).nonzero()[0].tolist()
+    sections = es.helpers.compute_split_shapes_for_factors(
+        global_shape[0], mesh_2d.mesh.shape[0], 4
+    )
+
+    assert es.param_local_slices(spec, global_shape, mesh_2d, factors={"o": 4}) == (
+        slice(sum(sections[:coord[0]]), sum(sections[:coord[0] + 1])),
+        slice(None),
+    )
+    assert es.param_local_shape(spec, global_shape, mesh_2d, factors={"o": 4}) == (
+        sections[coord[0]],
+        3,
+    )
+
+
 def test_param_local_slices_accepts_attached_params(dist_env, mesh_2d):
     param = torch.nn.Parameter(torch.zeros(2, 3))
     es.set_param_spec(param, es.ParamSpec("o/dp c"))
@@ -99,6 +132,39 @@ def test_param_local_slices_rejects_rank_mismatch(dist_env, mesh_2d):
         assert "rank" in str(error)
     else:
         raise AssertionError("Expected rank mismatch to fail")
+
+
+def test_param_local_slices_rejects_missing_mesh_dim(dist_env, mesh_2d):
+    spec = es.ParamSpec("o/tp c")
+
+    try:
+        es.param_local_slices(spec, (2, 3), mesh_2d)
+    except ValueError as error:
+        assert "tp" in str(error)
+    else:
+        raise AssertionError("Expected missing mesh dimension to fail")
+
+
+def test_param_local_slices_rejects_raw_mesh_compound_group(dist_env, mesh_2d):
+    spec = es.ParamSpec("o/dp-sp c")
+
+    try:
+        es.param_local_slices(spec, (2, 3), mesh_2d)
+    except ValueError as error:
+        assert "wrap_mesh" in str(error)
+    else:
+        raise AssertionError("Expected raw DeviceMesh compound group to fail")
+
+
+def test_param_local_slices_requires_initialized_process_group(monkeypatch, mesh_2d):
+    monkeypatch.setattr(dist, "is_initialized", lambda: False)
+
+    try:
+        es.param_local_slices(es.ParamSpec("o/dp c"), (2, 3), mesh_2d)
+    except RuntimeError as error:
+        assert "initialized process group" in str(error)
+    else:
+        raise AssertionError("Expected missing process group to fail")
 
 
 def test_param_shard_metadata_supports_compound_groups(dist_env, mesh_2d):
