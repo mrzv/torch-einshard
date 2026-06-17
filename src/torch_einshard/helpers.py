@@ -26,9 +26,9 @@ def init_process_group(backend, use_cuda):
 
 # TODO: add async_op option
 def all_reduce(input, group):
-    input = input.contiguous()
-    dist.all_reduce(input, group = group)
-    return input
+    output = input.contiguous().clone()
+    dist.all_reduce(output, group = group)
+    return output
 
 def split(input, group, dim, shapes):
     """Split the tensor along dim."""

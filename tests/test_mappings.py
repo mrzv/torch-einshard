@@ -20,10 +20,12 @@ def test_allreduce_forward_identity_backward(dist_env, mesh_1d):
     world_size = dist.get_world_size(group)
 
     x = torch.full((2, 3), float(rank + 1), requires_grad=True)
+    original = x.detach().clone()
     z = allreduce_forward_identity_backward(x, group)
 
     expected = torch.full_like(x, float(world_size * (world_size + 1) // 2))
     assert_close(z, expected)
+    assert_close(x, original)
 
     z.sum().backward()
     assert_close(x.grad, torch.ones_like(x))
