@@ -18,7 +18,7 @@ def init_process_group(backend, use_cuda):
         if 'LOCAL_RANK' in os.environ:
             local_rank = int(os.getenv("LOCAL_RANK"))
         else:
-            return world_rank % torch.cuda.device_count()
+            local_rank = world_rank % torch.cuda.device_count()
     else:
         local_rank = 0
 

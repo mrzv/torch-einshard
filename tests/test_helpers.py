@@ -1,6 +1,19 @@
 import torch_einshard as es
 
 
+def test_init_process_group_cuda_without_local_rank_returns_full_tuple(monkeypatch):
+    calls = []
+    monkeypatch.delenv("SLURM_NTASKS", raising=False)
+    monkeypatch.delenv("LOCAL_RANK", raising=False)
+    monkeypatch.setenv("WORLD_SIZE", "8")
+    monkeypatch.setenv("RANK", "5")
+    monkeypatch.setattr(es.helpers.dist, "init_process_group", lambda **kwargs: calls.append(kwargs))
+    monkeypatch.setattr(es.helpers.torch.cuda, "device_count", lambda: 4)
+
+    assert es.helpers.init_process_group("nccl", use_cuda=True) == (1, 5, 8)
+    assert calls == [{"backend": "nccl", "rank": 5, "world_size": 8}]
+
+
 def test_compute_split_shapes_single_chunk():
     assert es.helpers.compute_split_shapes(7, 1) == [7]
 
