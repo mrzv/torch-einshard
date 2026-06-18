@@ -13,7 +13,7 @@ def test_sharded_contraction_matches_manual_allreduce(dist_env, mesh_2d):
     z = es.einshard("a/sp b/dp, b/dp c -> a/sp c", x, y, mesh=mesh_2d)
 
     expected = es.einshard("al bl, bl c -> al c", x, y)
-    es.helpers.all_reduce(expected, mesh_2d["dp"].get_group())
+    expected = es.helpers.all_reduce(expected, mesh_2d["dp"].get_group())
     assert_close(z, expected)
 
 

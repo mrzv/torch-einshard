@@ -20,7 +20,7 @@ def test_wrap_mesh_compound_group(dist_env, mesh_2d):
     world_size = dist.get_world_size()
 
     x = torch.tensor(float(world_rank + 1))
-    es.helpers.all_reduce(x, group)
+    x = es.helpers.all_reduce(x, group)
 
     assert_close(x, torch.tensor(float(world_size * (world_size + 1) // 2)))
 
