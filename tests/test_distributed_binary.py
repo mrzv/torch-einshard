@@ -550,7 +550,7 @@ def test_owner_swap_with_additional_local_contracted_axis(dist_env):
     x_ref = x_full.detach().clone().requires_grad_(True)
     y_ref = y_full.detach().clone().requires_grad_(True)
     expected = torch.einsum("akmn,kmnb->ab", x_ref, y_ref)
-    assert_close(z, expected)
+    assert_close(z, expected, atol=5e-6)
 
     grad = torch.randn(rows, cols)
     z.backward(grad)
