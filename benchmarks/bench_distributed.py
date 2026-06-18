@@ -99,7 +99,7 @@ def bench_ownership_swap(args, device, writer, mesh):
 
     benchmark(
         "distributed_ownership_swap",
-        lambda: es.einshard("a/sp1 b/sp2 -> a/sp2 b/sp1", x, mesh=mesh, shapes=shapes),
+        lambda: es.einshard("n h/sp1 w/sp2 c -> n h/sp2 w/sp1 c", x, mesh=mesh, shapes=shapes),
         args=args,
         device=device,
         writer=writer,
