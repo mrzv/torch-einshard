@@ -81,4 +81,7 @@ def einshard(shard, *xs, mesh = None, shapes = None, sizes = None, families = No
     if any(_has_groups(s) for s in shard if s is not None):
         raise NotImplementedError("Factored axes are currently supported only for local reshape operations")
 
+    if mesh is None:
+        raise ValueError("Distributed einshard operations require mesh")
+
     return distributed_1d(shard, *xs, mesh = mesh, shapes = shapes)

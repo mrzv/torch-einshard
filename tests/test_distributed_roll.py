@@ -20,6 +20,13 @@ def test_local_roll_axis_family():
     assert_close(z, torch.roll(x, shifts=(1, -2, 3), dims=(2, 3, 4)))
 
 
+def test_distributed_einroll_requires_mesh():
+    x = torch.randn(4, 3)
+
+    with pytest.raises(ValueError, match="Distributed einroll operations require mesh"):
+        es.einroll("a/dp b", x, {"a": 1})
+
+
 def test_single_axis_distributed_roll(dist_env, mesh_1d):
     group = mesh_1d["dp"].get_group()
     rank = dist.get_rank(group)

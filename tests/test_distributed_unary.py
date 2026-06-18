@@ -8,6 +8,13 @@ import torch_einshard as es
 from conftest import assert_close
 
 
+def test_distributed_einshard_requires_mesh():
+    x = torch.randn(4, 3)
+
+    with pytest.raises(ValueError, match="Distributed einshard operations require mesh"):
+        es.einshard("a b -> a/dp b", x)
+
+
 def test_single_axis_split_gather_round_trip(dist_env, mesh_1d):
     group = mesh_1d["dp"].get_group()
     rank = dist.get_rank(group)

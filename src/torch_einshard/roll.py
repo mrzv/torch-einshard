@@ -23,6 +23,9 @@ def einroll(shard, x, shifts, *, mesh=None, shapes=None, families=None):
             z = torch.roll(z, shifts=shift, dims=dim)
             continue
 
+        if mesh is None:
+            raise ValueError("Distributed einroll operations require mesh")
+
         group = mesh[axis.shard_dim].get_group()
         split_shapes = resolve_split_shapes(shapes, axis.shard_dim, axis.name, group)
         if split_shapes is not None:
