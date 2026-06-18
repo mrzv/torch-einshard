@@ -224,7 +224,7 @@ Partial notation currently represents sum reductions only.
 
 ## Supported Distributed Binary Patterns
 
-Binary distributed contractions support one or more sharded contracted axes. The local contraction is computed first and then all-reduced over each contracted shard dimension.
+Binary distributed contractions support one or more sharded contracted axes. The local contraction is computed first and then all-reduced over each contracted shard dimension, unless the output explicitly keeps the partial value or the contracted mesh dimension is reused to shard an output axis.
 
 Generic form:
 
@@ -259,6 +259,28 @@ z = es.einshard("a/sp b/dp, b/dp c -> a/sp c // dp", x, y, mesh=mesh)
 ```
 
 In that case, `z` is the local partial contraction result and no forward all-reduce is applied.
+
+Binary outputs can request different sharding for free axes than the inputs use. `einshard` normalizes those input axes before the local contraction with the necessary split or gather collectives:
+
+```python
+z = es.einshard("l/tp e, e f/tp -> l f/tp", x_shard, y_shard, mesh=mesh, shapes=shapes)
+z = es.einshard("l/tp e, e f -> l f", x_shard, y, mesh=mesh, shapes=shapes)
+z = es.einshard("l e, e f -> l/tp f", x, y, mesh=mesh, shapes=shapes)
+```
+
+For uneven shards, pass split metadata for each affected logical axis and mesh dimension:
+
+```python
+shapes = {"tp": {"l": l_shapes, "f": f_shapes}}
+```
+
+If a sharded contraction dimension is reused to shard a free output axis, `einshard` reduce-scatters the partial contraction result instead of all-reducing it:
+
+```python
+z = es.einshard("l f/tp, f/tp e -> l/tp e", x_shard, y_shard, mesh=mesh, shapes=shapes)
+```
+
+This computes the local partial `l e // tp` and then reduce-scatters it to `l/tp e`.
 
 ## Tensor-Parallel Linear Patterns
 
