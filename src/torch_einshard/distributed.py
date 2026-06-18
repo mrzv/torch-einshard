@@ -96,6 +96,15 @@ def distributed_1d_2(shard, x, y, mesh, shapes = None):
             continue
         reduction_dims.append(axis.shard_dim)
 
+    scatter_output_by_dim = {}
+    for axis in output_axes:
+        matching_input_axes = [
+            input_axis for input_axis in (input0_by_name.get(axis.name), input1_by_name.get(axis.name))
+            if input_axis is not None
+        ]
+        if axis.shard_dim in reduction_dims and any(input_axis.local() for input_axis in matching_input_axes):
+            scatter_output_by_dim[axis.shard_dim] = axis
+
     def group(shard_dim):
         return mesh[shard_dim].get_group()
 
@@ -132,6 +141,8 @@ def distributed_1d_2(shard, x, y, mesh, shapes = None):
             output_axis = output_by_name[axis.name]
             if axis == output_axis:
                 continue
+            if axis.local() and output_axis.shard_dim in reduction_dims:
+                continue
 
             dim = dim_of(normalized_axes, axis.name, tensor)
             if axis.local():
@@ -161,9 +172,19 @@ def distributed_1d_2(shard, x, y, mesh, shapes = None):
 
         return tensor, TensorSpec(normalized_axes, _partials(spec))
 
+    def localize_scatter_axis(axis):
+        if scatter_output_by_dim.get(axis.shard_dim) == axis:
+            return Axis(axis.name)
+        return axis
+
     x, input0_spec = normalize_input(x, input0_spec)
     y, input1_spec = normalize_input(y, input1_spec)
-    normalized_shard = (input0_spec, input1_spec, output_spec)
+    local_output_axes = Axes(
+        localize_scatter_axis(axis) if not isinstance(axis, EllipsisAxis) else axis
+        for axis in _axes(output_spec)
+    )
+    local_output_spec = TensorSpec(local_output_axes, _partials(output_spec))
+    normalized_shard = (input0_spec, input1_spec, local_output_spec)
 
     input0_axes = _without_ellipsis(_axes(input0_spec))
     input1_axes = _without_ellipsis(_axes(input1_spec))
@@ -180,11 +201,21 @@ def distributed_1d_2(shard, x, y, mesh, shapes = None):
         assert axis == output_by_name[name], "Output shared axes must preserve input sharding"
 
     z = einsum(normalized_shard, x, y)    # perform the local operation
+    current_output_axes = local_output_axes
 
     for shard_dim in reduction_dims:
         if shard_dim in _partials(shard[2]):
             continue
-        z = allreduce_forward_identity_backward(z, comm = group(shard_dim))
+        scatter_axis = scatter_output_by_dim.get(shard_dim)
+        if scatter_axis is None:
+            z = allreduce_forward_identity_backward(z, comm = group(shard_dim))
+            continue
+
+        dim = dim_of(current_output_axes, scatter_axis.name, z)
+        comm = group(shard_dim)
+        split_shapes = resolve_split_shapes(shapes, shard_dim, scatter_axis.name, comm)
+        z = reducescatter_forward_allgather_backward(z, comm, dim, split_shapes)
+        current_output_axes = replace_axis(current_output_axes, scatter_axis.name, scatter_axis)
 
     return z
 
