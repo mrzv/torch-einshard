@@ -348,6 +348,40 @@ def test_shared_sharded_batch_axis(dist_env, mesh_2d):
     assert_close(z, expected)
 
 
+def test_shared_batch_axis_splits_replicated_operand(dist_env, mesh_2d):
+    dp_group = mesh_2d["dp"].get_group()
+    dp_rank = dist.get_rank(dp_group)
+    dp_size = dist.get_world_size(dp_group)
+    batch = dp_size * 2 + 1
+    batch_shapes = es.helpers.compute_split_shapes(batch, dp_size)
+
+    x_full = torch.randn(batch, 3, 5)
+    y = torch.randn(batch, 5, 7, requires_grad=True)
+    x_shard = torch.split(x_full, batch_shapes, dim=0)[dp_rank].clone().requires_grad_(True)
+
+    z = es.einshard(
+        "b/dp a c, b c d -> b/dp a d",
+        x_shard,
+        y,
+        mesh=mesh_2d,
+        shapes={"dp": {"b": batch_shapes}},
+    )
+
+    x_ref = x_full.detach().clone().requires_grad_(True)
+    y_ref = y.detach().clone().requires_grad_(True)
+    expected_full = torch.einsum("bac,bcd->bad", x_ref, y_ref)
+    expected = torch.split(expected_full, batch_shapes, dim=0)[dp_rank]
+    assert_close(z, expected)
+
+    grad_full = torch.randn(batch, 3, 7)
+    grad_shard = torch.split(grad_full, batch_shapes, dim=0)[dp_rank]
+    z.backward(grad_shard)
+    expected_full.backward(grad_full)
+
+    assert_close(x_shard.grad, torch.split(x_ref.grad, batch_shapes, dim=0)[dp_rank])
+    assert_close(y.grad, y_ref.grad)
+
+
 def test_shared_sharded_batch_axis_with_sharded_contraction(dist_env, mesh_2d):
     dp_group = mesh_2d["dp"].get_group()
     sp_group = mesh_2d["sp"].get_group()
