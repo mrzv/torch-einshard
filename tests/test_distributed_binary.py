@@ -391,6 +391,86 @@ def test_binary_elementwise_splits_replicated_shared_axis(dist_env, mesh_tp):
     assert_close(y.grad, y_ref.grad)
 
 
+def test_attention_scores_gather_key_axis(dist_env, mesh_tp):
+    group = mesh_tp["tp"].get_group()
+    rank = dist.get_rank(group)
+    world_size = dist.get_world_size(group)
+    batch = 2
+    heads = 3
+    query = world_size * 2 + 1
+    key = world_size * 3 + 2
+    dim = 4
+    query_shapes = es.helpers.compute_split_shapes(query, world_size)
+    key_shapes = es.helpers.compute_split_shapes(key, world_size)
+
+    q_full = torch.randn(batch, heads, query, dim)
+    k_full = torch.randn(batch, heads, key, dim)
+    q_shard = torch.split(q_full, query_shapes, dim=2)[rank].clone().requires_grad_(True)
+    k_shard = torch.split(k_full, key_shapes, dim=2)[rank].clone().requires_grad_(True)
+
+    z = es.einshard(
+        "b h q/tp d, b h k/tp d -> b h q/tp k",
+        q_shard,
+        k_shard,
+        mesh=mesh_tp,
+        shapes={"tp": {"q": query_shapes, "k": key_shapes}},
+    )
+
+    q_ref = q_full.detach().clone().requires_grad_(True)
+    k_ref = k_full.detach().clone().requires_grad_(True)
+    expected_full = torch.einsum("bhqd,bhkd->bhqk", q_ref, k_ref)
+    expected = torch.split(expected_full, query_shapes, dim=2)[rank]
+    assert_close(z, expected)
+
+    grad_full = torch.randn(batch, heads, query, key)
+    grad_shard = torch.split(grad_full, query_shapes, dim=2)[rank]
+    z.backward(grad_shard)
+    expected_full.backward(grad_full)
+
+    assert_close(q_shard.grad, torch.split(q_ref.grad, query_shapes, dim=2)[rank])
+    assert_close(k_shard.grad, torch.split(k_ref.grad, key_shapes, dim=2)[rank])
+
+
+def test_attention_values_split_contracted_key_axis(dist_env, mesh_tp):
+    group = mesh_tp["tp"].get_group()
+    rank = dist.get_rank(group)
+    world_size = dist.get_world_size(group)
+    batch = 2
+    heads = 3
+    query = world_size * 2 + 1
+    key = world_size * 3 + 2
+    dim = 4
+    query_shapes = es.helpers.compute_split_shapes(query, world_size)
+    key_shapes = es.helpers.compute_split_shapes(key, world_size)
+
+    attn_full = torch.randn(batch, heads, query, key)
+    v_full = torch.randn(batch, heads, key, dim)
+    attn_shard = torch.split(attn_full, query_shapes, dim=2)[rank].clone().requires_grad_(True)
+    v_shard = torch.split(v_full, key_shapes, dim=2)[rank].clone().requires_grad_(True)
+
+    z = es.einshard(
+        "b h q/tp k, b h k/tp d -> b h q/tp d",
+        attn_shard,
+        v_shard,
+        mesh=mesh_tp,
+        shapes={"tp": {"q": query_shapes, "k": key_shapes}},
+    )
+
+    attn_ref = attn_full.detach().clone().requires_grad_(True)
+    v_ref = v_full.detach().clone().requires_grad_(True)
+    expected_full = torch.einsum("bhqk,bhkd->bhqd", attn_ref, v_ref)
+    expected = torch.split(expected_full, query_shapes, dim=2)[rank]
+    assert_close(z, expected)
+
+    grad_full = torch.randn(batch, heads, query, dim)
+    grad_shard = torch.split(grad_full, query_shapes, dim=2)[rank]
+    z.backward(grad_shard)
+    expected_full.backward(grad_full)
+
+    assert_close(attn_shard.grad, torch.split(attn_ref.grad, query_shapes, dim=2)[rank])
+    assert_close(v_shard.grad, torch.split(v_ref.grad, key_shapes, dim=2)[rank])
+
+
 def test_shared_sharded_batch_axis(dist_env, mesh_2d):
     dp_group = mesh_2d["dp"].get_group()
     dp_rank = dist.get_rank(dp_group)

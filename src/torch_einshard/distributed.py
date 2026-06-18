@@ -116,7 +116,7 @@ def distributed_1d_2(shard, x, y, mesh, shapes = None):
             input_axis for input_axis in (input0_by_name.get(axis.name), input1_by_name.get(axis.name))
             if input_axis is not None
         ]
-        if axis.shard_dim in reduction_dims and any(input_axis.local() for input_axis in matching_input_axes):
+        if axis.shard_dim in reduction_dims and any(input_axis.local() or input_axis == axis for input_axis in matching_input_axes):
             scatter_output_by_dim[axis.shard_dim] = axis
 
     def group(shard_dim):
@@ -241,6 +241,13 @@ def distributed_1d_2(shard, x, y, mesh, shapes = None):
             if axis.name not in output_by_name:
                 continue
             output_axis = output_by_name[axis.name]
+            if scatter_output_by_dim.get(output_axis.shard_dim) == output_axis and axis == output_axis:
+                dim = dim_of(normalized_axes, axis.name, tensor)
+                comm = group(axis.shard_dim)
+                split_shapes = resolve_split_shapes(shapes, axis.shard_dim, axis.name, comm)
+                tensor = allgather_forward_split_backward(tensor, comm, dim, split_shapes)
+                normalized_axes = replace_axis(normalized_axes, axis.name, Axis(axis.name))
+                continue
             if axis == output_axis:
                 continue
             if axis.local() and output_axis.shard_dim in reduction_dims:
