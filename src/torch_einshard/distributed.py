@@ -88,10 +88,25 @@ def distributed_1d_2(shard, x, y, mesh, shapes = None):
     ]
     assert contracted_names, "Expected a contraction axis"
 
+    contracted_target_by_name = {}
+    for name in contracted_names:
+        axis0 = input0_by_name[name]
+        axis1 = input1_by_name[name]
+        if axis0 == axis1:
+            target = axis0
+        elif axis0.local() and not axis1.local():
+            target = axis1
+        elif axis1.local() and not axis0.local():
+            target = axis0
+        elif axis0.shard_dim and axis1.shard_dim:
+            target = axis0
+        else:
+            raise NotImplementedError("Unsupported contracted-axis sharding mismatch")
+        contracted_target_by_name[name] = target
+
     reduction_dims = []
     for name in contracted_names:
-        axis = input0_by_name[name]
-        assert axis == input1_by_name[name], "Contracted axes must use matching sharding"
+        axis = contracted_target_by_name[name]
         if axis.local() or axis.shard_dim in reduction_dims:
             continue
         reduction_dims.append(axis.shard_dim)
@@ -132,10 +147,44 @@ def distributed_1d_2(shard, x, y, mesh, shapes = None):
             for axis in axes
         )
 
+    def normalize_axis(tensor, normalized_axes, axis, target_axis):
+        dim = dim_of(normalized_axes, axis.name, tensor)
+        if axis.local():
+            comm = group(target_axis.shard_dim)
+            split_shapes = resolve_split_shapes(shapes, target_axis.shard_dim, axis.name, comm)
+            tensor = split_forward_allgather_backward(tensor, comm, dim, split_shapes)
+        elif target_axis.local():
+            comm = group(axis.shard_dim)
+            split_shapes = resolve_split_shapes(shapes, axis.shard_dim, axis.name, comm)
+            if active_in_output(axis.shard_dim):
+                tensor = allgather_forward_reducescatter_backward(tensor, comm, dim, split_shapes)
+            else:
+                tensor = allgather_forward_split_backward(tensor, comm, dim, split_shapes)
+        else:
+            source_comm = group(axis.shard_dim)
+            source_shapes = resolve_split_shapes(shapes, axis.shard_dim, axis.name, source_comm)
+            if active_in_output(axis.shard_dim):
+                tensor = allgather_forward_reducescatter_backward(tensor, source_comm, dim, source_shapes)
+            else:
+                tensor = allgather_forward_split_backward(tensor, source_comm, dim, source_shapes)
+
+            dest_comm = group(target_axis.shard_dim)
+            dest_shapes = resolve_split_shapes(shapes, target_axis.shard_dim, axis.name, dest_comm)
+            tensor = split_forward_allgather_backward(tensor, dest_comm, dim, dest_shapes)
+
+        normalized_axes = replace_axis(normalized_axes, axis.name, target_axis)
+        return tensor, normalized_axes
+
     def normalize_input(tensor, spec):
         axes = _axes(spec)
         normalized_axes = axes
         for axis in _without_ellipsis(axes):
+            if axis.name in contracted_target_by_name:
+                target_axis = contracted_target_by_name[axis.name]
+                if axis != target_axis:
+                    tensor, normalized_axes = normalize_axis(tensor, normalized_axes, axis, target_axis)
+                continue
+
             if axis.name not in output_by_name:
                 continue
             output_axis = output_by_name[axis.name]
@@ -144,31 +193,7 @@ def distributed_1d_2(shard, x, y, mesh, shapes = None):
             if axis.local() and output_axis.shard_dim in reduction_dims:
                 continue
 
-            dim = dim_of(normalized_axes, axis.name, tensor)
-            if axis.local():
-                comm = group(output_axis.shard_dim)
-                split_shapes = resolve_split_shapes(shapes, output_axis.shard_dim, axis.name, comm)
-                tensor = split_forward_allgather_backward(tensor, comm, dim, split_shapes)
-            elif output_axis.local():
-                comm = group(axis.shard_dim)
-                split_shapes = resolve_split_shapes(shapes, axis.shard_dim, axis.name, comm)
-                if active_in_output(axis.shard_dim):
-                    tensor = allgather_forward_reducescatter_backward(tensor, comm, dim, split_shapes)
-                else:
-                    tensor = allgather_forward_split_backward(tensor, comm, dim, split_shapes)
-            else:
-                source_comm = group(axis.shard_dim)
-                source_shapes = resolve_split_shapes(shapes, axis.shard_dim, axis.name, source_comm)
-                if active_in_output(axis.shard_dim):
-                    tensor = allgather_forward_reducescatter_backward(tensor, source_comm, dim, source_shapes)
-                else:
-                    tensor = allgather_forward_split_backward(tensor, source_comm, dim, source_shapes)
-
-                dest_comm = group(output_axis.shard_dim)
-                dest_shapes = resolve_split_shapes(shapes, output_axis.shard_dim, axis.name, dest_comm)
-                tensor = split_forward_allgather_backward(tensor, dest_comm, dim, dest_shapes)
-
-            normalized_axes = replace_axis(normalized_axes, axis.name, output_axis)
+            tensor, normalized_axes = normalize_axis(tensor, normalized_axes, axis, output_axis)
 
         return tensor, TensorSpec(normalized_axes, _partials(spec))
 
