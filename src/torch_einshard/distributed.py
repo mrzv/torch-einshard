@@ -224,7 +224,29 @@ def distributed_1d_2(shard, x, y, mesh, shapes = None):
     def normalize_input(tensor, spec):
         axes = _axes(spec)
         normalized_axes = axes
+        normalized_scatter_axes = set()
+
+        # Gather reduce-scatter output axes before changing contracted axes;
+        # otherwise a later gather can concatenate mismatched contracted slices.
         for axis in _without_ellipsis(axes):
+            if axis.name in contracted_target_by_name or axis.name not in output_by_name:
+                continue
+
+            output_axis = output_by_name[axis.name]
+            if scatter_output_by_dim.get(output_axis.shard_dim) != output_axis or axis != output_axis:
+                continue
+
+            dim = dim_of(normalized_axes, axis.name, tensor)
+            comm = group(axis.shard_dim)
+            split_shapes = resolve_split_shapes(shapes, axis.shard_dim, axis.name, comm)
+            tensor = allgather_forward_split_backward(tensor, comm, dim, split_shapes)
+            normalized_axes = replace_axis(normalized_axes, axis.name, Axis(axis.name))
+            normalized_scatter_axes.add(axis.name)
+
+        for axis in _without_ellipsis(axes):
+            if axis.name in normalized_scatter_axes:
+                continue
+
             if axis.name in contracted_target_by_name:
                 target_axis = contracted_target_by_name[axis.name]
                 if axis != target_axis:
@@ -241,13 +263,6 @@ def distributed_1d_2(shard, x, y, mesh, shapes = None):
             if axis.name not in output_by_name:
                 continue
             output_axis = output_by_name[axis.name]
-            if scatter_output_by_dim.get(output_axis.shard_dim) == output_axis and axis == output_axis:
-                dim = dim_of(normalized_axes, axis.name, tensor)
-                comm = group(axis.shard_dim)
-                split_shapes = resolve_split_shapes(shapes, axis.shard_dim, axis.name, comm)
-                tensor = allgather_forward_split_backward(tensor, comm, dim, split_shapes)
-                normalized_axes = replace_axis(normalized_axes, axis.name, Axis(axis.name))
-                continue
             if axis == output_axis:
                 continue
             if axis.local() and output_axis.shard_dim in reduction_dims:

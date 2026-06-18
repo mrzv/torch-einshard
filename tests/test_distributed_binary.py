@@ -135,6 +135,79 @@ def test_multi_axis_sharded_contraction_explicit_partial_output(dist_env, mesh_2
     assert_close(z, expected)
 
 
+def test_cross_sharded_contraction_reduce_scatters_output_axis(dist_env, mesh_2d):
+    dp_group = mesh_2d["dp"].get_group()
+    sp_group = mesh_2d["sp"].get_group()
+    dp_rank = dist.get_rank(dp_group)
+    sp_rank = dist.get_rank(sp_group)
+    dp_size = dist.get_world_size(dp_group)
+    sp_size = dist.get_world_size(sp_group)
+    rows = sp_size * 2 + 1
+    hidden = dp_size * sp_size * 2 + 1
+    cols = dp_size * 3 + 2
+    row_shapes = es.helpers.compute_split_shapes(rows, sp_size)
+    hidden_dp_shapes = es.helpers.compute_split_shapes(hidden, dp_size)
+    hidden_sp_shapes = es.helpers.compute_split_shapes(hidden, sp_size)
+    col_shapes = es.helpers.compute_split_shapes(cols, dp_size)
+    shapes = {
+        "dp": {"e": hidden_dp_shapes, "f": col_shapes},
+        "sp": {"l": row_shapes, "e": hidden_sp_shapes},
+    }
+
+    x_full = torch.randn(rows, hidden)
+    y_full = torch.randn(hidden, cols)
+    x_shard = torch.split(
+        torch.split(x_full, row_shapes, dim=0)[sp_rank],
+        hidden_dp_shapes,
+        dim=1,
+    )[dp_rank].clone().requires_grad_(True)
+    y_shard = torch.split(
+        torch.split(y_full, hidden_sp_shapes, dim=0)[sp_rank],
+        col_shapes,
+        dim=1,
+    )[dp_rank].clone().requires_grad_(True)
+
+    z = es.einshard(
+        "l/sp e/dp, e/sp f/dp -> l/sp f/dp",
+        x_shard,
+        y_shard,
+        mesh=mesh_2d,
+        shapes=shapes,
+    )
+
+    x_ref = x_full.detach().clone().requires_grad_(True)
+    y_ref = y_full.detach().clone().requires_grad_(True)
+    expected_full = torch.einsum("le,ef->lf", x_ref, y_ref)
+    expected = torch.split(
+        torch.split(expected_full, row_shapes, dim=0)[sp_rank],
+        col_shapes,
+        dim=1,
+    )[dp_rank]
+    assert_close(z, expected)
+
+    grad_full = torch.randn(rows, cols)
+    grad_shard = torch.split(
+        torch.split(grad_full, row_shapes, dim=0)[sp_rank],
+        col_shapes,
+        dim=1,
+    )[dp_rank]
+    z.backward(grad_shard)
+    expected_full.backward(grad_full)
+
+    expected_x_grad = torch.split(
+        torch.split(x_ref.grad, row_shapes, dim=0)[sp_rank],
+        hidden_dp_shapes,
+        dim=1,
+    )[dp_rank]
+    expected_y_grad = torch.split(
+        torch.split(y_ref.grad, hidden_sp_shapes, dim=0)[sp_rank],
+        col_shapes,
+        dim=1,
+    )[dp_rank]
+    assert_close(x_shard.grad, expected_x_grad)
+    assert_close(y_shard.grad, expected_y_grad)
+
+
 def test_binary_gathers_free_axis_to_sharded_output(dist_env, mesh_tp):
     group = mesh_tp["tp"].get_group()
     rank = dist.get_rank(group)
