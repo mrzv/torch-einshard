@@ -225,6 +225,68 @@ def distributed_1d_2(shard, x, y, mesh, shapes = None):
         axes = _axes(spec)
         normalized_axes = axes
         normalized_scatter_axes = set()
+        owner_swapped_axes = set()
+
+        # Crossed contracted axes must move ownership together; independent
+        # gather/split steps can gather tensors with different logical slices.
+        owner_swap_changes = []
+        for axis in _without_ellipsis(axes):
+            target_axis = contracted_target_by_name.get(axis.name)
+            if target_axis is None or axis == target_axis:
+                continue
+            if axis.local() or target_axis.local():
+                continue
+            owner_swap_changes.append((axis, target_axis))
+
+        if len(owner_swap_changes) >= 2:
+            source_shard_dims = tuple(axis.shard_dim for axis, _ in owner_swap_changes)
+            dest_shard_dims = tuple(target_axis.shard_dim for _, target_axis in owner_swap_changes)
+            involved_shard_dims = set(source_shard_dims) | set(dest_shard_dims)
+            changed_names = {axis.name for axis, _ in owner_swap_changes}
+            can_owner_swap = (
+                len(set(source_shard_dims)) == len(source_shard_dims)
+                and len(set(dest_shard_dims)) == len(dest_shard_dims)
+                and set(source_shard_dims) == set(dest_shard_dims)
+            )
+            can_owner_swap = can_owner_swap and all(
+                axis.name in changed_names or axis.shard_dim not in involved_shard_dims
+                for axis in _without_ellipsis(axes)
+            )
+
+            output_shape = list(tensor.shape)
+            mesh_shape = mesh.mesh.shape
+            mesh_dim_names = mesh.mesh_dim_names
+            for axis, target_axis in owner_swap_changes:
+                source_mesh_dim = mesh_dim_names.index(axis.shard_dim)
+                dest_mesh_dim = mesh_dim_names.index(target_axis.shard_dim)
+                if mesh_shape[source_mesh_dim] != mesh_shape[dest_mesh_dim]:
+                    can_owner_swap = False
+                    break
+
+                source_comm = group(axis.shard_dim)
+                dest_comm = group(target_axis.shard_dim)
+                source_shapes = resolve_split_shapes(shapes, axis.shard_dim, axis.name, source_comm)
+                dest_shapes = resolve_split_shapes(shapes, target_axis.shard_dim, axis.name, dest_comm)
+                if source_shapes is None or dest_shapes is None or source_shapes != dest_shapes:
+                    can_owner_swap = False
+                    break
+                output_shape[dim_of(normalized_axes, axis.name, tensor)] = dest_shapes[dist.get_rank(dest_comm)]
+
+            if can_owner_swap:
+                tensor = owner_swap_forward_backward(
+                    tensor,
+                    mesh,
+                    source_shard_dims,
+                    dest_shard_dims,
+                    tuple(output_shape),
+                )
+                for axis, target_axis in owner_swap_changes:
+                    normalized_axes = replace_axis(normalized_axes, axis.name, target_axis)
+                    owner_swapped_axes.add(axis.name)
+            else:
+                raise NotImplementedError(
+                    "Multiple contracted-axis shard-dimension changes require an owner-swap-compatible permutation"
+                )
 
         # Gather reduce-scatter output axes before changing contracted axes;
         # otherwise a later gather can concatenate mismatched contracted slices.
@@ -248,6 +310,8 @@ def distributed_1d_2(shard, x, y, mesh, shapes = None):
                 continue
 
             if axis.name in contracted_target_by_name:
+                if axis.name in owner_swapped_axes:
+                    continue
                 target_axis = contracted_target_by_name[axis.name]
                 if axis != target_axis:
                     tensor, normalized_axes = normalize_axis(tensor, normalized_axes, axis, target_axis)
@@ -294,6 +358,7 @@ def distributed_1d_2(shard, x, y, mesh, shapes = None):
     )
     local_output_spec = TensorSpec(local_output_axes, _partials(output_spec))
     normalized_shard = (input0_spec, input1_spec, local_output_spec)
+    local_output_by_name = {axis.name: axis for axis in _without_ellipsis(local_output_axes)}
 
     input0_axes = _without_ellipsis(_axes(input0_spec))
     input1_axes = _without_ellipsis(_axes(input1_spec))
@@ -307,13 +372,20 @@ def distributed_1d_2(shard, x, y, mesh, shapes = None):
     for name in shared_output_names:
         axis = input0_by_name[name]
         assert axis == input1_by_name[name], "Shared axes must use matching sharding"
-        assert axis == output_by_name[name], "Output shared axes must preserve input sharding"
+        assert axis == local_output_by_name[name], "Output shared axes must preserve input sharding"
 
     z = einsum(normalized_shard, x, y)    # perform the local operation
     current_output_axes = local_output_axes
 
     for shard_dim in reduction_dims:
         if shard_dim in _partials(shard[2]):
+            scatter_axis = scatter_output_by_dim.get(shard_dim)
+            if scatter_axis is not None:
+                dim = dim_of(current_output_axes, scatter_axis.name, z)
+                comm = group(shard_dim)
+                split_shapes = resolve_split_shapes(shapes, shard_dim, scatter_axis.name, comm)
+                z = split_forward_allgather_backward(z, comm, dim, split_shapes)
+                current_output_axes = replace_axis(current_output_axes, scatter_axis.name, scatter_axis)
             continue
         scatter_axis = scatter_output_by_dim.get(shard_dim)
         if scatter_axis is None:

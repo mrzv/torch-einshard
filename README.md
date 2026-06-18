@@ -302,6 +302,14 @@ z = es.einshard("l f/tp, f/tp e -> l/tp e", x_shard, y_shard, mesh=mesh, shapes=
 
 This computes the local partial `l e // tp` and then reduce-scatters it to `l/tp e`.
 
+The same contraction can keep the partial value while still sharding a free output axis over that mesh dimension:
+
+```python
+z = es.einshard("l f/tp, f/tp e -> l/tp e // tp", x_shard, y_shard, mesh=mesh, shapes=shapes)
+```
+
+In this form no forward all-reduce is applied. The local partial `l e // tp` is split to `l/tp e // tp`, so each rank keeps its partial contribution for its output shard.
+
 The contracted axis can be sharded over different mesh dimensions in each input while the reduction mesh dimension is reused for a different output axis:
 
 ```python
@@ -315,6 +323,34 @@ z = es.einshard(
 ```
 
 Here `e` is contracted, `f/dp` is gathered before `e` is normalized, and the local partial result is reduce-scattered back to `f/dp`.
+
+A free axis can also be local in both inputs and sharded only in the output when a contracted mesh dimension supplies the reduction:
+
+```python
+z = es.einshard(
+    "b l e/dp, b e/sp f -> b/dp l f",
+    x_shard,
+    y_shard,
+    mesh=mesh,
+    shapes=shapes,
+)
+```
+
+Here the local contraction produces `b l f // dp`, then the result is reduce-scattered along the output batch axis to `b/dp l f`.
+
+Multiple crossed contracted axes are supported when their shard-dimension changes form a pure owner-swap-compatible permutation:
+
+```python
+z = es.einshard(
+    "a k/dp m/sp, k/sp m/dp b -> a/sp b/dp",
+    x_shard,
+    y_shard,
+    mesh=mesh,
+    shapes=shapes,
+)
+```
+
+This owner-swap path currently requires equal-sized mesh dimensions and matching split metadata for the swapped axes. Other multi-crossed contracted-axis layouts raise `NotImplementedError` instead of falling back to unsafe sequential repartitioning.
 
 When one free axis moves from sharded to local and another moves from local to sharded over the same mesh dimension, `einshard` can keep the local contraction in the source-sharded layout and repartition the result with an all-to-all-style exchange:
 

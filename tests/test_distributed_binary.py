@@ -1,9 +1,38 @@
+import pytest
 import torch
 import torch.distributed as dist
+from torch.distributed.device_mesh import init_device_mesh
 
 import torch_einshard as es
 
 from conftest import assert_close
+
+
+def _split_two(tensor, first_shapes, first_dim, first_rank, second_shapes, second_dim, second_rank):
+    return torch.split(
+        torch.split(tensor, first_shapes, dim=first_dim)[first_rank],
+        second_shapes,
+        dim=second_dim,
+    )[second_rank]
+
+
+def _split_three(
+    tensor,
+    first_shapes,
+    first_dim,
+    first_rank,
+    second_shapes,
+    second_dim,
+    second_rank,
+    third_shapes,
+    third_dim,
+    third_rank,
+):
+    return torch.split(
+        _split_two(tensor, first_shapes, first_dim, first_rank, second_shapes, second_dim, second_rank),
+        third_shapes,
+        dim=third_dim,
+    )[third_rank]
 
 
 def test_sharded_contraction_matches_manual_allreduce(dist_env, mesh_2d):
@@ -206,6 +235,380 @@ def test_cross_sharded_contraction_reduce_scatters_output_axis(dist_env, mesh_2d
     )[dp_rank]
     assert_close(x_shard.grad, expected_x_grad)
     assert_close(y_shard.grad, expected_y_grad)
+
+
+def test_cross_sharded_contraction_operand_order_mirror(dist_env, mesh_2d):
+    dp_group = mesh_2d["dp"].get_group()
+    sp_group = mesh_2d["sp"].get_group()
+    dp_rank = dist.get_rank(dp_group)
+    sp_rank = dist.get_rank(sp_group)
+    dp_size = dist.get_world_size(dp_group)
+    sp_size = dist.get_world_size(sp_group)
+    rows = sp_size * 2 + 1
+    hidden = dp_size * sp_size * 2 + 1
+    cols = dp_size * 3 + 2
+    row_shapes = es.helpers.compute_split_shapes(rows, sp_size)
+    hidden_dp_shapes = es.helpers.compute_split_shapes(hidden, dp_size)
+    hidden_sp_shapes = es.helpers.compute_split_shapes(hidden, sp_size)
+    col_shapes = es.helpers.compute_split_shapes(cols, dp_size)
+    shapes = {
+        "dp": {"e": hidden_dp_shapes, "f": col_shapes},
+        "sp": {"l": row_shapes, "e": hidden_sp_shapes},
+    }
+
+    lhs_full = torch.randn(hidden, cols)
+    rhs_full = torch.randn(rows, hidden)
+    lhs_shard = _split_two(lhs_full, hidden_sp_shapes, 0, sp_rank, col_shapes, 1, dp_rank).clone().requires_grad_(True)
+    rhs_shard = _split_two(rhs_full, row_shapes, 0, sp_rank, hidden_dp_shapes, 1, dp_rank).clone().requires_grad_(True)
+
+    z = es.einshard(
+        "e/sp f/dp, l/sp e/dp -> l/sp f/dp",
+        lhs_shard,
+        rhs_shard,
+        mesh=mesh_2d,
+        shapes=shapes,
+    )
+
+    lhs_ref = lhs_full.detach().clone().requires_grad_(True)
+    rhs_ref = rhs_full.detach().clone().requires_grad_(True)
+    expected_full = torch.einsum("ef,le->lf", lhs_ref, rhs_ref)
+    expected = _split_two(expected_full, row_shapes, 0, sp_rank, col_shapes, 1, dp_rank)
+    assert_close(z, expected)
+
+    grad_full = torch.randn(rows, cols)
+    grad_shard = _split_two(grad_full, row_shapes, 0, sp_rank, col_shapes, 1, dp_rank)
+    z.backward(grad_shard)
+    expected_full.backward(grad_full)
+
+    expected_lhs_grad = _split_two(lhs_ref.grad, hidden_sp_shapes, 0, sp_rank, col_shapes, 1, dp_rank)
+    expected_rhs_grad = _split_two(rhs_ref.grad, row_shapes, 0, sp_rank, hidden_dp_shapes, 1, dp_rank)
+    assert_close(lhs_shard.grad, expected_lhs_grad)
+    assert_close(rhs_shard.grad, expected_rhs_grad)
+
+
+def test_cross_sharded_contraction_reordered_second_operand(dist_env, mesh_2d):
+    dp_group = mesh_2d["dp"].get_group()
+    sp_group = mesh_2d["sp"].get_group()
+    dp_rank = dist.get_rank(dp_group)
+    sp_rank = dist.get_rank(sp_group)
+    dp_size = dist.get_world_size(dp_group)
+    sp_size = dist.get_world_size(sp_group)
+    rows = sp_size * 2 + 1
+    hidden = dp_size * sp_size * 2 + 1
+    cols = dp_size * 3 + 2
+    row_shapes = es.helpers.compute_split_shapes(rows, sp_size)
+    hidden_dp_shapes = es.helpers.compute_split_shapes(hidden, dp_size)
+    hidden_sp_shapes = es.helpers.compute_split_shapes(hidden, sp_size)
+    col_shapes = es.helpers.compute_split_shapes(cols, dp_size)
+    shapes = {
+        "dp": {"e": hidden_dp_shapes, "f": col_shapes},
+        "sp": {"l": row_shapes, "e": hidden_sp_shapes},
+    }
+
+    x_full = torch.randn(rows, hidden)
+    y_full = torch.randn(cols, hidden)
+    x_shard = _split_two(x_full, row_shapes, 0, sp_rank, hidden_dp_shapes, 1, dp_rank).clone().requires_grad_(True)
+    y_shard = _split_two(y_full, col_shapes, 0, dp_rank, hidden_sp_shapes, 1, sp_rank).clone().requires_grad_(True)
+
+    z = es.einshard(
+        "l/sp e/dp, f/dp e/sp -> l/sp f/dp",
+        x_shard,
+        y_shard,
+        mesh=mesh_2d,
+        shapes=shapes,
+    )
+
+    x_ref = x_full.detach().clone().requires_grad_(True)
+    y_ref = y_full.detach().clone().requires_grad_(True)
+    expected_full = torch.einsum("le,fe->lf", x_ref, y_ref)
+    expected = _split_two(expected_full, row_shapes, 0, sp_rank, col_shapes, 1, dp_rank)
+    assert_close(z, expected)
+
+    grad_full = torch.randn(rows, cols)
+    grad_shard = _split_two(grad_full, row_shapes, 0, sp_rank, col_shapes, 1, dp_rank)
+    z.backward(grad_shard)
+    expected_full.backward(grad_full)
+
+    expected_x_grad = _split_two(x_ref.grad, row_shapes, 0, sp_rank, hidden_dp_shapes, 1, dp_rank)
+    expected_y_grad = _split_two(y_ref.grad, col_shapes, 0, dp_rank, hidden_sp_shapes, 1, sp_rank)
+    assert_close(x_shard.grad, expected_x_grad)
+    assert_close(y_shard.grad, expected_y_grad)
+
+
+def test_cross_sharded_contraction_with_ellipsis(dist_env, mesh_2d):
+    dp_group = mesh_2d["dp"].get_group()
+    sp_group = mesh_2d["sp"].get_group()
+    dp_rank = dist.get_rank(dp_group)
+    sp_rank = dist.get_rank(sp_group)
+    dp_size = dist.get_world_size(dp_group)
+    sp_size = dist.get_world_size(sp_group)
+    batch = 2
+    rows = sp_size * 2 + 1
+    hidden = dp_size * sp_size * 2 + 1
+    cols = dp_size * 3 + 2
+    row_shapes = es.helpers.compute_split_shapes(rows, sp_size)
+    hidden_dp_shapes = es.helpers.compute_split_shapes(hidden, dp_size)
+    hidden_sp_shapes = es.helpers.compute_split_shapes(hidden, sp_size)
+    col_shapes = es.helpers.compute_split_shapes(cols, dp_size)
+    shapes = {
+        "dp": {"e": hidden_dp_shapes, "f": col_shapes},
+        "sp": {"l": row_shapes, "e": hidden_sp_shapes},
+    }
+
+    x_full = torch.randn(batch, rows, hidden)
+    y_full = torch.randn(batch, hidden, cols)
+    x_shard = _split_two(x_full, row_shapes, 1, sp_rank, hidden_dp_shapes, 2, dp_rank).clone().requires_grad_(True)
+    y_shard = _split_two(y_full, hidden_sp_shapes, 1, sp_rank, col_shapes, 2, dp_rank).clone().requires_grad_(True)
+
+    z = es.einshard(
+        "... l/sp e/dp, ... e/sp f/dp -> ... l/sp f/dp",
+        x_shard,
+        y_shard,
+        mesh=mesh_2d,
+        shapes=shapes,
+    )
+
+    x_ref = x_full.detach().clone().requires_grad_(True)
+    y_ref = y_full.detach().clone().requires_grad_(True)
+    expected_full = torch.einsum("...le,...ef->...lf", x_ref, y_ref)
+    expected = _split_two(expected_full, row_shapes, 1, sp_rank, col_shapes, 2, dp_rank)
+    assert_close(z, expected)
+
+    grad_full = torch.randn(batch, rows, cols)
+    grad_shard = _split_two(grad_full, row_shapes, 1, sp_rank, col_shapes, 2, dp_rank)
+    z.backward(grad_shard)
+    expected_full.backward(grad_full)
+
+    expected_x_grad = _split_two(x_ref.grad, row_shapes, 1, sp_rank, hidden_dp_shapes, 2, dp_rank)
+    expected_y_grad = _split_two(y_ref.grad, hidden_sp_shapes, 1, sp_rank, col_shapes, 2, dp_rank)
+    assert_close(x_shard.grad, expected_x_grad)
+    assert_close(y_shard.grad, expected_y_grad)
+
+
+def test_shared_local_axis_reduce_scatters_to_sharded_output(dist_env, mesh_2d):
+    dp_group = mesh_2d["dp"].get_group()
+    sp_group = mesh_2d["sp"].get_group()
+    dp_rank = dist.get_rank(dp_group)
+    sp_rank = dist.get_rank(sp_group)
+    dp_size = dist.get_world_size(dp_group)
+    sp_size = dist.get_world_size(sp_group)
+    batch = dp_size * 2 + 1
+    rows = 3
+    hidden = dp_size * sp_size * 2 + 1
+    cols = 4
+    batch_shapes = es.helpers.compute_split_shapes(batch, dp_size)
+    hidden_dp_shapes = es.helpers.compute_split_shapes(hidden, dp_size)
+    hidden_sp_shapes = es.helpers.compute_split_shapes(hidden, sp_size)
+    shapes = {
+        "dp": {"b": batch_shapes, "e": hidden_dp_shapes},
+        "sp": {"e": hidden_sp_shapes},
+    }
+
+    x_full = torch.randn(batch, rows, hidden)
+    y_full = torch.randn(batch, hidden, cols)
+    x_shard = torch.split(x_full, hidden_dp_shapes, dim=2)[dp_rank].clone().requires_grad_(True)
+    y_shard = torch.split(y_full, hidden_sp_shapes, dim=1)[sp_rank].clone().requires_grad_(True)
+
+    z = es.einshard(
+        "b l e/dp, b e/sp f -> b/dp l f",
+        x_shard,
+        y_shard,
+        mesh=mesh_2d,
+        shapes=shapes,
+    )
+
+    x_ref = x_full.detach().clone().requires_grad_(True)
+    y_ref = y_full.detach().clone().requires_grad_(True)
+    expected_full = torch.einsum("ble,bef->blf", x_ref, y_ref)
+    expected = torch.split(expected_full, batch_shapes, dim=0)[dp_rank]
+    assert_close(z, expected)
+
+    grad_full = torch.randn(batch, rows, cols)
+    grad_shard = torch.split(grad_full, batch_shapes, dim=0)[dp_rank]
+    z.backward(grad_shard)
+    expected_full.backward(grad_full)
+
+    assert_close(x_shard.grad, torch.split(x_ref.grad, hidden_dp_shapes, dim=2)[dp_rank])
+    assert_close(y_shard.grad, torch.split(y_ref.grad, hidden_sp_shapes, dim=1)[sp_rank])
+
+
+def test_two_crossed_contractions_reduce_scatter_two_output_axes(dist_env, mesh_2d):
+    dp_group = mesh_2d["dp"].get_group()
+    sp_group = mesh_2d["sp"].get_group()
+    dp_rank = dist.get_rank(dp_group)
+    sp_rank = dist.get_rank(sp_group)
+    dp_size = dist.get_world_size(dp_group)
+    sp_size = dist.get_world_size(sp_group)
+    rows = sp_size * 2 + 1
+    hidden_k = dp_size * sp_size * 2 + 1
+    hidden_m = dp_size * sp_size * 2 + 3
+    cols = dp_size * 3 + 2
+    row_shapes = es.helpers.compute_split_shapes(rows, sp_size)
+    k_dp_shapes = es.helpers.compute_split_shapes(hidden_k, dp_size)
+    k_sp_shapes = es.helpers.compute_split_shapes(hidden_k, sp_size)
+    m_dp_shapes = es.helpers.compute_split_shapes(hidden_m, dp_size)
+    m_sp_shapes = es.helpers.compute_split_shapes(hidden_m, sp_size)
+    col_shapes = es.helpers.compute_split_shapes(cols, dp_size)
+    shapes = {
+        "dp": {"k": k_dp_shapes, "m": m_dp_shapes, "b": col_shapes},
+        "sp": {"a": row_shapes, "k": k_sp_shapes, "m": m_sp_shapes},
+    }
+
+    x_full = torch.randn(rows, hidden_k, hidden_m)
+    y_full = torch.randn(hidden_k, hidden_m, cols)
+    x_shard = _split_two(x_full, k_dp_shapes, 1, dp_rank, m_sp_shapes, 2, sp_rank).clone().requires_grad_(True)
+    y_shard = _split_two(y_full, k_sp_shapes, 0, sp_rank, m_dp_shapes, 1, dp_rank).clone().requires_grad_(True)
+
+    if dp_size != sp_size:
+        with pytest.raises(NotImplementedError, match="owner-swap-compatible permutation"):
+            es.einshard(
+                "a k/dp m/sp, k/sp m/dp b -> a/sp b/dp",
+                x_shard,
+                y_shard,
+                mesh=mesh_2d,
+                shapes=shapes,
+            )
+        return
+
+    z = es.einshard(
+        "a k/dp m/sp, k/sp m/dp b -> a/sp b/dp",
+        x_shard,
+        y_shard,
+        mesh=mesh_2d,
+        shapes=shapes,
+    )
+
+    x_ref = x_full.detach().clone().requires_grad_(True)
+    y_ref = y_full.detach().clone().requires_grad_(True)
+    expected_full = torch.einsum("akm,kmb->ab", x_ref, y_ref)
+    expected = _split_two(expected_full, row_shapes, 0, sp_rank, col_shapes, 1, dp_rank)
+    assert_close(z, expected)
+
+    grad_full = torch.randn(rows, cols)
+    grad_shard = _split_two(grad_full, row_shapes, 0, sp_rank, col_shapes, 1, dp_rank)
+    z.backward(grad_shard)
+    expected_full.backward(grad_full)
+
+    expected_x_grad = _split_two(x_ref.grad, k_dp_shapes, 1, dp_rank, m_sp_shapes, 2, sp_rank)
+    expected_y_grad = _split_two(y_ref.grad, k_sp_shapes, 0, sp_rank, m_dp_shapes, 1, dp_rank)
+    assert_close(x_shard.grad, expected_x_grad)
+    assert_close(y_shard.grad, expected_y_grad)
+
+
+def test_owner_swap_with_additional_local_contracted_axis(dist_env):
+    if dist_env.world_size % 4 != 0:
+        pytest.skip("requires a 2x2xN mesh")
+
+    mesh = init_device_mesh(dist_env.device, (2, 2, dist_env.world_size // 4), mesh_dim_names=("dp", "sp", "tp"))
+    dp_group = mesh["dp"].get_group()
+    sp_group = mesh["sp"].get_group()
+    tp_group = mesh["tp"].get_group()
+    dp_rank = dist.get_rank(dp_group)
+    sp_rank = dist.get_rank(sp_group)
+    tp_rank = dist.get_rank(tp_group)
+    dp_size = dist.get_world_size(dp_group)
+    sp_size = dist.get_world_size(sp_group)
+    tp_size = dist.get_world_size(tp_group)
+    rows = 3
+    hidden_k = dp_size * sp_size * 2 + 1
+    hidden_m = dp_size * sp_size * 2 + 3
+    hidden_n = tp_size * 2 + 1
+    cols = 4
+    k_shapes = es.helpers.compute_split_shapes(hidden_k, dp_size)
+    m_shapes = es.helpers.compute_split_shapes(hidden_m, dp_size)
+    n_shapes = es.helpers.compute_split_shapes(hidden_n, tp_size)
+    shapes = {
+        "dp": {"k": k_shapes, "m": m_shapes},
+        "sp": {"k": k_shapes, "m": m_shapes},
+        "tp": {"n": n_shapes},
+    }
+
+    x_full = torch.randn(rows, hidden_k, hidden_m, hidden_n)
+    y_full = torch.randn(hidden_k, hidden_m, hidden_n, cols)
+    x_shard = _split_three(
+        x_full,
+        k_shapes,
+        1,
+        dp_rank,
+        m_shapes,
+        2,
+        sp_rank,
+        n_shapes,
+        3,
+        tp_rank,
+    ).clone().requires_grad_(True)
+    y_shard = _split_two(y_full, k_shapes, 0, sp_rank, m_shapes, 1, dp_rank).clone().requires_grad_(True)
+
+    z = es.einshard(
+        "a k/dp m/sp n/tp, k/sp m/dp n b -> a b",
+        x_shard,
+        y_shard,
+        mesh=mesh,
+        shapes=shapes,
+    )
+
+    x_ref = x_full.detach().clone().requires_grad_(True)
+    y_ref = y_full.detach().clone().requires_grad_(True)
+    expected = torch.einsum("akmn,kmnb->ab", x_ref, y_ref)
+    assert_close(z, expected)
+
+    grad = torch.randn(rows, cols)
+    z.backward(grad)
+    expected.backward(grad)
+
+    expected_x_grad = _split_three(
+        x_ref.grad,
+        k_shapes,
+        1,
+        dp_rank,
+        m_shapes,
+        2,
+        sp_rank,
+        n_shapes,
+        3,
+        tp_rank,
+    )
+    expected_y_grad = _split_two(y_ref.grad, k_shapes, 0, sp_rank, m_shapes, 1, dp_rank)
+    assert_close(x_shard.grad, expected_x_grad)
+    assert_close(y_shard.grad, expected_y_grad)
+
+
+def test_explicit_partial_output_can_also_shard_output_axis(dist_env, mesh_tp):
+    group = mesh_tp["tp"].get_group()
+    rank = dist.get_rank(group)
+    world_size = dist.get_world_size(group)
+    rows = world_size * 2 + 1
+    cols = world_size * 3 + 2
+    hidden = 5
+    row_shapes = es.helpers.compute_split_shapes(rows, world_size)
+    col_shapes = es.helpers.compute_split_shapes(cols, world_size)
+
+    x_full = torch.randn(rows, cols)
+    y_full = torch.randn(cols, hidden)
+    x_shard = torch.split(x_full, col_shapes, dim=1)[rank].clone().requires_grad_(True)
+    y_shard = torch.split(y_full, col_shapes, dim=0)[rank].clone().requires_grad_(True)
+
+    z = es.einshard(
+        "l f/tp, f/tp e -> l/tp e // tp",
+        x_shard,
+        y_shard,
+        mesh=mesh_tp,
+        shapes={"tp": {"l": row_shapes, "f": col_shapes}},
+    )
+
+    x_ref = torch.split(x_full.detach().clone(), col_shapes, dim=1)[rank].requires_grad_(True)
+    y_ref = torch.split(y_full.detach().clone(), col_shapes, dim=0)[rank].requires_grad_(True)
+    expected_partial_full = torch.einsum("lf,fe->le", x_ref, y_ref)
+    expected = torch.split(expected_partial_full, row_shapes, dim=0)[rank]
+    assert_close(z, expected)
+
+    grad_full = torch.randn(rows, hidden)
+    grad_shard = torch.split(grad_full, row_shapes, dim=0)[rank]
+    z.backward(grad_shard)
+    expected_partial_full.backward(grad_full)
+
+    assert_close(x_shard.grad, x_ref.grad)
+    assert_close(y_shard.grad, y_ref.grad)
 
 
 def test_binary_gathers_free_axis_to_sharded_output(dist_env, mesh_tp):
