@@ -38,7 +38,7 @@ device,local_rank,world_rank,world_size = init()
 if world_rank != 0:
     ic.disable()
 
-assert world_size >= 4 and world_size % 4 == 0, "World size needs to be divisible by 4 (for dp = 4)"
+assert world_size == 12, "World size needs to be 12 for mesh shape (2, 3, 2)"
 
 mesh = init_device_mesh(device, (2,3,2), mesh_dim_names=("a", "b", "c"))
 
