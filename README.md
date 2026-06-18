@@ -313,6 +313,19 @@ b n c, h/tp c -> b n h/tp
 b n h/tp, c h/tp -> b n c
 ```
 
+With sequence-parallel activations, the MLP keeps the sequence axis sharded at the block boundary:
+
+```text
+l/tp e, e f/tp -> l f/tp
+l f/tp, f/tp e -> l/tp e
+```
+
+The first projection gathers `l/tp` to full `l` while producing the sharded hidden axis `f/tp`. The second projection contracts over `f/tp` and reduce-scatters the result back to `l/tp`. For uneven shards, provide split metadata for both logical axes:
+
+```python
+shapes = {"tp": {"l": l_shapes, "f": f_shapes}}
+```
+
 Attention projections follow the same pattern:
 
 ```text
