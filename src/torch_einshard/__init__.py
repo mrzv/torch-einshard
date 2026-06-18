@@ -48,7 +48,28 @@ def local_operation(shard):
         return Axes(set(_flat_axes(shard[0])) ^ set(_flat_axes(shard[2]))).local()
     else:
         # X,Y -> Z
-        return Axes(set(_flat_axes(shard[0])) & set(_flat_axes(shard[1]))).local()
+        input0_axes = _flat_axes(shard[0])
+        input1_axes = _flat_axes(shard[1])
+        output_axes = _flat_axes(shard[2])
+        input_axes = list(input0_axes) + list(input1_axes)
+
+        for output_axis in output_axes:
+            if output_axis in input_axes:
+                continue
+            if any(axis.name == output_axis.name for axis in input_axes):
+                return False
+
+        input0_by_name = {axis.name: axis for axis in input0_axes}
+        input1_by_name = {axis.name: axis for axis in input1_axes}
+        for name in set(input0_by_name) & set(input1_by_name):
+            input0_axis = input0_by_name[name]
+            input1_axis = input1_by_name[name]
+            if not input0_axis.local() or not input1_axis.local():
+                return False
+            if input0_axis != input1_axis:
+                return False
+
+        return True
 
 def einshard(shard, *xs, mesh = None, shapes = None, sizes = None, families = None):
     shard, sizes = cached_expand_axis_families(shard, sizes, families)

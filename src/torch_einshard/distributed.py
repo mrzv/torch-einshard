@@ -11,7 +11,7 @@ from .mappings import allreduce_forward_identity_backward, \
                         alltoall_repartition, \
                         owner_swap_forward_backward
 from .helpers import resolve_split_shapes
-from .sharding import Axis, Axes, EllipsisAxis
+from .sharding import Axis, Axes, EllipsisAxis, TensorSpec
 
 
 def _axes(spec):
@@ -65,16 +65,19 @@ def distributed_1d(shard, *xs, mesh, shapes):
 
     # X,Y -> Z
     elif shard[1] is not None:
-        return distributed_1d_2(shard, *xs, mesh = mesh)
+        return distributed_1d_2(shard, *xs, mesh = mesh, shapes = shapes)
     else:
         return NotImplemented       # TODO: maybe raise instead?
 
-def distributed_1d_2(shard, x, y, mesh):
+def distributed_1d_2(shard, x, y, mesh, shapes = None):
     # TODO: check the dimensions match sharding
 
-    input0_axes = _without_ellipsis(_axes(shard[0]))
-    input1_axes = _without_ellipsis(_axes(shard[1]))
-    output_axes = _without_ellipsis(_axes(shard[2]))
+    input0_spec = shard[0]
+    input1_spec = shard[1]
+    output_spec = shard[2]
+    input0_axes = _without_ellipsis(_axes(input0_spec))
+    input1_axes = _without_ellipsis(_axes(input1_spec))
+    output_axes = _without_ellipsis(_axes(output_spec))
     input0_by_name = {axis.name: axis for axis in input0_axes}
     input1_by_name = {axis.name: axis for axis in input1_axes}
     output_by_name = {axis.name: axis for axis in output_axes}
@@ -85,6 +88,87 @@ def distributed_1d_2(shard, x, y, mesh):
     ]
     assert contracted_names, "Expected a contraction axis"
 
+    reduction_dims = []
+    for name in contracted_names:
+        axis = input0_by_name[name]
+        assert axis == input1_by_name[name], "Contracted axes must use matching sharding"
+        if axis.local() or axis.shard_dim in reduction_dims:
+            continue
+        reduction_dims.append(axis.shard_dim)
+
+    def group(shard_dim):
+        return mesh[shard_dim].get_group()
+
+    def dim_of(axes, axis_name, tensor):
+        dim = 0
+        fixed_dims = sum(1 for axis in axes if not isinstance(axis, EllipsisAxis))
+        ellipsis_dims = tensor.dim() - fixed_dims
+        for axis in axes:
+            if isinstance(axis, EllipsisAxis):
+                dim += ellipsis_dims
+            elif axis.name == axis_name:
+                return dim
+            else:
+                dim += 1
+        raise ValueError(f"Axis {axis_name!r} is not present in input")
+
+    def active_in_output(shard_dim):
+        if shard_dim in _partials(output_spec):
+            return True
+        return any(axis.shard_dim == shard_dim for axis in output_axes)
+
+    def replace_axis(axes, axis_name, replacement):
+        return Axes(
+            replacement if not isinstance(axis, EllipsisAxis) and axis.name == axis_name else axis
+            for axis in axes
+        )
+
+    def normalize_input(tensor, spec):
+        axes = _axes(spec)
+        normalized_axes = axes
+        for axis in _without_ellipsis(axes):
+            if axis.name not in output_by_name:
+                continue
+            output_axis = output_by_name[axis.name]
+            if axis == output_axis:
+                continue
+
+            dim = dim_of(normalized_axes, axis.name, tensor)
+            if axis.local():
+                comm = group(output_axis.shard_dim)
+                split_shapes = resolve_split_shapes(shapes, output_axis.shard_dim, axis.name, comm)
+                tensor = split_forward_allgather_backward(tensor, comm, dim, split_shapes)
+            elif output_axis.local():
+                comm = group(axis.shard_dim)
+                split_shapes = resolve_split_shapes(shapes, axis.shard_dim, axis.name, comm)
+                if active_in_output(axis.shard_dim):
+                    tensor = allgather_forward_reducescatter_backward(tensor, comm, dim, split_shapes)
+                else:
+                    tensor = allgather_forward_split_backward(tensor, comm, dim, split_shapes)
+            else:
+                source_comm = group(axis.shard_dim)
+                source_shapes = resolve_split_shapes(shapes, axis.shard_dim, axis.name, source_comm)
+                if active_in_output(axis.shard_dim):
+                    tensor = allgather_forward_reducescatter_backward(tensor, source_comm, dim, source_shapes)
+                else:
+                    tensor = allgather_forward_split_backward(tensor, source_comm, dim, source_shapes)
+
+                dest_comm = group(output_axis.shard_dim)
+                dest_shapes = resolve_split_shapes(shapes, output_axis.shard_dim, axis.name, dest_comm)
+                tensor = split_forward_allgather_backward(tensor, dest_comm, dim, dest_shapes)
+
+            normalized_axes = replace_axis(normalized_axes, axis.name, output_axis)
+
+        return tensor, TensorSpec(normalized_axes, _partials(spec))
+
+    x, input0_spec = normalize_input(x, input0_spec)
+    y, input1_spec = normalize_input(y, input1_spec)
+    normalized_shard = (input0_spec, input1_spec, output_spec)
+
+    input0_axes = _without_ellipsis(_axes(input0_spec))
+    input1_axes = _without_ellipsis(_axes(input1_spec))
+    input0_by_name = {axis.name: axis for axis in input0_axes}
+    input1_by_name = {axis.name: axis for axis in input1_axes}
     shared_output_names = [
         axis.name for axis in input0_axes
         if axis.name in input1_by_name and axis.name in output_names
@@ -95,20 +179,12 @@ def distributed_1d_2(shard, x, y, mesh):
         assert axis == input1_by_name[name], "Shared axes must use matching sharding"
         assert axis == output_by_name[name], "Output shared axes must preserve input sharding"
 
-    reduction_dims = []
-    for name in contracted_names:
-        axis = input0_by_name[name]
-        assert axis == input1_by_name[name], "Contracted axes must use matching sharding"
-        if axis.local() or axis.shard_dim in reduction_dims:
-            continue
-        reduction_dims.append(axis.shard_dim)
-
-    z = einsum(shard, x, y)    # perform the local operation
+    z = einsum(normalized_shard, x, y)    # perform the local operation
 
     for shard_dim in reduction_dims:
         if shard_dim in _partials(shard[2]):
             continue
-        z = allreduce_forward_identity_backward(z, comm = mesh[shard_dim].get_group())
+        z = allreduce_forward_identity_backward(z, comm = group(shard_dim))
 
     return z
 
