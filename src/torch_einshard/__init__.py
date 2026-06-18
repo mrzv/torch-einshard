@@ -2,6 +2,7 @@ from .einsum import einsum
 from .grammar import parse_sharding, Axes
 from .distributed import distributed_1d
 from .families import cached_expand_axis_families
+from .halo import einhalo, einwindow
 from .mesh import CompoundDeviceMesh, wrap_mesh
 from .params import (
     ParamShardMetadata,

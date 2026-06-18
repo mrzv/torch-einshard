@@ -426,6 +426,74 @@ The score pattern gathers the sharded key axis so each query shard can attend ov
 shapes = {"tp": {"q": q_shapes, "k": k_shapes}}
 ```
 
+## Ghost Cells And Windows
+
+`einhalo` extends one or more axes with ghost cells. Local axes are padded directly. Sharded axes gather the full logical axis, slice the extended range owned by the current rank, and use autograd to route halo gradients back to the owning shard.
+
+```python
+xg = es.einhalo(
+    "b h/sp_h w/sp_w c",
+    x,
+    {"h": 1, "w": 1},
+    mesh=mesh,
+    shapes={"sp_h": h_shapes, "sp_w": w_shapes},
+)
+```
+
+Halo widths can be symmetric integers or `(left, right)` pairs:
+
+```python
+xg = es.einhalo("h/sp c", x, {"h": (2, 1)}, mesh=mesh, shapes=shapes)
+```
+
+Supported boundaries are `constant`, `periodic`, and `replicate`. Constant boundaries use `fill=0` by default:
+
+```python
+xg = es.einhalo("h/sp c", x, {"h": 1}, boundary="constant", fill=-1, mesh=mesh, shapes=shapes)
+```
+
+`einwindow` is a sharding-aware `unfold`/`im2col`. It first applies the needed halo, then preserves the owned center axis and adds an explicit local window axis:
+
+```python
+patches = es.einwindow(
+    "b h/sp_h w/sp_w c -> b h/sp_h w/sp_w kh kw c",
+    x,
+    {"h": "kh", "w": "kw"},
+    {"h": 1, "w": 1},
+    mesh=mesh,
+    shapes={"sp_h": h_shapes, "sp_w": w_shapes},
+)
+```
+
+For a 3x3 convolution, the window axes can then be contracted normally:
+
+```python
+y = es.einshard(
+    "b h/sp_h w/sp_w kh kw c, o kh kw c -> b h/sp_h w/sp_w o",
+    patches,
+    weight,
+    mesh=mesh,
+)
+```
+
+For neighborhood attention, window the key and value tensors, then contract the query only against local neighborhood axes instead of a full sequence/spatial axis.
+
+Axis families work for both halo/window widths and window-axis names:
+
+```python
+patches = es.einwindow(
+    "b *spatial c -> b *spatial *window c",
+    x,
+    {"spatial": ("kh", "kw")},
+    {"spatial": (1, 1)},
+    families={"spatial": ("h/sp_h", "w/sp_w"), "window": ("kh", "kw")},
+    mesh=mesh,
+    shapes={"sp_h": h_shapes, "sp_w": w_shapes},
+)
+```
+
+Current sharded halo semantics are correctness-first and may materialize the full gathered axis. A direct neighbor-exchange implementation can replace this later without changing the public API.
+
 ## Distributed Roll
 
 `einroll` rolls tensors described by sharded axis notation.
