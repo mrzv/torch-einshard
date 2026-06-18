@@ -476,6 +476,31 @@ y = es.einshard(
 )
 ```
 
+`einconv` provides the lower-memory convolution path directly. It applies the
+needed `einhalo` padding, calls PyTorch `conv1d`/`conv2d`/`conv3d` without
+materializing im2col windows, and checkpoints the full halo-plus-convolution
+forward by default so backward recomputes activations instead of saving them:
+
+```python
+y = es.einconv(
+    "b h/sp_h w/sp_w c, o c kh kw -> b h/sp_h w/sp_w o",
+    x,
+    weight,
+    {"h": "kh", "w": "kw"},
+    bias=bias,
+    mesh=mesh,
+    shapes={"sp_h": h_shapes, "sp_w": w_shapes},
+)
+```
+
+The `checkpoint` option defaults to `"full"`. Use `checkpoint="conv"` to
+checkpoint only the local convolution after halo exchange, or `checkpoint=False`
+to disable checkpointing. The initial implementation supports 1D/2D/3D
+convolutions with stride 1, one input-channel axis, one output-channel axis, and
+local kernel axes. Padding must preserve each spatial length; omitted padding
+defaults to same-padding for odd effective kernel sizes. Grouped convolutions are
+not supported yet.
+
 For neighborhood attention, window the key and value tensors, then contract the query only against local neighborhood axes instead of a full sequence/spatial axis.
 
 Axis families work for both halo/window widths and window-axis names:

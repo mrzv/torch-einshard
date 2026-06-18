@@ -1,4 +1,5 @@
 from .einsum import einsum
+from .conv import einconv
 from .grammar import parse_sharding, Axes
 from .distributed import distributed_1d
 from .families import cached_expand_axis_families
