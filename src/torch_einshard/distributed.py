@@ -86,7 +86,6 @@ def distributed_1d_2(shard, x, y, mesh, shapes = None):
         axis.name for axis in input0_axes
         if axis.name in input1_by_name and axis.name not in output_names
     ]
-    assert contracted_names, "Expected a contraction axis"
 
     contracted_target_by_name = {}
     for name in contracted_names:

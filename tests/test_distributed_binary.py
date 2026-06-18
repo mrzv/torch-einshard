@@ -331,6 +331,66 @@ def test_binary_repartitions_free_axis_after_local_contraction(dist_env, mesh_tp
     assert_close(y.grad, y_ref.grad)
 
 
+def test_binary_elementwise_shared_sharded_axis(dist_env, mesh_tp):
+    group = mesh_tp["tp"].get_group()
+    rank = dist.get_rank(group)
+    world_size = dist.get_world_size(group)
+    rows = world_size * 2 + 1
+    hidden = 4
+    row_shapes = es.helpers.compute_split_shapes(rows, world_size)
+
+    x_full = torch.randn(rows, hidden)
+    y_full = torch.randn(rows, hidden)
+    x_shard = torch.split(x_full, row_shapes, dim=0)[rank].clone().requires_grad_(True)
+    y_shard = torch.split(y_full, row_shapes, dim=0)[rank].clone().requires_grad_(True)
+
+    z = es.einshard(
+        "l/tp e, l/tp e -> l/tp e",
+        x_shard,
+        y_shard,
+        mesh=mesh_tp,
+        shapes={"tp": {"l": row_shapes}},
+    )
+
+    expected = torch.split(x_full * y_full, row_shapes, dim=0)[rank]
+    assert_close(z, expected)
+
+
+def test_binary_elementwise_splits_replicated_shared_axis(dist_env, mesh_tp):
+    group = mesh_tp["tp"].get_group()
+    rank = dist.get_rank(group)
+    world_size = dist.get_world_size(group)
+    rows = world_size * 2 + 1
+    hidden = 4
+    row_shapes = es.helpers.compute_split_shapes(rows, world_size)
+
+    x_full = torch.randn(rows, hidden)
+    y = torch.randn(rows, hidden, requires_grad=True)
+    x_shard = torch.split(x_full, row_shapes, dim=0)[rank].clone().requires_grad_(True)
+
+    z = es.einshard(
+        "l/tp e, l e -> l/tp e",
+        x_shard,
+        y,
+        mesh=mesh_tp,
+        shapes={"tp": {"l": row_shapes}},
+    )
+
+    x_ref = x_full.detach().clone().requires_grad_(True)
+    y_ref = y.detach().clone().requires_grad_(True)
+    expected_full = x_ref * y_ref
+    expected = torch.split(expected_full, row_shapes, dim=0)[rank]
+    assert_close(z, expected)
+
+    grad_full = torch.randn(rows, hidden)
+    grad_shard = torch.split(grad_full, row_shapes, dim=0)[rank]
+    z.backward(grad_shard)
+    expected_full.backward(grad_full)
+
+    assert_close(x_shard.grad, torch.split(x_ref.grad, row_shapes, dim=0)[rank])
+    assert_close(y.grad, y_ref.grad)
+
+
 def test_shared_sharded_batch_axis(dist_env, mesh_2d):
     dp_group = mesh_2d["dp"].get_group()
     dp_rank = dist.get_rank(dp_group)
