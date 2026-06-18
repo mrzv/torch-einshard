@@ -147,6 +147,53 @@ def distributed_1d_2(shard, x, y, mesh, shapes = None):
             for axis in axes
         )
 
+    def find_post_repartition():
+        gather_candidates = []
+        split_candidates = []
+        for output_axis in output_axes:
+            matching_input_axes = [
+                input_axis for input_axis in (input0_by_name.get(output_axis.name), input1_by_name.get(output_axis.name))
+                if input_axis is not None
+            ]
+            if len(matching_input_axes) != 1:
+                continue
+            input_axis = matching_input_axes[0]
+            if input_axis == output_axis:
+                continue
+            if input_axis.shard_dim and output_axis.local():
+                gather_candidates.append((input_axis, output_axis))
+            elif input_axis.local() and output_axis.shard_dim:
+                split_candidates.append((input_axis, output_axis))
+
+        if len(gather_candidates) != 1 or len(split_candidates) != 1:
+            return None
+
+        source_input_axis, source_output_axis = gather_candidates[0]
+        dest_input_axis, dest_output_axis = split_candidates[0]
+        shard_dim = source_input_axis.shard_dim
+        if shard_dim != dest_output_axis.shard_dim:
+            return None
+        if shard_dim in reduction_dims or shard_dim in _partials(output_spec):
+            return None
+
+        comm = group(shard_dim)
+        source_shapes = resolve_split_shapes(shapes, shard_dim, source_input_axis.name, comm)
+        dest_shapes = resolve_split_shapes(shapes, shard_dim, dest_output_axis.name, comm)
+        if source_shapes is None or dest_shapes is None:
+            return None
+
+        return {
+            "shard_dim": shard_dim,
+            "source_input_axis": source_input_axis,
+            "source_output_axis": source_output_axis,
+            "dest_input_axis": dest_input_axis,
+            "dest_output_axis": dest_output_axis,
+            "source_shapes": source_shapes,
+            "dest_shapes": dest_shapes,
+        }
+
+    post_repartition = find_post_repartition()
+
     def normalize_axis(tensor, normalized_axes, axis, target_axis):
         dim = dim_of(normalized_axes, axis.name, tensor)
         if axis.local():
@@ -185,6 +232,13 @@ def distributed_1d_2(shard, x, y, mesh, shapes = None):
                     tensor, normalized_axes = normalize_axis(tensor, normalized_axes, axis, target_axis)
                 continue
 
+            if post_repartition is not None:
+                if axis == post_repartition["source_input_axis"]:
+                    continue
+                if axis == post_repartition["dest_input_axis"]:
+                    tensor = identity_forward_allreduce_backward(tensor, group(post_repartition["shard_dim"]))
+                    continue
+
             if axis.name not in output_by_name:
                 continue
             output_axis = output_by_name[axis.name]
@@ -202,10 +256,19 @@ def distributed_1d_2(shard, x, y, mesh, shapes = None):
             return Axis(axis.name)
         return axis
 
+    def localize_post_repartition_axis(axis):
+        if post_repartition is None:
+            return axis
+        if axis == post_repartition["source_output_axis"]:
+            return post_repartition["source_input_axis"]
+        if axis == post_repartition["dest_output_axis"]:
+            return post_repartition["dest_input_axis"]
+        return axis
+
     x, input0_spec = normalize_input(x, input0_spec)
     y, input1_spec = normalize_input(y, input1_spec)
     local_output_axes = Axes(
-        localize_scatter_axis(axis) if not isinstance(axis, EllipsisAxis) else axis
+        localize_post_repartition_axis(localize_scatter_axis(axis)) if not isinstance(axis, EllipsisAxis) else axis
         for axis in _axes(output_spec)
     )
     local_output_spec = TensorSpec(local_output_axes, _partials(output_spec))
@@ -241,6 +304,27 @@ def distributed_1d_2(shard, x, y, mesh, shapes = None):
         split_shapes = resolve_split_shapes(shapes, shard_dim, scatter_axis.name, comm)
         z = reducescatter_forward_allgather_backward(z, comm, dim, split_shapes)
         current_output_axes = replace_axis(current_output_axes, scatter_axis.name, scatter_axis)
+
+    if post_repartition is not None:
+        comm = group(post_repartition["shard_dim"])
+        z = alltoall_repartition(
+            z,
+            comm,
+            dim_of(current_output_axes, post_repartition["source_input_axis"].name, z),
+            dim_of(current_output_axes, post_repartition["dest_input_axis"].name, z),
+            post_repartition["source_shapes"],
+            post_repartition["dest_shapes"],
+        )
+        current_output_axes = replace_axis(
+            current_output_axes,
+            post_repartition["source_output_axis"].name,
+            post_repartition["source_output_axis"],
+        )
+        current_output_axes = replace_axis(
+            current_output_axes,
+            post_repartition["dest_output_axis"].name,
+            post_repartition["dest_output_axis"],
+        )
 
     return z
 

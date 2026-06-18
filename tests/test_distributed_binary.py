@@ -294,6 +294,43 @@ def test_binary_splits_full_contracted_axis_to_match_shard(dist_env, mesh_tp):
     assert_close(y_shard.grad, torch.split(y_ref.grad, col_shapes, dim=0)[rank])
 
 
+def test_binary_repartitions_free_axis_after_local_contraction(dist_env, mesh_tp):
+    group = mesh_tp["tp"].get_group()
+    rank = dist.get_rank(group)
+    world_size = dist.get_world_size(group)
+    rows = world_size * 2 + 1
+    cols = world_size * 3 + 2
+    hidden = 4
+    row_shapes = es.helpers.compute_split_shapes(rows, world_size)
+    col_shapes = es.helpers.compute_split_shapes(cols, world_size)
+
+    x_full = torch.randn(rows, hidden)
+    y = torch.randn(hidden, cols, requires_grad=True)
+    x_shard = torch.split(x_full, row_shapes, dim=0)[rank].clone().requires_grad_(True)
+
+    z = es.einshard(
+        "l/tp e, e f -> l f/tp",
+        x_shard,
+        y,
+        mesh=mesh_tp,
+        shapes={"tp": {"l": row_shapes, "f": col_shapes}},
+    )
+
+    x_ref = x_full.detach().clone().requires_grad_(True)
+    y_ref = y.detach().clone().requires_grad_(True)
+    expected_full = torch.einsum("le,ef->lf", x_ref, y_ref)
+    expected = torch.split(expected_full, col_shapes, dim=1)[rank]
+    assert_close(z, expected)
+
+    grad_full = torch.randn(rows, cols)
+    grad_shard = torch.split(grad_full, col_shapes, dim=1)[rank]
+    z.backward(grad_shard)
+    expected_full.backward(grad_full)
+
+    assert_close(x_shard.grad, torch.split(x_ref.grad, row_shapes, dim=0)[rank])
+    assert_close(y.grad, y_ref.grad)
+
+
 def test_shared_sharded_batch_axis(dist_env, mesh_2d):
     dp_group = mesh_2d["dp"].get_group()
     dp_rank = dist.get_rank(dp_group)
