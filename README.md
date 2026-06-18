@@ -224,7 +224,7 @@ Partial notation currently represents sum reductions only.
 
 ## Supported Distributed Binary Patterns
 
-Binary distributed contractions support one or more sharded contracted axes. The local contraction is computed first and then all-reduced over each contracted shard dimension, unless the output explicitly keeps the partial value or the contracted mesh dimension is reused to shard an output axis.
+Binary distributed operations support sharded contractions and sharded elementwise products. For contractions, the local contraction is computed first and then all-reduced over each contracted shard dimension, unless the output explicitly keeps the partial value or the contracted mesh dimension is reused to shard an output axis.
 
 Generic form:
 
@@ -252,6 +252,19 @@ Shared sharded axes can also appear in both inputs and the output, which covers 
 z = es.einshard("b/dp a c, b/dp c d -> b/dp a d", x, y, mesh=mesh)
 ```
 
+If one operand has a replicated shared axis and the output requests the sharded layout, that operand is split before the local operation:
+
+```python
+z = es.einshard("b/dp a c, b c d -> b/dp a d", x_shard, y, mesh=mesh, shapes=shapes)
+```
+
+Sharded elementwise products use the same normalization path:
+
+```python
+z = es.einshard("l/tp e, l/tp e -> l/tp e", x_shard, y_shard, mesh=mesh, shapes=shapes)
+z = es.einshard("l/tp e, l e -> l/tp e", x_shard, y, mesh=mesh, shapes=shapes)
+```
+
 The partial output can also be requested explicitly:
 
 ```python
@@ -268,6 +281,13 @@ z = es.einshard("l/tp e, e f -> l f", x_shard, y, mesh=mesh, shapes=shapes)
 z = es.einshard("l e, e f -> l/tp f", x, y, mesh=mesh, shapes=shapes)
 ```
 
+Contracted axes can also be normalized when one operand has the full contracted dimension and the other is sharded:
+
+```python
+z = es.einshard("l f, f/tp e -> l e", x, y_shard, mesh=mesh, shapes=shapes)
+z = es.einshard("l/tp f, f/tp e -> l/tp e", x_shard, y_shard, mesh=mesh, shapes=shapes)
+```
+
 For uneven shards, pass split metadata for each affected logical axis and mesh dimension:
 
 ```python
@@ -281,6 +301,14 @@ z = es.einshard("l f/tp, f/tp e -> l/tp e", x_shard, y_shard, mesh=mesh, shapes=
 ```
 
 This computes the local partial `l e // tp` and then reduce-scatters it to `l/tp e`.
+
+When one free axis moves from sharded to local and another moves from local to sharded over the same mesh dimension, `einshard` can keep the local contraction in the source-sharded layout and repartition the result with an all-to-all-style exchange:
+
+```python
+z = es.einshard("l/tp e, e f -> l f/tp", x_shard, y, mesh=mesh, shapes=shapes)
+```
+
+This avoids materializing the full `l f` result on every rank when split metadata is available for both `l` and `f`.
 
 ## Tensor-Parallel Linear Patterns
 
@@ -333,6 +361,19 @@ b l c, q/tp c -> b l q/tp
 b l c, k/tp c -> b l k/tp
 b l c, v/tp c -> b l v/tp
 b l v/tp, c v/tp -> b l c
+```
+
+Sequence-parallel attention score and value contractions are also expressible:
+
+```text
+b h q/tp d, b h k/tp d -> b h q/tp k
+b h q/tp k, b h k/tp d -> b h q/tp d
+```
+
+The score pattern gathers the sharded key axis so each query shard can attend over full `k`. The value pattern splits the contracted `k` axis to match `v`, computes a local partial over full `q`, and reduce-scatters back to `q/tp`. For uneven sequence shards, provide both query and key split metadata:
+
+```python
+shapes = {"tp": {"q": q_shapes, "k": k_shapes}}
 ```
 
 ## Distributed Roll
