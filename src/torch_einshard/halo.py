@@ -5,7 +5,6 @@ import torch.distributed as dist
 from .families import cached_expand_axis_families, expand_family_mapping
 from .grammar import parse_sharding
 from .helpers import resolve_split_shapes
-from .mappings import allgather_forward_reducescatter_backward
 from .sharding import EllipsisAxis
 
 
@@ -83,6 +82,192 @@ def _take_periodic_range(x, dim, start, length):
     return torch.index_select(x, dim, index)
 
 
+def _rank_for_offset(offsets, ends, offset):
+    for rank, end in enumerate(ends):
+        if offset < end:
+            return rank
+    return len(ends) - 1
+
+
+def _halo_intervals_for_range(shapes, request_start, request_length, *, periodic):
+    if request_length == 0:
+        return []
+
+    total = sum(shapes)
+    if periodic and total == 0:
+        raise ValueError("Cannot periodic-pad an empty axis")
+
+    offsets = [sum(shapes[:rank]) for rank in range(len(shapes))]
+    ends = [offsets[rank] + shapes[rank] for rank in range(len(shapes))]
+    intervals = []
+    output_offset = 0
+    cursor = request_start
+    remaining = request_length
+
+    while remaining > 0:
+        if periodic:
+            global_offset = cursor % total
+            src_rank = _rank_for_offset(offsets, ends, global_offset)
+            rank_end = ends[src_rank]
+            length = min(remaining, rank_end - global_offset)
+            if length == 0:
+                cursor += 1
+                continue
+        else:
+            if cursor < 0:
+                length = min(remaining, -cursor)
+                cursor += length
+                output_offset += length
+                remaining -= length
+                continue
+            if cursor >= total:
+                break
+            src_rank = _rank_for_offset(offsets, ends, cursor)
+            global_offset = cursor
+            rank_end = ends[src_rank]
+            length = min(remaining, rank_end - global_offset)
+            if length == 0:
+                cursor += 1
+                continue
+
+        intervals.append((output_offset, src_rank, global_offset - offsets[src_rank], length))
+        cursor += length
+        output_offset += length
+        remaining -= length
+
+    return intervals
+
+
+def _all_halo_intervals(shapes, left, right, *, periodic):
+    intervals_by_rank = []
+    start = 0
+    for local in shapes:
+        if periodic:
+            request_start = start - left
+            request_length = local + left + right
+        else:
+            total = sum(shapes)
+            request_start = max(0, start - left)
+            request_end = min(total, start + local + right)
+            request_length = request_end - request_start
+        intervals_by_rank.append(_halo_intervals_for_range(shapes, request_start, request_length, periodic=periodic))
+        start += local
+    return intervals_by_rank
+
+
+def _empty_like_along_dim(x, dim, length):
+    shape = list(x.shape)
+    shape[dim] = length
+    return torch.empty(shape, dtype=x.dtype, device=x.device)
+
+
+class _HaloExchange(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, input, group, dim, shapes, left, right, periodic):
+        size = dist.get_world_size(group)
+        rank = dist.get_rank(group)
+        if len(shapes) != size:
+            raise ValueError(f"Error: passed shapes of size {len(shapes)} not equal to {size}")
+        if input.shape[dim] != shapes[rank]:
+            raise ValueError(
+                f"Local tensor size {input.shape[dim]} does not match split shape {shapes[rank]}"
+            )
+
+        intervals_by_rank = _all_halo_intervals(shapes, left, right, periodic=periodic)
+        output_length = shapes[rank] + left + right if periodic else sum(length for _, _, _, length in intervals_by_rank[rank])
+        output = _empty_like_along_dim(input, dim, output_length)
+
+        ops = []
+        recv_targets = []
+        send_buffers = []
+
+        for output_offset, src_rank, src_start, length in intervals_by_rank[rank]:
+            target = output.narrow(dim, output_offset, length)
+            if src_rank == rank:
+                target.copy_(input.narrow(dim, src_start, length))
+                continue
+            peer = dist.get_global_rank(group, src_rank)
+            recv_buffer = torch.empty_like(target)
+            recv_targets.append((recv_buffer, target))
+            ops.append(dist.P2POp(dist.irecv, recv_buffer, peer, group))
+
+        for dest_rank, intervals in enumerate(intervals_by_rank):
+            if dest_rank == rank:
+                continue
+            for _, src_rank, src_start, length in intervals:
+                if src_rank != rank:
+                    continue
+                peer = dist.get_global_rank(group, dest_rank)
+                send_buffer = input.narrow(dim, src_start, length).contiguous()
+                send_buffers.append(send_buffer)
+                ops.append(dist.P2POp(dist.isend, send_buffer, peer, group))
+
+        if ops:
+            for request in dist.batch_isend_irecv(ops):
+                request.wait()
+        for recv_buffer, target in recv_targets:
+            target.copy_(recv_buffer)
+
+        ctx.group = group
+        ctx.dim = dim
+        ctx.shapes = shapes
+        ctx.left = left
+        ctx.right = right
+        ctx.periodic = periodic
+        ctx.input_shape = tuple(input.shape)
+        return output.contiguous()
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        group = ctx.group
+        dim = ctx.dim
+        shapes = ctx.shapes
+        left = ctx.left
+        right = ctx.right
+        periodic = ctx.periodic
+        rank = dist.get_rank(group)
+        intervals_by_rank = _all_halo_intervals(shapes, left, right, periodic=periodic)
+
+        grad_input = torch.zeros(ctx.input_shape, dtype=grad_output.dtype, device=grad_output.device)
+        ops = []
+        recv_targets = []
+        send_buffers = []
+
+        for output_offset, src_rank, src_start, length in intervals_by_rank[rank]:
+            grad_chunk = grad_output.narrow(dim, output_offset, length)
+            if src_rank == rank:
+                grad_input.narrow(dim, src_start, length).add_(grad_chunk)
+                continue
+            peer = dist.get_global_rank(group, src_rank)
+            send_buffer = grad_chunk.contiguous()
+            send_buffers.append(send_buffer)
+            ops.append(dist.P2POp(dist.isend, send_buffer, peer, group))
+
+        for dest_rank, intervals in enumerate(intervals_by_rank):
+            if dest_rank == rank:
+                continue
+            for _, src_rank, src_start, length in intervals:
+                if src_rank != rank:
+                    continue
+                target = grad_input.narrow(dim, src_start, length)
+                peer = dist.get_global_rank(group, dest_rank)
+                recv_buffer = torch.empty_like(target)
+                recv_targets.append((recv_buffer, target))
+                ops.append(dist.P2POp(dist.irecv, recv_buffer, peer, group))
+
+        if ops:
+            for request in dist.batch_isend_irecv(ops):
+                request.wait()
+        for recv_buffer, target in recv_targets:
+            target.add_(recv_buffer)
+
+        return grad_input, None, None, None, None, None, None
+
+
+def _halo_exchange(input, group, dim, shapes, left, right, *, periodic):
+    return _HaloExchange.apply(input, group, dim, shapes, left, right, periodic)
+
+
 def _halo_sharded_axis(x, axis, dim, left, right, *, mesh, shapes, boundary, fill):
     if mesh is None:
         raise ValueError("Sharded einhalo axes require mesh")
@@ -99,7 +284,6 @@ def _halo_sharded_axis(x, axis, dim, left, right, *, mesh, shapes, boundary, fil
             f"for axis {axis.name!r}"
         )
 
-    full = allgather_forward_reducescatter_backward(x, group, dim, split_shapes)
     total = sum(split_shapes)
     if boundary == "periodic" and total == 0:
         raise ValueError("Cannot periodic-pad an empty axis")
@@ -107,14 +291,14 @@ def _halo_sharded_axis(x, axis, dim, left, right, *, mesh, shapes, boundary, fil
     local = split_shapes[rank]
 
     if boundary == "periodic":
-        return _take_periodic_range(full, dim, start - left, local + left + right).contiguous()
+        return _halo_exchange(x, group, dim, split_shapes, left, right, periodic=True)
 
     if boundary not in ("constant", "replicate"):
         raise ValueError(f"Unsupported halo boundary {boundary!r}")
 
     take_start = max(0, start - left)
     take_end = min(total, start + local + right)
-    result = full.narrow(dim, take_start, take_end - take_start)
+    result = _halo_exchange(x, group, dim, split_shapes, left, right, periodic=False)
     pad_left = take_start - (start - left)
     pad_right = (start + local + right) - take_end
     return _pad_dim(result, dim, pad_left, pad_right, boundary=boundary, fill=fill)

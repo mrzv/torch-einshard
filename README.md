@@ -428,7 +428,7 @@ shapes = {"tp": {"q": q_shapes, "k": k_shapes}}
 
 ## Ghost Cells And Windows
 
-`einhalo` extends one or more axes with ghost cells. Local axes are padded directly. Sharded axes gather the full logical axis, slice the extended range owned by the current rank, and use autograd to route halo gradients back to the owning shard.
+`einhalo` extends one or more axes with ghost cells. Local axes are padded directly. Sharded axes exchange only the needed boundary intervals with owning ranks, then use autograd to route halo gradients back to those owners.
 
 ```python
 xg = es.einhalo(
@@ -492,7 +492,7 @@ patches = es.einwindow(
 )
 ```
 
-Current sharded halo semantics are correctness-first and may materialize the full gathered axis. A direct neighbor-exchange implementation can replace this later without changing the public API.
+Sharded halo exchange handles uneven shards, halos larger than a local shard, and `periodic` wraparound by slicing the requested ghost interval into rank-owned pieces.
 
 ## Distributed Roll
 

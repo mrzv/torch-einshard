@@ -19,6 +19,13 @@ def _extended_split(full, shapes, rank, left, right, *, fill=0):
     return result
 
 
+def _periodic_split(full, shapes, rank, left, right):
+    start = sum(shapes[:rank])
+    local = shapes[rank]
+    index = torch.arange(start - left, start + local + right, device=full.device).remainder(full.shape[0])
+    return full.index_select(0, index)
+
+
 def test_local_einhalo_constant_boundary():
     x = torch.arange(5, dtype=torch.float32)
 
@@ -147,6 +154,62 @@ def test_distributed_einhalo_uneven_shards(dist_env, mesh_1d):
         start = sum(shapes[:peer])
         end = start + shapes[peer]
         full_grad[max(0, start - 1):min(full.shape[0], end + 1)] += 1
+    assert_close(x.grad, torch.split(full_grad, shapes, dim=0)[rank])
+
+
+def test_distributed_einhalo_halo_larger_than_local_shard(dist_env, mesh_1d):
+    group = mesh_1d["dp"].get_group()
+    rank = dist.get_rank(group)
+    world_size = dist.get_world_size(group)
+    shapes = [2] + [1] * (world_size - 1)
+    full = torch.arange(sum(shapes) * 2, dtype=torch.float32).reshape(sum(shapes), 2)
+    x = torch.split(full, shapes, dim=0)[rank].clone().requires_grad_(True)
+    left = world_size + 1
+    right = world_size
+
+    z = es.einhalo("a/dp b", x, {"a": (left, right)}, mesh=mesh_1d, shapes=shapes, fill=-3)
+
+    assert_close(z, _extended_split(full, shapes, rank, left, right, fill=-3))
+
+    z.sum().backward()
+    full_grad = torch.zeros_like(full)
+    for peer in range(world_size):
+        start = sum(shapes[:peer])
+        end = start + shapes[peer]
+        full_grad[max(0, start - left):min(full.shape[0], end + right)] += 1
+    assert_close(x.grad, torch.split(full_grad, shapes, dim=0)[rank])
+
+
+def test_distributed_einhalo_periodic_wraps_and_accumulates(dist_env, mesh_1d):
+    group = mesh_1d["dp"].get_group()
+    rank = dist.get_rank(group)
+    world_size = dist.get_world_size(group)
+    shapes = [2] + [1] * (world_size - 1)
+    full = torch.arange(sum(shapes) * 2, dtype=torch.float32).reshape(sum(shapes), 2)
+    x = torch.split(full, shapes, dim=0)[rank].clone().requires_grad_(True)
+    left = sum(shapes) + 1
+    right = world_size
+
+    z = es.einhalo(
+        "a/dp b",
+        x,
+        {"a": (left, right)},
+        boundary="periodic",
+        mesh=mesh_1d,
+        shapes=shapes,
+    )
+
+    assert_close(z, _periodic_split(full, shapes, rank, left, right))
+
+    z.sum().backward()
+    full_grad = torch.zeros_like(full)
+    for peer in range(world_size):
+        index = torch.arange(
+            sum(shapes[:peer]) - left,
+            sum(shapes[:peer + 1]) + right,
+            device=full.device,
+        ).remainder(full.shape[0])
+        full_grad.index_add_(0, index, torch.ones(index.shape[0], full.shape[1]))
     assert_close(x.grad, torch.split(full_grad, shapes, dim=0)[rank])
 
 
