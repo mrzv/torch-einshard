@@ -1,5 +1,8 @@
-from parsley import makeGrammar
+from copy import deepcopy
 from functools import lru_cache
+
+from parsley import makeGrammar
+
 from .sharding import Axis, Axes, AxisGroup, EllipsisAxis, TensorSpec
 
 # TODO: add subscript-notation for parallelism
@@ -26,7 +29,7 @@ sharding = makeGrammar(grammar, globals(), name = "Einshard")
 
 def parse_sharding(expression):
     try:
-        return _parse_sharding_cached(expression)
+        return deepcopy(_parse_sharding_cached(expression))
     except Exception as error:
         raise ValueError(f"Invalid einshard expression {expression!r}: {error}") from error
 

@@ -3,6 +3,7 @@ import pytest
 import torch_einshard as es
 from torch_einshard.families import cached_expand_axis_families
 from torch_einshard.grammar import parse_sharding, sharding
+from torch_einshard.sharding import Axis
 
 
 def test_parse_single_partial():
@@ -87,8 +88,21 @@ def test_parse_sharding_wraps_parse_errors():
         parse_sharding("a b ->")
 
 
-def test_parse_sharding_reuses_cached_result():
-    assert parse_sharding("a b -> b a") is parse_sharding("a b -> b a")
+def test_parse_sharding_returns_copy_of_cached_result():
+    parsed = parse_sharding("a b -> b a")
+    reparsed = parse_sharding("a b -> b a")
+
+    assert parsed is not reparsed
+    assert repr(parsed) == repr(reparsed)
+
+
+def test_parse_sharding_mutation_does_not_poison_cache():
+    parsed = parse_sharding("a -> a")
+    parsed[0].axes.append(Axis("b"))
+
+    reparsed = parse_sharding("a -> a")
+
+    assert [axis.name for axis in reparsed[0].axes] == ["a"]
 
 
 def test_cached_axis_family_expansion_accepts_list_values():
