@@ -163,7 +163,7 @@ x = es.einfft(
 
 `signal_sizes` is only needed for inverse real FFTs when the original length cannot be inferred from the half-spectrum size, such as odd-length signals.
 
-Sharded transform axes are supported. The optimized path handles complex-to-complex FFTs when each sharded transform axis stays on the same mesh dimension with equal shard sizes and local shard size divisible by the mesh size. Multiple sharded transform axes are supported when they use distinct mesh dimensions. The optimized path uses a distributed Cooley-Tukey decomposition with all-to-all transposes and local factor FFTs.
+Sharded transform axes are supported. The optimized path handles complex-to-complex FFTs when each sharded transform axis stays on the same mesh dimension with equal shard sizes and local shard size divisible by the mesh size. Multiple sharded transform axes are supported when they use distinct mesh dimensions. Real FFTs also have an optimized path when the half-spectrum axis is local and any sharded transform axes are full-complex axes that satisfy the same constraints. The optimized path uses a distributed Cooley-Tukey decomposition with all-to-all transposes and local factor FFTs.
 
 ```python
 z = es.einfft(
@@ -175,7 +175,7 @@ z = es.einfft(
 )
 ```
 
-Unsupported sharded transform layouts, including sharded real FFT variants, fall back to gather the full transform axis, run the local FFT, then split the output frequency axis if requested. That path emits a `RuntimeWarning` because it materializes the full transform axis on every rank. Non-FFT axes must preserve their sharding. `einfft` currently supports explicit named axes; it does not support ellipsis axes, factored axes, or partial tensor specs.
+Unsupported sharded transform layouts, including real FFTs where the half-spectrum axis is sharded, fall back to gather the full transform axis, run the local FFT, then split the output frequency axis if requested. That path emits a `RuntimeWarning` because it materializes the full transform axis on every rank. Non-FFT axes must preserve their sharding. `einfft` currently supports explicit named axes; it does not support ellipsis axes, factored axes, or partial tensor specs.
 
 ## Supported Distributed Unary Patterns
 

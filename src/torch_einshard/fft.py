@@ -241,8 +241,8 @@ def _distributed_fft_axis_plan(x, source, target, input_axis, output_axis, input
     return comm, dim, split_shapes, sum(split_shapes)
 
 
-def _fast_fft_plan(x, transform_axes, input_by_name, output_by_name, input_axes, shapes, mesh):
-    if not torch.is_complex(x):
+def _fast_fft_plan(x, transform_axes, input_by_name, output_by_name, input_axes, shapes, mesh, *, require_complex=True):
+    if require_complex and not torch.is_complex(x):
         return None
 
     plan = []
@@ -290,6 +290,98 @@ def _apply_fast_fft_plan(z, current_axes, output_by_name, plan, *, inverse, norm
             _, source, target, dim, _, comm, split_shapes = item
             z = _distributed_fft_1d(z, comm, dim, split_shapes, inverse=inverse, norm=per_axis_norm)
             current_axes[dim] = Axis(target, output_by_name[target].shard_dim)
+    return _apply_fft_norm(z, n=total_size, inverse=inverse, norm=norm)
+
+
+def _fast_real_fft_plan(x, transform_axes, input_by_name, output_by_name, input_axes, shapes, mesh, *, inverse, signal_sizes):
+    half_source = next(reversed(transform_axes))
+    half_target = transform_axes[half_source]
+    if not input_by_name[half_source].local() or not output_by_name[half_target].local():
+        return None
+
+    complex_axes = {source: target for source, target in transform_axes.items() if source != half_source}
+    if not complex_axes:
+        return None
+
+    plan = _fast_fft_plan(
+        x,
+        complex_axes,
+        input_by_name,
+        output_by_name,
+        input_axes,
+        shapes,
+        mesh,
+        require_complex=False,
+    )
+    if plan is None:
+        return None
+
+    if inverse and signal_sizes is not None:
+        if not isinstance(signal_sizes, Mapping):
+            return plan
+        plan_sizes = {item[1]: item[4] for item in plan}
+        for source, target in complex_axes.items():
+            requested_size = signal_sizes.get(target, signal_sizes.get(source))
+            if requested_size is None:
+                continue
+            axis_size = plan_sizes.get(source, x.shape[_axis_dim(input_axes, source)])
+            if requested_size != axis_size:
+                return None
+
+    return plan
+
+
+def _apply_fast_real_fft_plan(
+    z,
+    current_axes,
+    output_by_name,
+    transform_axes,
+    plan,
+    *,
+    inverse,
+    norm,
+    signal_sizes,
+):
+    half_source = next(reversed(transform_axes))
+    half_target = transform_axes[half_source]
+    sizes = _real_signal_sizes(transform_axes, current_axes, z, signal_sizes) if inverse else None
+    half_size = sizes[-1] if inverse else None
+    plan_sizes = {item[1]: item[4] for item in plan}
+    total_size = math.prod(
+        plan_sizes.get(source, sizes[i] if inverse else z.shape[_axis_dim(current_axes, source)])
+        for i, source in enumerate(transform_axes)
+    )
+    per_axis_norm = "forward" if inverse else None
+
+    if inverse:
+        for item in plan:
+            if item[0] == "local":
+                _, source, target, dim, _ = item
+                z = _fft_unscaled(z, dim=dim, inverse=True)
+                current_axes[dim] = Axis(target)
+            else:
+                _, source, target, dim, _, comm, split_shapes = item
+                z = _distributed_fft_1d(z, comm, dim, split_shapes, inverse=True, norm=per_axis_norm)
+                current_axes[dim] = Axis(target, output_by_name[target].shard_dim)
+
+        half_dim = _axis_dim(current_axes, half_source)
+        z = torch.fft.irfft(z, n=half_size, dim=half_dim) * half_size
+        current_axes[half_dim] = Axis(half_target)
+    else:
+        half_dim = _axis_dim(current_axes, half_source)
+        z = torch.fft.rfft(z, dim=half_dim)
+        current_axes[half_dim] = Axis(half_target)
+
+        for item in plan:
+            if item[0] == "local":
+                _, source, target, dim, _ = item
+                z = _fft_unscaled(z, dim=dim, inverse=False)
+                current_axes[dim] = Axis(target)
+            else:
+                _, source, target, dim, _, comm, split_shapes = item
+                z = _distributed_fft_1d(z, comm, dim, split_shapes, inverse=False, norm=per_axis_norm)
+                current_axes[dim] = Axis(target, output_by_name[target].shard_dim)
+
     return _apply_fft_norm(z, n=total_size, inverse=inverse, norm=norm)
 
 
@@ -384,7 +476,19 @@ def einfft(
     z = x
 
     fast_path = None
-    if not real:
+    if real:
+        fast_path = _fast_real_fft_plan(
+            z,
+            transform_axes,
+            input_by_name,
+            output_by_name,
+            current_axes,
+            shapes,
+            mesh,
+            inverse=inverse,
+            signal_sizes=signal_sizes,
+        )
+    else:
         fast_path = _fast_fft_plan(
             z,
             transform_axes,
@@ -395,7 +499,19 @@ def einfft(
             mesh,
         )
     if fast_path is not None:
-        z = _apply_fast_fft_plan(z, current_axes, output_by_name, fast_path, inverse=inverse, norm=norm)
+        if real:
+            z = _apply_fast_real_fft_plan(
+                z,
+                current_axes,
+                output_by_name,
+                transform_axes,
+                fast_path,
+                inverse=inverse,
+                norm=norm,
+                signal_sizes=signal_sizes,
+            )
+        else:
+            z = _apply_fast_fft_plan(z, current_axes, output_by_name, fast_path, inverse=inverse, norm=norm)
         current_spec = TensorSpec(current_axes)
         if [axis.name for axis in current_axes] == output_names and current_axes == _axes(output_spec):
             return z

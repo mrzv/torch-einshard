@@ -22,10 +22,10 @@ Current fast-path constraints:
 - Multiple sharded transform axes must use distinct mesh dimensions.
 - Input and output shard sizes are equal.
 - Local shard size is divisible by the mesh size.
-- Input is complex.
-- No factored axes, ellipsis axes, partial specs, or real FFT fast paths.
+- Input is complex, except for real FFT fast paths where the half-spectrum axis is local.
+- No factored axes, ellipsis axes, or partial specs.
 
-Real FFT variants are supported through `real=True`. Forward real mode uses `torch.fft.rfftn`; inverse real mode uses `torch.fft.irfftn` and accepts `signal_sizes` for odd-length or otherwise ambiguous inverse lengths. Sharded real FFTs currently use the gather/local-FFT/split fallback because the half-spectrum axis changes shape and does not fit the complex Cooley-Tukey kernel yet.
+Real FFT variants are supported through `real=True`. Forward real mode uses `torch.fft.rfftn`; inverse real mode uses `torch.fft.irfftn` and accepts `signal_sizes` for odd-length or otherwise ambiguous inverse lengths. The fast path supports real FFTs when the half-spectrum axis is local and sharded transform axes are full-complex axes handled by the distributed 1D kernel. Sharded real FFTs where the half-spectrum axis changes sharded size still use the gather/local-FFT/split fallback.
 
 Future broader-layout work should consider:
 
@@ -33,6 +33,6 @@ Future broader-layout work should consider:
 - Local shard sizes that are not divisible by world size.
 - Transform axes that move between mesh dimensions, such as `x/tp -> k/sp`.
 - Multiple sharded transform axes on the same mesh dimension, if a clear distribution semantics is defined.
-- Distributed fast paths for real FFT variants such as `rfft` and `irfft`.
+- Distributed fast paths for real FFT variants where the half-spectrum axis itself is sharded.
 - Factored or reshaped transform axes once the intended semantics are clear.
 - Alternative output layouts, such as block-cyclic or transposed frequency shards, when those are more efficient than contiguous `k/tp` shards.
