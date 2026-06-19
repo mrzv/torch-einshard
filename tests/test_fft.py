@@ -57,6 +57,63 @@ def test_inverse_fft():
     assert_close(z, torch.fft.ifftn(x, dim=(1,), norm="ortho"))
 
 
+def test_local_rfft_renames_axis():
+    x = torch.randn(2, 5, 3)
+
+    z = es.einfft("b x c -> b k c", x, axes={"x": "k"}, real=True)
+
+    assert_close(z, torch.fft.rfftn(x, dim=(1,)))
+
+
+def test_local_rfftn_uses_last_transform_axis_as_half_spectrum_axis():
+    x = torch.randn(2, 5, 7)
+
+    z = es.einfft("b x y -> b kx ky", x, axes={"x": "kx", "y": "ky"}, real=True, norm="ortho")
+
+    assert_close(z, torch.fft.rfftn(x, dim=(1, 2), norm="ortho"))
+
+
+def test_local_irfft_renames_axis():
+    x = torch.randn(2, 6)
+    spectrum = torch.fft.rfftn(x, dim=(1,))
+
+    z = es.einfft("b k -> b x", spectrum, axes={"k": "x"}, inverse=True, real=True)
+
+    assert_close(z, torch.fft.irfftn(spectrum, s=(6,), dim=(1,)))
+
+
+def test_local_irfft_uses_signal_sizes_for_odd_length():
+    x = torch.randn(2, 5)
+    spectrum = torch.fft.rfftn(x, dim=(1,))
+
+    z = es.einfft(
+        "b k -> b x",
+        spectrum,
+        axes={"k": "x"},
+        inverse=True,
+        real=True,
+        signal_sizes={"x": 5},
+    )
+
+    assert_close(z, x)
+
+
+def test_local_irfftn_uses_last_transform_axis_signal_size():
+    x = torch.randn(2, 5, 7)
+    spectrum = torch.fft.rfftn(x, dim=(1, 2))
+
+    z = es.einfft(
+        "b kx ky -> b x y",
+        spectrum,
+        axes={"kx": "x", "ky": "y"},
+        inverse=True,
+        real=True,
+        signal_sizes={"y": 7},
+    )
+
+    assert_close(z, x)
+
+
 def test_rejects_partial_specs():
     x = torch.randn(2, 5, dtype=torch.complex64)
 
@@ -93,6 +150,151 @@ def test_sharded_transform_axis_uses_distributed_fft(dist_env, mesh_tp):
 
     expected = torch.split(torch.fft.fftn(full, dim=(1,)), shapes, dim=1)[rank]
     assert_close(z, expected)
+
+
+def test_sharded_real_fft_uses_slow_path_with_warning(dist_env, mesh_tp):
+    group = mesh_tp["tp"].get_group()
+    rank = dist.get_rank(group)
+    world_size = dist.get_world_size(group)
+    if world_size == 1:
+        pytest.skip("slow sharded FFT fallback warning requires more than one rank")
+    size = world_size * 4 + 1
+    input_shapes = es.helpers.compute_split_shapes(size, world_size)
+    output_shapes = es.helpers.compute_split_shapes(size // 2 + 1, world_size)
+
+    full = torch.randn(2, size)
+    x = torch.split(full, input_shapes, dim=1)[rank].contiguous()
+
+    with pytest.warns(RuntimeWarning, match="gather/FFT/split fallback"):
+        z = es.einfft(
+            "b x/tp -> b k/tp",
+            x,
+            axes={"x": "k"},
+            real=True,
+            mesh=mesh_tp,
+            shapes={"tp": {"x": input_shapes, "k": output_shapes}},
+        )
+
+    expected = torch.split(torch.fft.rfftn(full, dim=(1,)), output_shapes, dim=1)[rank]
+    assert_close(z, expected)
+
+
+def test_sharded_inverse_real_fft_uses_slow_path_with_warning(dist_env, mesh_tp):
+    group = mesh_tp["tp"].get_group()
+    rank = dist.get_rank(group)
+    world_size = dist.get_world_size(group)
+    if world_size == 1:
+        pytest.skip("slow sharded FFT fallback warning requires more than one rank")
+    size = world_size * 4 + 1
+    input_shapes = es.helpers.compute_split_shapes(size // 2 + 1, world_size)
+    output_shapes = es.helpers.compute_split_shapes(size, world_size)
+
+    full = torch.randn(2, size)
+    spectrum = torch.fft.rfftn(full, dim=(1,))
+    x = torch.split(spectrum, input_shapes, dim=1)[rank].contiguous()
+
+    with pytest.warns(RuntimeWarning, match="gather/FFT/split fallback"):
+        z = es.einfft(
+            "b k/tp -> b x/tp",
+            x,
+            axes={"k": "x"},
+            inverse=True,
+            real=True,
+            signal_sizes={"x": size},
+            mesh=mesh_tp,
+            shapes={"tp": {"k": input_shapes, "x": output_shapes}},
+        )
+
+    expected = torch.split(torch.fft.irfftn(spectrum, s=(size,), dim=(1,)), output_shapes, dim=1)[rank]
+    assert_close(z, expected)
+
+
+def test_real_fft_to_sharded_output_warns(dist_env, mesh_tp):
+    group = mesh_tp["tp"].get_group()
+    rank = dist.get_rank(group)
+    world_size = dist.get_world_size(group)
+    if world_size == 1:
+        pytest.skip("slow sharded FFT fallback warning requires more than one rank")
+    size = world_size * 4 + 1
+    output_shapes = es.helpers.compute_split_shapes(size // 2 + 1, world_size)
+
+    x = torch.randn(2, size)
+
+    with pytest.warns(RuntimeWarning, match="gather/FFT/split fallback"):
+        z = es.einfft(
+            "b x -> b k/tp",
+            x,
+            axes={"x": "k"},
+            real=True,
+            mesh=mesh_tp,
+            shapes={"tp": {"k": output_shapes}},
+        )
+
+    expected = torch.split(torch.fft.rfftn(x, dim=(1,)), output_shapes, dim=1)[rank]
+    assert_close(z, expected)
+
+
+def test_sharded_real_fft_slow_path_backward(dist_env, mesh_tp):
+    group = mesh_tp["tp"].get_group()
+    rank = dist.get_rank(group)
+    world_size = dist.get_world_size(group)
+    if world_size == 1:
+        pytest.skip("slow sharded FFT fallback warning requires more than one rank")
+    size = world_size * 4 + 1
+    input_shapes = es.helpers.compute_split_shapes(size, world_size)
+    output_shapes = es.helpers.compute_split_shapes(size // 2 + 1, world_size)
+
+    full = torch.randn(2, size)
+    x = torch.split(full.detach().clone(), input_shapes, dim=1)[rank].contiguous().requires_grad_()
+
+    with pytest.warns(RuntimeWarning, match="gather/FFT/split fallback"):
+        z = es.einfft(
+            "b x/tp -> b k/tp",
+            x,
+            axes={"x": "k"},
+            real=True,
+            mesh=mesh_tp,
+            shapes={"tp": {"x": input_shapes, "k": output_shapes}},
+        )
+    (z.abs() ** 2).sum().backward()
+
+    expected_full = full.detach().clone().requires_grad_()
+    expected = torch.fft.rfftn(expected_full, dim=(1,))
+    (expected.abs() ** 2).sum().backward()
+    assert_close(x.grad, torch.split(expected_full.grad, input_shapes, dim=1)[rank])
+
+
+def test_sharded_inverse_real_fft_slow_path_backward(dist_env, mesh_tp):
+    group = mesh_tp["tp"].get_group()
+    rank = dist.get_rank(group)
+    world_size = dist.get_world_size(group)
+    if world_size == 1:
+        pytest.skip("slow sharded FFT fallback warning requires more than one rank")
+    size = world_size * 4 + 1
+    input_shapes = es.helpers.compute_split_shapes(size // 2 + 1, world_size)
+    output_shapes = es.helpers.compute_split_shapes(size, world_size)
+
+    full = torch.randn(2, size)
+    spectrum = torch.fft.rfftn(full, dim=(1,))
+    x = torch.split(spectrum.detach().clone(), input_shapes, dim=1)[rank].contiguous().requires_grad_()
+
+    with pytest.warns(RuntimeWarning, match="gather/FFT/split fallback"):
+        z = es.einfft(
+            "b k/tp -> b x/tp",
+            x,
+            axes={"k": "x"},
+            inverse=True,
+            real=True,
+            signal_sizes={"x": size},
+            mesh=mesh_tp,
+            shapes={"tp": {"k": input_shapes, "x": output_shapes}},
+        )
+    (z ** 2).sum().backward()
+
+    expected_full = spectrum.detach().clone().requires_grad_()
+    expected = torch.fft.irfftn(expected_full, s=(size,), dim=(1,))
+    (expected ** 2).sum().backward()
+    assert_close(x.grad, torch.split(expected_full.grad, input_shapes, dim=1)[rank])
 
 
 @pytest.mark.parametrize("inverse", [False, True])

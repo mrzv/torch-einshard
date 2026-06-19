@@ -124,7 +124,7 @@ For `dim == 2`, this expands to `b t (h wh) (w ww) c -> (b h w) t wh ww c`. For 
 
 ## FFT
 
-`einfft` applies a complex `torch.fft.fftn` or `torch.fft.ifftn` over named axes while using sharding notation for input and output layout.
+`einfft` applies `torch.fft.fftn` or `torch.fft.ifftn` over named axes while using sharding notation for input and output layout.
 
 ```python
 z = es.einfft("b x c -> b k c", x, axes={"x": "k"})
@@ -147,7 +147,23 @@ Use `inverse=True` for `torch.fft.ifftn`:
 x = es.einfft("b k c -> b x c", z, axes={"k": "x"}, inverse=True)
 ```
 
-Sharded transform axes are supported. The optimized path currently handles a single complex-to-complex transform axis that stays on the same mesh dimension with equal shard sizes and local shard size divisible by the mesh size. It uses a distributed Cooley-Tukey decomposition with all-to-all transposes and local factor FFTs.
+Use `real=True` for real FFT variants. Forward real mode calls `torch.fft.rfftn`; inverse real mode calls `torch.fft.irfftn`. The last axis in the `axes` mapping is the half-spectrum axis, matching PyTorch's `rfftn`/`irfftn` convention:
+
+```python
+z = es.einfft("b x y -> b kx ky", x, axes={"x": "kx", "y": "ky"}, real=True)
+x = es.einfft(
+    "b kx ky -> b x y",
+    z,
+    axes={"kx": "x", "ky": "y"},
+    inverse=True,
+    real=True,
+    signal_sizes={"y": y_size},
+)
+```
+
+`signal_sizes` is only needed for inverse real FFTs when the original length cannot be inferred from the half-spectrum size, such as odd-length signals.
+
+Sharded transform axes are supported. The optimized path handles complex-to-complex FFTs when each sharded transform axis stays on the same mesh dimension with equal shard sizes and local shard size divisible by the mesh size. Multiple sharded transform axes are supported when they use distinct mesh dimensions. The optimized path uses a distributed Cooley-Tukey decomposition with all-to-all transposes and local factor FFTs.
 
 ```python
 z = es.einfft(
@@ -159,7 +175,7 @@ z = es.einfft(
 )
 ```
 
-Unsupported sharded transform layouts fall back to gather the full transform axis, run the local FFT, then split the output frequency axis if requested. That path emits a `RuntimeWarning` because it materializes the full transform axis on every rank. Non-FFT axes must preserve their sharding. `einfft` currently supports complex-to-complex FFTs with explicit named axes; it does not support `rfft`, `irfft`, ellipsis axes, factored axes, or partial tensor specs.
+Unsupported sharded transform layouts, including sharded real FFT variants, fall back to gather the full transform axis, run the local FFT, then split the output frequency axis if requested. That path emits a `RuntimeWarning` because it materializes the full transform axis on every rank. Non-FFT axes must preserve their sharding. `einfft` currently supports explicit named axes; it does not support ellipsis axes, factored axes, or partial tensor specs.
 
 ## Supported Distributed Unary Patterns
 

@@ -1,5 +1,6 @@
 import math
 import warnings
+from collections.abc import Mapping
 
 import torch
 import torch.distributed as dist
@@ -301,6 +302,31 @@ def _warn_slow_path():
     )
 
 
+def _real_signal_sizes(transform_axes, current_axes, x, signal_sizes):
+    if signal_sizes is None:
+        signal_sizes = {}
+    elif not isinstance(signal_sizes, Mapping):
+        raise TypeError("signal_sizes must be a mapping from axis names to sizes")
+
+    result = []
+    for source, target in transform_axes.items():
+        if target in signal_sizes:
+            result.append(signal_sizes[target])
+        elif source in signal_sizes:
+            result.append(signal_sizes[source])
+        else:
+            result.append(None)
+
+    if result[-1] is None:
+        dim = _axis_dim(current_axes, next(reversed(transform_axes)))
+        result[-1] = 2 * (x.shape[dim] - 1)
+    for i, size in enumerate(result):
+        if size is None:
+            dim = _axis_dim(current_axes, list(transform_axes)[i])
+            result[i] = x.shape[dim]
+    return tuple(result)
+
+
 def einfft(
     shard,
     x,
@@ -311,8 +337,10 @@ def einfft(
     mesh=None,
     shapes=None,
     families=None,
+    real=False,
+    signal_sizes=None,
 ):
-    """Apply a named-axis complex FFT with sharding-aware gather/split fallback."""
+    """Apply a named-axis FFT with sharding-aware gather/split fallback."""
     shard, _ = cached_expand_axis_families(shard, families=families)
     axes = _expand_transform_axes(axes, families)
     transform_axes = _normalize_transform_axes(axes)
@@ -355,15 +383,17 @@ def einfft(
     current_axes = Axes(Axis(axis.name, axis.shard_dim) for axis in _axes(input_spec))
     z = x
 
-    fast_path = _fast_fft_plan(
-        z,
-        transform_axes,
-        input_by_name,
-        output_by_name,
-        current_axes,
-        shapes,
-        mesh,
-    )
+    fast_path = None
+    if not real:
+        fast_path = _fast_fft_plan(
+            z,
+            transform_axes,
+            input_by_name,
+            output_by_name,
+            current_axes,
+            shapes,
+            mesh,
+        )
     if fast_path is not None:
         z = _apply_fast_fft_plan(z, current_axes, output_by_name, fast_path, inverse=inverse, norm=norm)
         current_spec = TensorSpec(current_axes)
@@ -371,7 +401,10 @@ def einfft(
             return z
         return distributed_1d((current_spec, None, output_spec), z, mesh=mesh, shapes=shapes)
 
-    if any(not input_by_name[source].local() for source in transform_axes):
+    if any(
+        not input_by_name[source].local() or (real and not output_by_name[target].local())
+        for source, target in transform_axes.items()
+    ):
         _warn_slow_path()
 
     fft_dims = []
@@ -388,8 +421,19 @@ def einfft(
         z = allgather_forward_split_backward(z, comm, dim, split_shapes)
         current_axes[dim] = Axis(axis.name)
 
-    fft = torch.fft.ifftn if inverse else torch.fft.fftn
-    z = fft(z, dim=tuple(fft_dims), norm=norm)
+    if real:
+        if inverse:
+            z = torch.fft.irfftn(
+                z,
+                s=_real_signal_sizes(transform_axes, current_axes, z, signal_sizes),
+                dim=tuple(fft_dims),
+                norm=norm,
+            )
+        else:
+            z = torch.fft.rfftn(z, dim=tuple(fft_dims), norm=norm)
+    else:
+        fft = torch.fft.ifftn if inverse else torch.fft.fftn
+        z = fft(z, dim=tuple(fft_dims), norm=norm)
 
     for source, target in transform_axes.items():
         dim = _axis_dim(current_axes, source)
