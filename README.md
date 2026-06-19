@@ -122,6 +122,45 @@ windows = es.einshard(
 
 For `dim == 2`, this expands to `b t (h wh) (w ww) c -> (b h w) t wh ww c`. For `dim == 3`, it expands to `b t (h wh) (w ww) (d wd) c -> (b h w d) t wh ww wd c`.
 
+## FFT
+
+`einfft` applies a complex `torch.fft.fftn` or `torch.fft.ifftn` over named axes while using sharding notation for input and output layout.
+
+```python
+z = es.einfft("b x c -> b k c", x, axes={"x": "k"})
+```
+
+The `axes` mapping names each transformed input axis and the corresponding output frequency axis. Multiple axes use a single multidimensional FFT:
+
+```python
+z = es.einfft(
+    "b x y c -> b kx ky c",
+    x,
+    axes={"x": "kx", "y": "ky"},
+    norm="ortho",
+)
+```
+
+Use `inverse=True` for `torch.fft.ifftn`:
+
+```python
+x = es.einfft("b k c -> b x c", z, axes={"k": "x"}, inverse=True)
+```
+
+Sharded transform axes are supported with a correctness-first fallback: gather the full transform axis, run the local FFT, then split the output frequency axis if requested.
+
+```python
+z = es.einfft(
+    "b x/tp -> b k/tp",
+    x_shard,
+    axes={"x": "k"},
+    mesh=mesh,
+    shapes={"tp": {"x": x_shapes, "k": k_shapes}},
+)
+```
+
+This is semantically useful but is not yet a distributed Cooley-Tukey FFT; sharded transform axes are materialized in full during the operation. Non-FFT axes must preserve their sharding. `einfft` currently supports complex-to-complex FFTs with explicit named axes; it does not support `rfft`, `irfft`, ellipsis axes, factored axes, or partial tensor specs.
+
 ## Supported Distributed Unary Patterns
 
 Unary distributed operations support split, gather, multi-axis split/gather, optimized ownership swaps, and gather-then-split repartition.
