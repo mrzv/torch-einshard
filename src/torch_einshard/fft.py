@@ -215,18 +215,10 @@ def _distributed_fft_1d(input, group, dim, shapes, *, inverse, norm):
     return _DistributedFFT1D.apply(input, group, dim, shapes, inverse, norm)
 
 
-def _can_use_distributed_fft_1d(x, transform_axes, input_by_name, output_by_name, input_axes, shapes, mesh):
-    if mesh is None or len(transform_axes) != 1:
-        return None
-
-    source, target = next(iter(transform_axes.items()))
-    input_axis = input_by_name[source]
-    output_axis = output_by_name[target]
+def _distributed_fft_axis_plan(x, source, target, input_axis, output_axis, input_axes, shapes, mesh):
     if input_axis.local() or output_axis.local():
         return None
     if input_axis.shard_dim != output_axis.shard_dim:
-        return None
-    if not torch.is_complex(x):
         return None
 
     comm = _group(mesh, input_axis.shard_dim)
@@ -245,7 +237,59 @@ def _can_use_distributed_fft_1d(x, transform_axes, input_by_name, output_by_name
     local_size = split_shapes[rank]
     if x.shape[dim] != local_size or local_size != split_shapes[0] or local_size % size != 0:
         return None
-    return comm, dim, split_shapes
+    return comm, dim, split_shapes, sum(split_shapes)
+
+
+def _fast_fft_plan(x, transform_axes, input_by_name, output_by_name, input_axes, shapes, mesh):
+    if not torch.is_complex(x):
+        return None
+
+    plan = []
+    sharded_dims = set()
+    for source, target in transform_axes.items():
+        dim = _axis_dim(input_axes, source)
+        input_axis = input_by_name[source]
+        output_axis = output_by_name[target]
+        if not output_axis.local():
+            if output_axis.shard_dim in sharded_dims:
+                return None
+            sharded_dims.add(output_axis.shard_dim)
+        if input_axis.local():
+            plan.append(("local", source, target, dim, x.shape[dim]))
+            continue
+        if mesh is None or output_axis.local() or input_axis.shard_dim != output_axis.shard_dim:
+            return None
+        axis_plan = _distributed_fft_axis_plan(
+            x,
+            source,
+            target,
+            input_axis,
+            output_axis,
+            input_axes,
+            shapes,
+            mesh,
+        )
+        if axis_plan is None:
+            return None
+        comm, dim, split_shapes, global_size = axis_plan
+        plan.append(("distributed", source, target, dim, global_size, comm, split_shapes))
+    return plan
+
+
+def _apply_fast_fft_plan(z, current_axes, output_by_name, plan, *, inverse, norm):
+    total_size = 1
+    per_axis_norm = "forward" if inverse else None
+    for item in plan:
+        total_size *= item[4]
+        if item[0] == "local":
+            _, source, target, dim, _ = item
+            z = _fft_unscaled(z, dim=dim, inverse=inverse)
+            current_axes[dim] = Axis(target)
+        else:
+            _, source, target, dim, _, comm, split_shapes = item
+            z = _distributed_fft_1d(z, comm, dim, split_shapes, inverse=inverse, norm=per_axis_norm)
+            current_axes[dim] = Axis(target, output_by_name[target].shard_dim)
+    return _apply_fft_norm(z, n=total_size, inverse=inverse, norm=norm)
 
 
 def _warn_slow_path():
@@ -311,7 +355,7 @@ def einfft(
     current_axes = Axes(Axis(axis.name, axis.shard_dim) for axis in _axes(input_spec))
     z = x
 
-    fast_path = _can_use_distributed_fft_1d(
+    fast_path = _fast_fft_plan(
         z,
         transform_axes,
         input_by_name,
@@ -321,10 +365,7 @@ def einfft(
         mesh,
     )
     if fast_path is not None:
-        comm, dim, split_shapes = fast_path
-        source, target = next(iter(transform_axes.items()))
-        z = _distributed_fft_1d(z, comm, dim, split_shapes, inverse=inverse, norm=norm)
-        current_axes[dim] = Axis(target, output_by_name[target].shard_dim)
+        z = _apply_fast_fft_plan(z, current_axes, output_by_name, fast_path, inverse=inverse, norm=norm)
         current_spec = TensorSpec(current_axes)
         if [axis.name for axis in current_axes] == output_names and current_axes == _axes(output_spec):
             return z

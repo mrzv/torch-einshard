@@ -148,6 +148,160 @@ def test_sharded_transform_axis_fast_path_permute_output(dist_env, mesh_tp):
     assert_close(z, expected)
 
 
+@pytest.mark.parametrize("inverse,norm", [(False, None), (True, "ortho")])
+def test_sharded_and_local_transform_axes_fast_path(dist_env, mesh_tp, inverse, norm):
+    group = mesh_tp["tp"].get_group()
+    rank = dist.get_rank(group)
+    world_size = dist.get_world_size(group)
+    x_size = world_size * world_size * 3
+    y_size = 5
+    shapes = es.helpers.compute_split_shapes(x_size, world_size)
+
+    full = torch.randn(2, x_size, y_size, dtype=torch.complex64)
+    x = torch.split(full, shapes, dim=1)[rank].contiguous()
+
+    z = _assert_no_runtime_warning(
+        lambda: es.einfft(
+            "b x/tp y -> b kx/tp ky",
+            x,
+            axes={"x": "kx", "y": "ky"},
+            inverse=inverse,
+            norm=norm,
+            mesh=mesh_tp,
+            shapes={"tp": {"x": shapes, "kx": shapes}},
+        )
+    )
+
+    fft = torch.fft.ifftn if inverse else torch.fft.fftn
+    expected = torch.split(fft(full, dim=(1, 2), norm=norm), shapes, dim=1)[rank]
+    assert_close(z, expected)
+
+
+def test_sharded_and_local_transform_axes_fast_path_backward(dist_env, mesh_tp, monkeypatch):
+    fft_impl = importlib.import_module("torch_einshard.fft")
+    distributed_fft_calls = 0
+    original_distributed_fft = fft_impl._distributed_fft_1d_no_autograd
+
+    def counted_distributed_fft(*args, **kwargs):
+        nonlocal distributed_fft_calls
+        distributed_fft_calls += 1
+        return original_distributed_fft(*args, **kwargs)
+
+    monkeypatch.setattr(fft_impl, "_distributed_fft_1d_no_autograd", counted_distributed_fft)
+
+    group = mesh_tp["tp"].get_group()
+    rank = dist.get_rank(group)
+    world_size = dist.get_world_size(group)
+    x_size = world_size * world_size * 3
+    y_size = 5
+    shapes = es.helpers.compute_split_shapes(x_size, world_size)
+
+    full = torch.randn(2, x_size, y_size, dtype=torch.complex64)
+    x = torch.split(full.detach().clone(), shapes, dim=1)[rank].contiguous().requires_grad_()
+    z = es.einfft(
+        "b x/tp y -> b kx/tp ky",
+        x,
+        axes={"x": "kx", "y": "ky"},
+        mesh=mesh_tp,
+        shapes={"tp": {"x": shapes, "kx": shapes}},
+    )
+    (z.abs() ** 2).sum().backward()
+
+    expected_full = full.detach().clone().requires_grad_()
+    expected = torch.fft.fftn(expected_full, dim=(1, 2))
+    (expected.abs() ** 2).sum().backward()
+    assert distributed_fft_calls == 2
+    assert_close(x.grad, torch.split(expected_full.grad, shapes, dim=1)[rank])
+
+
+@pytest.mark.parametrize("inverse,norm", [(False, None), (True, "ortho")])
+def test_multi_sharded_transform_axes_fast_path(dist_env, mesh_2d, inverse, norm):
+    sp_group = mesh_2d["sp"].get_group()
+    dp_group = mesh_2d["dp"].get_group()
+    sp_world_size = dist.get_world_size(sp_group)
+    dp_world_size = dist.get_world_size(dp_group)
+    if sp_world_size == 1 or dp_world_size == 1:
+        pytest.skip("multi-sharded FFT fast path requires a non-degenerate 2D mesh")
+    sp_rank = dist.get_rank(sp_group)
+    dp_rank = dist.get_rank(dp_group)
+    x_size = sp_world_size * sp_world_size * 3
+    y_size = dp_world_size * dp_world_size * 2
+    shapes = {
+        "sp": es.helpers.compute_split_shapes(x_size, sp_world_size),
+        "dp": es.helpers.compute_split_shapes(y_size, dp_world_size),
+    }
+
+    full = torch.randn(x_size, y_size, dtype=torch.complex64)
+    x = torch.split(full, shapes["sp"], dim=0)[sp_rank]
+    x = torch.split(x, shapes["dp"], dim=1)[dp_rank].contiguous()
+
+    z = _assert_no_runtime_warning(
+        lambda: es.einfft(
+            "x/sp y/dp -> kx/sp ky/dp",
+            x,
+            axes={"x": "kx", "y": "ky"},
+            inverse=inverse,
+            norm=norm,
+            mesh=mesh_2d,
+            shapes={"sp": {"x": shapes["sp"], "kx": shapes["sp"]}, "dp": {"y": shapes["dp"], "ky": shapes["dp"]}},
+        )
+    )
+
+    fft = torch.fft.ifftn if inverse else torch.fft.fftn
+    expected = fft(full, dim=(0, 1), norm=norm)
+    expected = torch.split(expected, shapes["sp"], dim=0)[sp_rank]
+    expected = torch.split(expected, shapes["dp"], dim=1)[dp_rank]
+    assert_close(z, expected)
+
+
+def test_multi_sharded_transform_axes_fast_path_backward(dist_env, mesh_2d, monkeypatch):
+    fft_impl = importlib.import_module("torch_einshard.fft")
+    distributed_fft_calls = 0
+    original_distributed_fft = fft_impl._distributed_fft_1d_no_autograd
+
+    def counted_distributed_fft(*args, **kwargs):
+        nonlocal distributed_fft_calls
+        distributed_fft_calls += 1
+        return original_distributed_fft(*args, **kwargs)
+
+    monkeypatch.setattr(fft_impl, "_distributed_fft_1d_no_autograd", counted_distributed_fft)
+
+    sp_group = mesh_2d["sp"].get_group()
+    dp_group = mesh_2d["dp"].get_group()
+    sp_world_size = dist.get_world_size(sp_group)
+    dp_world_size = dist.get_world_size(dp_group)
+    if sp_world_size == 1 or dp_world_size == 1:
+        pytest.skip("multi-sharded FFT fast path requires a non-degenerate 2D mesh")
+    sp_rank = dist.get_rank(sp_group)
+    dp_rank = dist.get_rank(dp_group)
+    x_size = sp_world_size * sp_world_size * 3
+    y_size = dp_world_size * dp_world_size * 2
+    shapes = {
+        "sp": es.helpers.compute_split_shapes(x_size, sp_world_size),
+        "dp": es.helpers.compute_split_shapes(y_size, dp_world_size),
+    }
+
+    full = torch.randn(x_size, y_size, dtype=torch.complex64)
+    x = torch.split(full.detach().clone(), shapes["sp"], dim=0)[sp_rank]
+    x = torch.split(x, shapes["dp"], dim=1)[dp_rank].contiguous().requires_grad_()
+    z = es.einfft(
+        "x/sp y/dp -> kx/sp ky/dp",
+        x,
+        axes={"x": "kx", "y": "ky"},
+        mesh=mesh_2d,
+        shapes={"sp": {"x": shapes["sp"], "kx": shapes["sp"]}, "dp": {"y": shapes["dp"], "ky": shapes["dp"]}},
+    )
+    (z.abs() ** 2).sum().backward()
+
+    expected_full = full.detach().clone().requires_grad_()
+    expected = torch.fft.fftn(expected_full, dim=(0, 1))
+    (expected.abs() ** 2).sum().backward()
+    expected_grad = torch.split(expected_full.grad, shapes["sp"], dim=0)[sp_rank]
+    expected_grad = torch.split(expected_grad, shapes["dp"], dim=1)[dp_rank]
+    assert distributed_fft_calls == 4
+    assert_close(x.grad, expected_grad)
+
+
 @pytest.mark.parametrize("inverse,norm", [(False, None), (False, "ortho"), (True, "forward")])
 def test_sharded_transform_axis_fast_path_backward(dist_env, mesh_tp, monkeypatch, inverse, norm):
     fft_impl = importlib.import_module("torch_einshard.fft")
