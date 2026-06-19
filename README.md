@@ -141,6 +141,25 @@ z = es.einfft(
 )
 ```
 
+Axis families can make one FFT expression cover both 2D and 3D cases. Family entries may include sharding suffixes, and `axes` can map a family name to the corresponding concrete output axis names:
+
+```python
+spatial = ("x/tp", "y", "z")[:dim]
+freq = ("kx/tp", "ky", "kz")[:dim]
+freq_axes = ("kx", "ky", "kz")[:dim]
+
+z = es.einfft(
+    "b *spatial c -> b *freq c",
+    x,
+    axes={"spatial": freq_axes},
+    families={"spatial": spatial, "freq": freq},
+    mesh=mesh,
+    shapes={"tp": {"x": x_shapes, "kx": x_shapes}},
+)
+```
+
+For `dim == 2`, this expands to `b x/tp y c -> b kx/tp ky c`. For `dim == 3`, it expands to `b x/tp y z c -> b kx/tp ky kz c`.
+
 Use `inverse=True` for `torch.fft.ifftn`:
 
 ```python
