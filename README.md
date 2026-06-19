@@ -147,7 +147,7 @@ Use `inverse=True` for `torch.fft.ifftn`:
 x = es.einfft("b k c -> b x c", z, axes={"k": "x"}, inverse=True)
 ```
 
-Sharded transform axes are supported with a correctness-first fallback: gather the full transform axis, run the local FFT, then split the output frequency axis if requested.
+Sharded transform axes are supported. The optimized path currently handles a single complex-to-complex transform axis that stays on the same mesh dimension with equal shard sizes and local shard size divisible by the mesh size. It uses a distributed Cooley-Tukey decomposition with all-to-all transposes and local factor FFTs.
 
 ```python
 z = es.einfft(
@@ -159,7 +159,7 @@ z = es.einfft(
 )
 ```
 
-This is semantically useful but is not yet a distributed Cooley-Tukey FFT; sharded transform axes are materialized in full during the operation. Non-FFT axes must preserve their sharding. `einfft` currently supports complex-to-complex FFTs with explicit named axes; it does not support `rfft`, `irfft`, ellipsis axes, factored axes, or partial tensor specs.
+Unsupported sharded transform layouts fall back to gather the full transform axis, run the local FFT, then split the output frequency axis if requested. That path emits a `RuntimeWarning` because it materializes the full transform axis on every rank. Non-FFT axes must preserve their sharding. `einfft` currently supports complex-to-complex FFTs with explicit named axes; it does not support `rfft`, `irfft`, ellipsis axes, factored axes, or partial tensor specs.
 
 ## Supported Distributed Unary Patterns
 
