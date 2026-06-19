@@ -1,3 +1,4 @@
+import importlib
 import warnings
 
 import pytest
@@ -148,7 +149,18 @@ def test_sharded_transform_axis_fast_path_permute_output(dist_env, mesh_tp):
 
 
 @pytest.mark.parametrize("inverse,norm", [(False, None), (False, "ortho"), (True, "forward")])
-def test_sharded_transform_axis_fast_path_backward(dist_env, mesh_tp, inverse, norm):
+def test_sharded_transform_axis_fast_path_backward(dist_env, mesh_tp, monkeypatch, inverse, norm):
+    fft_impl = importlib.import_module("torch_einshard.fft")
+    distributed_fft_calls = 0
+    original_distributed_fft = fft_impl._distributed_fft_1d_no_autograd
+
+    def counted_distributed_fft(*args, **kwargs):
+        nonlocal distributed_fft_calls
+        distributed_fft_calls += 1
+        return original_distributed_fft(*args, **kwargs)
+
+    monkeypatch.setattr(fft_impl, "_distributed_fft_1d_no_autograd", counted_distributed_fft)
+
     group = mesh_tp["tp"].get_group()
     rank = dist.get_rank(group)
     world_size = dist.get_world_size(group)
@@ -172,6 +184,7 @@ def test_sharded_transform_axis_fast_path_backward(dist_env, mesh_tp, inverse, n
     fft = torch.fft.ifftn if inverse else torch.fft.fftn
     expected = fft(expected_full, dim=(1,), norm=norm)
     (expected.abs() ** 2).sum().backward()
+    assert distributed_fft_calls == 2
     assert_close(x.grad, torch.split(expected_full.grad, shapes, dim=1)[rank])
 
 

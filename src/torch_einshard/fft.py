@@ -8,7 +8,7 @@ from .distributed import distributed_1d
 from .families import cached_expand_axis_families, expand_family_mapping
 from .grammar import parse_sharding
 from .mappings import allgather_forward_split_backward, split_forward_allgather_backward
-from .helpers import all_gather, resolve_split_shapes, split
+from .helpers import resolve_split_shapes
 from .sharding import Axis, AxisGroup, Axes, EllipsisAxis, TensorSpec
 
 
@@ -178,17 +178,14 @@ def _distributed_fft_1d_no_autograd(input, group, dim, *, inverse, norm):
 
 
 def _adjoint_fft(input, group, dim, shapes, *, inverse, norm):
-    full = all_gather(input, group, dim, shapes)
     if norm == "ortho":
-        result = torch.fft.fftn(full, dim=(dim,), norm="ortho") if inverse else torch.fft.ifftn(full, dim=(dim,), norm="ortho")
-        return split(result, group, dim, shapes)
+        return _distributed_fft_1d_no_autograd(input, group, dim, inverse=not inverse, norm="ortho")
     if inverse:
         adjoint_norm = "forward" if norm in (None, "backward") else None
-        result = torch.fft.fftn(full, dim=(dim,), norm=adjoint_norm)
-    else:
-        adjoint_norm = None if norm == "forward" else "forward"
-        result = torch.fft.ifftn(full, dim=(dim,), norm=adjoint_norm)
-    return split(result, group, dim, shapes)
+        return _distributed_fft_1d_no_autograd(input, group, dim, inverse=False, norm=adjoint_norm)
+
+    adjoint_norm = None if norm == "forward" else "forward"
+    return _distributed_fft_1d_no_autograd(input, group, dim, inverse=True, norm=adjoint_norm)
 
 
 class _DistributedFFT1D(torch.autograd.Function):

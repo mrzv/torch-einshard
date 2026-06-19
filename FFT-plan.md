@@ -2,11 +2,11 @@
 
 The current `einfft` implementation has a useful first distributed fast path, but it is not a general distributed FFT engine yet.
 
-## Fully Optimized Backward
+## Optimized Backward
 
-The forward path for eligible sharded FFTs uses a distributed Cooley-Tukey decomposition with all-to-all transposes and local factor FFTs. The backward path is correct, but it is still a correctness-first implementation: it gathers the full gradient FFT axis on every rank, applies the adjoint local FFT, and splits the result again.
+The forward path for eligible sharded FFTs uses a distributed Cooley-Tukey decomposition with all-to-all transposes and local factor FFTs. The backward path uses the same distributed factorization for the adjoint transform, with the inverse direction and normalization selected to match PyTorch FFT autograd semantics.
 
-This means backward currently has the same memory and communication profile as the slow gather/FFT/split fallback. A fully optimized backward should avoid materializing the full transform axis and instead implement the adjoint using the same distributed factorization/all-to-all structure as the forward path, with the correct inverse direction and normalization scaling.
+This avoids materializing the full transform axis during backward for layouts that qualify for the fast path. Backward for unsupported layouts still follows the slow fallback path through the existing gather/split autograd mappings.
 
 ## Broader Layouts
 
