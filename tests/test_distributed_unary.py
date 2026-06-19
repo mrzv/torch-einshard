@@ -4,6 +4,7 @@ import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
 
 import torch_einshard as es
+from torch_einshard.symbolic import last_plan
 
 from conftest import assert_close
 
@@ -25,9 +26,11 @@ def test_single_axis_split_gather_round_trip(dist_env, mesh_1d):
     z = es.einshard("a b -> a/dp b", x, mesh=mesh_1d, shapes=shapes)
 
     assert z.shape == (shapes[rank], 3)
+    assert [step.name for step in last_plan()] == ["split_forward_allgather_backward"]
 
     zz = es.einshard("a/dp b -> a b", z, mesh=mesh_1d, shapes=shapes)
     assert_close(zz, x)
+    assert [step.name for step in last_plan()] == ["allgather_forward_split_backward"]
 
     (z ** 2).sum().backward()
     assert_close(x.grad, 2 * x)
@@ -108,6 +111,7 @@ def test_repartition_between_axes(dist_env, mesh_1d):
 
     expected = torch.split(full.detach(), col_shapes, dim=1)[rank]
     assert_close(z, expected)
+    assert [step.name for step in last_plan()] == ["alltoall_repartition"]
 
 
 def test_repartition_between_axes_uneven_shards(dist_env, mesh_1d):

@@ -4,6 +4,7 @@ import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
 
 import torch_einshard as es
+from torch_einshard.symbolic import last_plan
 
 from conftest import assert_close
 
@@ -103,6 +104,10 @@ def test_row_parallel_linear_pattern(dist_env, mesh_tp):
 
     expected = torch.einsum("bnc,hc->bnh", x, weight)
     assert_close(z, expected)
+    assert [step.name for step in last_plan()] == [
+        "rank_local_einsum",
+        "allreduce_forward_identity_backward",
+    ]
 
 
 def test_row_parallel_linear_explicit_partial_output(dist_env, mesh_tp):
@@ -120,6 +125,7 @@ def test_row_parallel_linear_explicit_partial_output(dist_env, mesh_tp):
 
     expected = torch.einsum("bnc,hc->bnh", x_shard, weight_shard)
     assert_close(z, expected)
+    assert [step.name for step in last_plan()] == ["rank_local_einsum"]
 
 
 def test_multi_axis_sharded_contraction(dist_env, mesh_2d):

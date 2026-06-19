@@ -107,6 +107,15 @@ def test_execution_plan_records_steps_and_last_plan_snapshot():
     assert [step.name for step in last_plan()] == plan.names()
 
 
+def test_execution_plan_execute_records_step_and_calls_function():
+    plan = ExecutionPlan()
+
+    result = plan.execute("double", lambda x: x * 2, 3, step_args=("x",))
+
+    assert result == 6
+    assert [(step.name, step.args) for step in plan.snapshot()] == [("double", ("x",))]
+
+
 def test_tensor_spec_factories_build_specs():
     spec = tensor_spec([local_axis("a"), sharded_axis("b", "tp")], partials=("dp",))
 

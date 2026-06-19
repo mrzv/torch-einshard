@@ -106,6 +106,10 @@ class ExecutionPlan:
     def add(self, name, *args):
         self.steps.append(PlanStep(name, tuple(args)))
 
+    def execute(self, name, fn, *fn_args, step_args=(), **fn_kwargs):
+        self.add(name, *step_args)
+        return fn(*fn_args, **fn_kwargs)
+
     def names(self):
         return [step.name for step in self.steps]
 

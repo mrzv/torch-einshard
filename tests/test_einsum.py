@@ -1,6 +1,7 @@
 import torch
 import pytest
 import torch_einshard as es
+from torch_einshard.symbolic import last_plan
 
 
 def test_contract_permute():
@@ -12,6 +13,7 @@ def test_contract_permute():
     zz = torch.einsum('abkc,bcld->klda', x, y)
 
     torch.testing.assert_close(z, zz)
+    assert [step.name for step in last_plan()] == ["rank_local_einsum"]
 
 
 def test_outer():

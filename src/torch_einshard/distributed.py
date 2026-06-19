@@ -12,6 +12,7 @@ from .mappings import allreduce_forward_identity_backward, \
                         owner_swap_forward_backward
 from .helpers import resolve_split_shapes
 from .sharding import Axis, Axes, EllipsisAxis, TensorSpec
+from .symbolic import ExecutionPlan, set_last_plan
 
 
 def _axes(spec):
@@ -70,11 +71,17 @@ def distributed_1d(shard, *xs, mesh, shapes):
         return NotImplemented       # TODO: maybe raise instead?
 
 def distributed_1d_2(shard, x, y, mesh, shapes = None):
+    plan = ExecutionPlan()
     # TODO: check the dimensions match sharding
 
     input0_spec = shard[0]
     input1_spec = shard[1]
     output_spec = shard[2]
+
+    def finish(output):
+        set_last_plan(plan)
+        return output
+
     input0_axes = _without_ellipsis(_axes(input0_spec))
     input1_axes = _without_ellipsis(_axes(input1_spec))
     output_axes = _without_ellipsis(_axes(output_spec))
@@ -198,25 +205,73 @@ def distributed_1d_2(shard, x, y, mesh, shapes = None):
         if axis.local():
             comm = group(target_axis.shard_dim)
             split_shapes = resolve_split_shapes(shapes, target_axis.shard_dim, axis.name, comm)
-            tensor = split_forward_allgather_backward(tensor, comm, dim, split_shapes)
+            tensor = plan.execute(
+                "split_forward_allgather_backward",
+                split_forward_allgather_backward,
+                tensor,
+                comm,
+                dim,
+                split_shapes,
+                step_args=(axis.name, target_axis.shard_dim),
+            )
         elif target_axis.local():
             comm = group(axis.shard_dim)
             split_shapes = resolve_split_shapes(shapes, axis.shard_dim, axis.name, comm)
             if active_in_output(axis.shard_dim):
-                tensor = allgather_forward_reducescatter_backward(tensor, comm, dim, split_shapes)
+                tensor = plan.execute(
+                    "allgather_forward_reducescatter_backward",
+                    allgather_forward_reducescatter_backward,
+                    tensor,
+                    comm,
+                    dim,
+                    split_shapes,
+                    step_args=(axis.name, axis.shard_dim),
+                )
             else:
-                tensor = allgather_forward_split_backward(tensor, comm, dim, split_shapes)
+                tensor = plan.execute(
+                    "allgather_forward_split_backward",
+                    allgather_forward_split_backward,
+                    tensor,
+                    comm,
+                    dim,
+                    split_shapes,
+                    step_args=(axis.name, axis.shard_dim),
+                )
         else:
             source_comm = group(axis.shard_dim)
             source_shapes = resolve_split_shapes(shapes, axis.shard_dim, axis.name, source_comm)
             if active_in_output(axis.shard_dim):
-                tensor = allgather_forward_reducescatter_backward(tensor, source_comm, dim, source_shapes)
+                tensor = plan.execute(
+                    "allgather_forward_reducescatter_backward",
+                    allgather_forward_reducescatter_backward,
+                    tensor,
+                    source_comm,
+                    dim,
+                    source_shapes,
+                    step_args=(axis.name, axis.shard_dim),
+                )
             else:
-                tensor = allgather_forward_split_backward(tensor, source_comm, dim, source_shapes)
+                tensor = plan.execute(
+                    "allgather_forward_split_backward",
+                    allgather_forward_split_backward,
+                    tensor,
+                    source_comm,
+                    dim,
+                    source_shapes,
+                    step_args=(axis.name, axis.shard_dim),
+                )
 
             dest_comm = group(target_axis.shard_dim)
             dest_shapes = resolve_split_shapes(shapes, target_axis.shard_dim, axis.name, dest_comm)
-            tensor = split_forward_allgather_backward(tensor, dest_comm, dim, dest_shapes)
+            tensor = plan.execute(
+                "split_forward_allgather_backward",
+                split_forward_allgather_backward,
+                tensor,
+                dest_comm,
+                dim,
+                dest_shapes,
+                step_args=(axis.name, target_axis.shard_dim),
+            )
 
         normalized_axes = replace_axis(normalized_axes, axis.name, target_axis)
         return tensor, normalized_axes
@@ -273,12 +328,15 @@ def distributed_1d_2(shard, x, y, mesh, shapes = None):
                 output_shape[dim_of(normalized_axes, axis.name, tensor)] = dest_shapes[dist.get_rank(dest_comm)]
 
             if can_owner_swap:
-                tensor = owner_swap_forward_backward(
+                tensor = plan.execute(
+                    "owner_swap",
+                    owner_swap_forward_backward,
                     tensor,
                     mesh,
                     source_shard_dims,
                     dest_shard_dims,
                     tuple(output_shape),
+                    step_args=(source_shard_dims, dest_shard_dims),
                 )
                 for axis, target_axis in owner_swap_changes:
                     normalized_axes = replace_axis(normalized_axes, axis.name, target_axis)
@@ -301,7 +359,15 @@ def distributed_1d_2(shard, x, y, mesh, shapes = None):
             dim = dim_of(normalized_axes, axis.name, tensor)
             comm = group(axis.shard_dim)
             split_shapes = resolve_split_shapes(shapes, axis.shard_dim, axis.name, comm)
-            tensor = allgather_forward_split_backward(tensor, comm, dim, split_shapes)
+            tensor = plan.execute(
+                "allgather_forward_split_backward",
+                allgather_forward_split_backward,
+                tensor,
+                comm,
+                dim,
+                split_shapes,
+                step_args=(axis.name, axis.shard_dim),
+            )
             normalized_axes = replace_axis(normalized_axes, axis.name, Axis(axis.name))
             normalized_scatter_axes.add(axis.name)
 
@@ -321,7 +387,13 @@ def distributed_1d_2(shard, x, y, mesh, shapes = None):
                 if axis == post_repartition["source_input_axis"]:
                     continue
                 if axis == post_repartition["dest_input_axis"]:
-                    tensor = identity_forward_allreduce_backward(tensor, group(post_repartition["shard_dim"]))
+                    tensor = plan.execute(
+                        "identity_forward_allreduce_backward",
+                        identity_forward_allreduce_backward,
+                        tensor,
+                        group(post_repartition["shard_dim"]),
+                        step_args=(post_repartition["shard_dim"],),
+                    )
                     continue
 
             if axis.name not in output_by_name:
@@ -374,6 +446,7 @@ def distributed_1d_2(shard, x, y, mesh, shapes = None):
         assert axis == input1_by_name[name], "Shared axes must use matching sharding"
         assert axis == local_output_by_name[name], "Output shared axes must preserve input sharding"
 
+    plan.add("rank_local_einsum")
     z = einsum(normalized_shard, x, y)    # perform the local operation
     current_output_axes = local_output_axes
 
@@ -384,29 +457,60 @@ def distributed_1d_2(shard, x, y, mesh, shapes = None):
                 dim = dim_of(current_output_axes, scatter_axis.name, z)
                 comm = group(shard_dim)
                 split_shapes = resolve_split_shapes(shapes, shard_dim, scatter_axis.name, comm)
-                z = split_forward_allgather_backward(z, comm, dim, split_shapes)
+                z = plan.execute(
+                    "split_forward_allgather_backward",
+                    split_forward_allgather_backward,
+                    z,
+                    comm,
+                    dim,
+                    split_shapes,
+                    step_args=(scatter_axis.name, shard_dim),
+                )
                 current_output_axes = replace_axis(current_output_axes, scatter_axis.name, scatter_axis)
             continue
         scatter_axis = scatter_output_by_dim.get(shard_dim)
         if scatter_axis is None:
-            z = allreduce_forward_identity_backward(z, comm = group(shard_dim))
+            z = plan.execute(
+                "allreduce_forward_identity_backward",
+                allreduce_forward_identity_backward,
+                z,
+                comm=group(shard_dim),
+                step_args=(shard_dim,),
+            )
             continue
 
         dim = dim_of(current_output_axes, scatter_axis.name, z)
         comm = group(shard_dim)
         split_shapes = resolve_split_shapes(shapes, shard_dim, scatter_axis.name, comm)
-        z = reducescatter_forward_allgather_backward(z, comm, dim, split_shapes)
+        z = plan.execute(
+            "reducescatter_forward_allgather_backward",
+            reducescatter_forward_allgather_backward,
+            z,
+            comm,
+            dim,
+            split_shapes,
+            step_args=(scatter_axis.name, shard_dim),
+        )
         current_output_axes = replace_axis(current_output_axes, scatter_axis.name, scatter_axis)
 
     if post_repartition is not None:
         comm = group(post_repartition["shard_dim"])
-        z = alltoall_repartition(
+        result = alltoall_repartition(
             z,
             comm,
             dim_of(current_output_axes, post_repartition["source_input_axis"].name, z),
             dim_of(current_output_axes, post_repartition["dest_input_axis"].name, z),
             post_repartition["source_shapes"],
             post_repartition["dest_shapes"],
+        )
+        if result is None:
+            return None
+        z = result
+        plan.add(
+            "alltoall_repartition",
+            post_repartition["source_input_axis"].name,
+            post_repartition["dest_input_axis"].name,
+            post_repartition["shard_dim"],
         )
         current_output_axes = replace_axis(
             current_output_axes,
@@ -419,9 +523,10 @@ def distributed_1d_2(shard, x, y, mesh, shapes = None):
             post_repartition["dest_output_axis"],
         )
 
-    return z
+    return finish(z)
 
 def distributed_1d_1(shard, x, mesh, shapes = None):
+    plan = ExecutionPlan()
     input_spec = shard[0]
     output_spec = shard[2]
     input_axes = _axes(input_spec)
@@ -441,6 +546,10 @@ def distributed_1d_1(shard, x, mesh, shapes = None):
     z = x
     current = list(input_axes)
     current_partials = list(input_partials)
+
+    def finish(output):
+        set_last_plan(plan)
+        return output
 
     shard_dim_changes = [
         out_axis.name for out_axis in output_axes
@@ -496,7 +605,7 @@ def distributed_1d_1(shard, x, mesh, shapes = None):
         comm = group(source_axis.shard_dim)
         source_shapes = resolve_split_shapes(shapes, source_axis.shard_dim, source_axis.name, comm)
         dest_shapes = resolve_split_shapes(shapes, dest_axis.shard_dim, dest_axis.name, comm)
-        return alltoall_repartition(
+        result = alltoall_repartition(
             z,
             comm,
             dim_of(source_axis.name),
@@ -504,6 +613,9 @@ def distributed_1d_1(shard, x, mesh, shapes = None):
             source_shapes,
             dest_shapes,
         )
+        if result is not None:
+            plan.add("alltoall_repartition", source_axis.name, dest_axis.name, source_axis.shard_dim)
+        return result
 
     def try_multi_axis_owner_swap():
         if output_partials or [axis.name for axis in input_axes] != [axis.name for axis in output_axes]:
@@ -535,12 +647,15 @@ def distributed_1d_1(shard, x, mesh, shapes = None):
                 return None
             output_shape[dim_of(out_axis.name)] = dest_shapes[dist.get_rank(dest_comm)]
 
-        return owner_swap_forward_backward(
+        return plan.execute(
+            "owner_swap",
+            owner_swap_forward_backward,
             z,
             mesh,
             source_shard_dims,
             dest_shard_dims,
             tuple(output_shape),
+            step_args=(source_shard_dims, dest_shard_dims),
         )
 
     # Reduce input partials first. If the same mesh dimension appears on an
@@ -557,12 +672,26 @@ def distributed_1d_1(shard, x, mesh, shapes = None):
                 break
 
         if scatter_axis is None:
-            z = allreduce_forward_identity_backward(z, group(partial))
+            z = plan.execute(
+                "allreduce_forward_identity_backward",
+                allreduce_forward_identity_backward,
+                z,
+                group(partial),
+                step_args=(partial,),
+            )
         else:
             dim = dim_of(scatter_axis.name)
             comm = group(partial)
             split_shapes = resolve_split_shapes(shapes, partial, scatter_axis.name, comm)
-            z = reducescatter_forward_allgather_backward(z, comm, dim, split_shapes)
+            z = plan.execute(
+                "reducescatter_forward_allgather_backward",
+                reducescatter_forward_allgather_backward,
+                z,
+                comm,
+                dim,
+                split_shapes,
+                step_args=(scatter_axis.name, partial),
+            )
             current[dim] = scatter_axis
         current_partials.remove(partial)
 
@@ -571,7 +700,7 @@ def distributed_1d_1(shard, x, mesh, shapes = None):
         z = optimized
         current = list(output_axes)
         if [axis.name for axis in current] == [axis.name for axis in output_axes]:
-            return z
+            return finish(z)
 
     assert len(shard_dim_changes) <= 1, "Cannot repartition multiple sharded axes between shard dimensions yet"
 
@@ -580,7 +709,7 @@ def distributed_1d_1(shard, x, mesh, shapes = None):
         z = optimized
         current = list(output_axes)
         if [axis.name for axis in current] == [axis.name for axis in output_axes]:
-            return z
+            return finish(z)
 
     if has_repartition_change():
         warnings.warn(
@@ -603,37 +732,84 @@ def distributed_1d_1(shard, x, mesh, shapes = None):
             shard_dim = out_axis.shard_dim
             comm = group(shard_dim)
             split_shapes = resolve_split_shapes(shapes, shard_dim, out_axis.name, comm)
-            z = split_forward_allgather_backward(z, comm, dim, split_shapes)
+            z = plan.execute(
+                "split_forward_allgather_backward",
+                split_forward_allgather_backward,
+                z,
+                comm,
+                dim,
+                split_shapes,
+                step_args=(out_axis.name, shard_dim),
+            )
         elif out_axis.local():
             # X/P ... -> P * X ...
             shard_dim = current_axis.shard_dim
             comm = group(shard_dim)
             split_shapes = resolve_split_shapes(shapes, shard_dim, out_axis.name, comm)
             if shard_dim in output_partials:
-                z = allgather_forward_reducescatter_backward(z, comm, dim, split_shapes)
+                z = plan.execute(
+                    "allgather_forward_reducescatter_backward",
+                    allgather_forward_reducescatter_backward,
+                    z,
+                    comm,
+                    dim,
+                    split_shapes,
+                    step_args=(out_axis.name, shard_dim),
+                )
                 current_partials.append(shard_dim)
             else:
-                z = allgather_forward_split_backward(z, comm, dim, split_shapes)
+                z = plan.execute(
+                    "allgather_forward_split_backward",
+                    allgather_forward_split_backward,
+                    z,
+                    comm,
+                    dim,
+                    split_shapes,
+                    step_args=(out_axis.name, shard_dim),
+                )
         else:
             # X/P ... -> Q * X ... -> X/Q ...
             source_comm = group(current_axis.shard_dim)
             source_shapes = resolve_split_shapes(shapes, current_axis.shard_dim, out_axis.name, source_comm)
-            z = allgather_forward_split_backward(z, source_comm, dim, source_shapes)
+            z = plan.execute(
+                "allgather_forward_split_backward",
+                allgather_forward_split_backward,
+                z,
+                source_comm,
+                dim,
+                source_shapes,
+                step_args=(out_axis.name, current_axis.shard_dim),
+            )
 
             dest_comm = group(out_axis.shard_dim)
             dest_shapes = resolve_split_shapes(shapes, out_axis.shard_dim, out_axis.name, dest_comm)
-            z = split_forward_allgather_backward(z, dest_comm, dim, dest_shapes)
+            z = plan.execute(
+                "split_forward_allgather_backward",
+                split_forward_allgather_backward,
+                z,
+                dest_comm,
+                dim,
+                dest_shapes,
+                step_args=(out_axis.name, out_axis.shard_dim),
+            )
 
         current[dim] = out_axis
 
     for partial in output_partials:
         if partial in current_partials:
             continue
-        z = identity_forward_allreduce_backward(z, group(partial))
+        z = plan.execute(
+            "identity_forward_allreduce_backward",
+            identity_forward_allreduce_backward,
+            z,
+            group(partial),
+            step_args=(partial,),
+        )
         current_partials.append(partial)
 
     if [axis.name for axis in current] == [axis.name for axis in output_axes]:
-        return z
+        return finish(z)
 
     # permute if necessary
-    return einsum(shard, z, name_only=True)
+    plan.add("permute", tuple(axis.name for axis in output_axes))
+    return finish(einsum(shard, z, name_only=True))

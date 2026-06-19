@@ -23,6 +23,7 @@ from .params import (
 )
 from .roll import einroll
 from .sharding import AxisGroup
+from .symbolic import ExecutionPlan, set_last_plan
 
 
 def _axes(spec):
@@ -78,7 +79,11 @@ def einshard(shard, *xs, mesh = None, shapes = None, sizes = None, families = No
     shard = parse_sharding(shard)
 
     if local_operation(shard):
-        return einsum(shard, *xs, sizes=sizes)
+        output = einsum(shard, *xs, sizes=sizes)
+        plan = ExecutionPlan()
+        plan.add("rank_local_einsum")
+        set_last_plan(plan)
+        return output
 
     if any(_has_groups(s) for s in shard if s is not None):
         raise NotImplementedError("Factored axes are currently supported only for local reshape operations")
