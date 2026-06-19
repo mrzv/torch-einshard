@@ -1,4 +1,3 @@
-from copy import deepcopy
 from functools import lru_cache
 
 from parsley import makeGrammar
@@ -29,7 +28,7 @@ sharding = makeGrammar(grammar, globals(), name = "Einshard")
 
 def parse_sharding(expression):
     try:
-        return deepcopy(_parse_sharding_cached(expression))
+        return _copy_parse_result(_parse_sharding_cached(expression))
     except Exception as error:
         raise ValueError(f"Invalid einshard expression {expression!r}: {error}") from error
 
@@ -37,3 +36,21 @@ def parse_sharding(expression):
 @lru_cache(maxsize=2048)
 def _parse_sharding_cached(expression):
     return sharding(expression).map()
+
+
+def _copy_parse_result(result):
+    return tuple(_copy_tensor_spec(spec) for spec in result)
+
+
+def _copy_tensor_spec(spec):
+    if spec is None:
+        return None
+    return TensorSpec(Axes(_copy_axis(axis) for axis in spec.axes), spec.partials)
+
+
+def _copy_axis(axis):
+    if isinstance(axis, AxisGroup):
+        return AxisGroup(_copy_axis(child) for child in axis.axes)
+    if isinstance(axis, EllipsisAxis):
+        return EllipsisAxis()
+    return Axis(axis.name, axis.shard_dim)
