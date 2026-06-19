@@ -10,22 +10,23 @@ This avoids materializing the full transform axis during backward for layouts th
 
 ## Broader Layouts
 
-The fast path handles separable multi-axis FFTs when each sharded transform axis can use the distributed 1D kernel. A representative case is:
+The fast path handles separable multi-axis FFTs when each sharded transform axis can use the distributed 1D kernel. Representative complex and real cases are:
 
 ```python
 es.einfft("b x/tp -> b k/tp", x, axes={"x": "k"}, mesh=mesh, shapes=shapes)
+es.einfft("b x/tp y -> b kx/tp ky", x, axes={"x": "kx", "y": "ky"}, real=True, mesh=mesh, shapes=shapes)
 ```
 
 Current fast-path constraints:
 
-- Each sharded input transform axis must have an output frequency axis sharded on the same mesh dimension.
+- Each sharded transform axis must stay sharded on the same mesh dimension across input and output.
 - Multiple sharded transform axes must use distinct mesh dimensions.
 - Input and output shard sizes are equal.
 - Local shard size is divisible by the mesh size.
 - Input is complex, except for real FFT fast paths where the half-spectrum axis is local.
 - No factored axes, ellipsis axes, or partial specs.
 
-Real FFT variants are supported through `real=True`. Forward real mode uses `torch.fft.rfftn`; inverse real mode uses `torch.fft.irfftn` and accepts `signal_sizes` for odd-length or otherwise ambiguous inverse lengths. The fast path supports real FFTs when the half-spectrum axis is local and sharded transform axes are full-complex axes handled by the distributed 1D kernel. Sharded real FFTs where the half-spectrum axis changes sharded size still use the gather/local-FFT/split fallback.
+Real FFT variants are supported through `real=True`. Forward real mode uses `torch.fft.rfftn`; inverse real mode uses `torch.fft.irfftn` and accepts `signal_sizes` for odd-length or otherwise ambiguous inverse lengths. The fast path supports real FFTs when the half-spectrum axis is local and sharded transform axes are full-complex axes handled by the distributed 1D kernel. Inverse real fast paths also require any specified non-half-axis `signal_sizes` to match the current global axis sizes; padding or cropping those axes falls back. Sharded real FFTs where the half-spectrum axis changes sharded size still use the gather/local-FFT/split fallback.
 
 Future broader-layout work should consider:
 

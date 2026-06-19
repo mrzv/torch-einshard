@@ -173,9 +173,17 @@ z = es.einfft(
     mesh=mesh,
     shapes={"tp": {"x": x_shapes, "k": k_shapes}},
 )
+z = es.einfft(
+    "b x/tp y -> b kx/tp ky",
+    x_real_shard,
+    axes={"x": "kx", "y": "ky"},
+    real=True,
+    mesh=mesh,
+    shapes={"tp": {"x": x_shapes, "kx": x_shapes}},
+)
 ```
 
-Unsupported sharded transform layouts, including real FFTs where the half-spectrum axis is sharded, fall back to gather the full transform axis, run the local FFT, then split the output frequency axis if requested. That path emits a `RuntimeWarning` because it materializes the full transform axis on every rank. Non-FFT axes must preserve their sharding. `einfft` currently supports explicit named axes; it does not support ellipsis axes, factored axes, or partial tensor specs.
+Inverse real fast paths require any specified non-half-axis `signal_sizes` to match the current global axis sizes; padding or cropping those axes falls back. Unsupported sharded transform layouts, including real FFTs where the half-spectrum axis is sharded, fall back to gather the full transform axis, run the local FFT, then split the output frequency axis if requested. That path emits a `RuntimeWarning` because it materializes the full transform axis on every rank. Non-FFT axes must preserve their sharding. `einfft` currently supports explicit named axes; it does not support ellipsis axes, factored axes, or partial tensor specs.
 
 ## Supported Distributed Unary Patterns
 
