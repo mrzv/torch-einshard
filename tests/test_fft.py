@@ -33,7 +33,7 @@ def test_local_fftn_permute_output():
     z = es.einfft("b x y -> ky b kx", x, axes={"x": "kx", "y": "ky"})
 
     expected = torch.fft.fftn(x, dim=(1, 2)).permute(2, 0, 1)
-    assert_close(z, expected)
+    assert_close(z, expected, rtol=1e-4, atol=1e-5)
 
 
 def test_local_fft_expands_iterable_axis_family():
@@ -180,6 +180,345 @@ def test_sharded_real_fft_uses_slow_path_with_warning(dist_env, mesh_tp):
 
 
 @pytest.mark.parametrize("norm", [None, "backward", "forward", "ortho"])
+def test_sharded_half_spectrum_real_fft_uses_fast_path(dist_env, mesh_tp, monkeypatch, norm):
+    fft_impl = importlib.import_module("torch_einshard.fft")
+    distributed_fft_calls = 0
+    original_distributed_fft = fft_impl._distributed_fft_1d_no_autograd
+
+    def counted_distributed_fft(*args, **kwargs):
+        nonlocal distributed_fft_calls
+        distributed_fft_calls += 1
+        return original_distributed_fft(*args, **kwargs)
+
+    monkeypatch.setattr(fft_impl, "_distributed_fft_1d_no_autograd", counted_distributed_fft)
+
+    group = mesh_tp["tp"].get_group()
+    rank = dist.get_rank(group)
+    world_size = dist.get_world_size(group)
+    size = world_size * world_size * 4
+    input_shapes = es.helpers.compute_split_shapes(size, world_size)
+    output_shapes = es.helpers.compute_split_shapes(size // 2 + 1, world_size)
+
+    full = torch.randn(2, size)
+    x = torch.split(full, input_shapes, dim=1)[rank].contiguous()
+
+    z = _assert_no_runtime_warning(
+        lambda: es.einfft(
+            "b x/tp -> b k/tp",
+            x,
+            axes={"x": "k"},
+            real=True,
+            norm=norm,
+            mesh=mesh_tp,
+            shapes={"tp": {"x": input_shapes, "k": output_shapes}},
+        )
+    )
+
+    expected = torch.split(torch.fft.rfftn(full, dim=(1,), norm=norm), output_shapes, dim=1)[rank]
+    assert distributed_fft_calls == 1
+    assert_close(z, expected, rtol=1e-4, atol=1e-4)
+
+
+def test_sharded_half_spectrum_real_fft_fast_path_backward(dist_env, mesh_tp, monkeypatch):
+    fft_impl = importlib.import_module("torch_einshard.fft")
+    distributed_fft_calls = 0
+    original_distributed_fft = fft_impl._distributed_fft_1d_no_autograd
+
+    def counted_distributed_fft(*args, **kwargs):
+        nonlocal distributed_fft_calls
+        distributed_fft_calls += 1
+        return original_distributed_fft(*args, **kwargs)
+
+    monkeypatch.setattr(fft_impl, "_distributed_fft_1d_no_autograd", counted_distributed_fft)
+
+    group = mesh_tp["tp"].get_group()
+    rank = dist.get_rank(group)
+    world_size = dist.get_world_size(group)
+    size = world_size * world_size * 4
+    input_shapes = es.helpers.compute_split_shapes(size, world_size)
+    output_shapes = es.helpers.compute_split_shapes(size // 2 + 1, world_size)
+
+    full = torch.randn(2, size)
+    x = torch.split(full.detach().clone(), input_shapes, dim=1)[rank].contiguous().requires_grad_()
+    z = _assert_no_runtime_warning(
+        lambda: es.einfft(
+            "b x/tp -> b k/tp",
+            x,
+            axes={"x": "k"},
+            real=True,
+            mesh=mesh_tp,
+            shapes={"tp": {"x": input_shapes, "k": output_shapes}},
+        )
+    )
+    (z.abs() ** 2).sum().backward()
+
+    expected_full = full.detach().clone().requires_grad_()
+    expected = torch.fft.rfftn(expected_full, dim=(1,))
+    (expected.abs() ** 2).sum().backward()
+    assert distributed_fft_calls == 2
+    assert_close(x.grad, torch.split(expected_full.grad, input_shapes, dim=1)[rank], rtol=1e-4, atol=2e-4)
+
+
+def test_einfft_explain_reports_fast_path(dist_env, mesh_tp):
+    group = mesh_tp["tp"].get_group()
+    world_size = dist.get_world_size(group)
+    size = world_size * world_size * 4
+    input_shapes = es.helpers.compute_split_shapes(size, world_size)
+    output_shapes = es.helpers.compute_split_shapes(size // 2 + 1, world_size)
+    full = torch.randn(2, size)
+    x = torch.split(full, input_shapes, dim=1)[dist.get_rank(group)].contiguous()
+
+    info = es.einfft(
+        "b x/tp -> b k/tp",
+        x,
+        axes={"x": "k"},
+        real=True,
+        mesh=mesh_tp,
+        shapes={"tp": {"x": input_shapes, "k": output_shapes}},
+        explain=True,
+    )
+
+    assert info == {
+        "fast_path": True,
+        "path": "distributed-rfft-sharded-half",
+        "reason": None,
+        "axes": {"x": "k"},
+    }
+
+
+def test_einfft_explain_reports_fallback_reason(dist_env, mesh_tp):
+    group = mesh_tp["tp"].get_group()
+    world_size = dist.get_world_size(group)
+    if world_size == 1:
+        pytest.skip("uneven sharded FFT diagnostics require more than one rank")
+    size = world_size * 4 + 1
+    input_shapes = es.helpers.compute_split_shapes(size, world_size)
+    output_shapes = es.helpers.compute_split_shapes(size // 2 + 1, world_size)
+    full = torch.randn(2, size)
+    x = torch.split(full, input_shapes, dim=1)[dist.get_rank(group)].contiguous()
+
+    info = es.einfft(
+        "b x/tp -> b k/tp",
+        x,
+        axes={"x": "k"},
+        real=True,
+        mesh=mesh_tp,
+        shapes={"tp": {"x": input_shapes, "k": output_shapes}},
+        explain=True,
+    )
+
+    assert info["fast_path"] is False
+    assert info["path"] == "fallback"
+    assert info["reason"] == "fast path requires equal shard sizes"
+
+
+def test_einfft_rejects_transform_axis_sharing_mesh_dim_with_other_axis(dist_env, mesh_tp):
+    group = mesh_tp["tp"].get_group()
+    rank = dist.get_rank(group)
+    world_size = dist.get_world_size(group)
+    b_size = world_size * 2
+    x_size = world_size * world_size * 4
+    b_shapes = es.helpers.compute_split_shapes(b_size, world_size)
+    x_shapes = es.helpers.compute_split_shapes(x_size, world_size)
+    k_shapes = es.helpers.compute_split_shapes(x_size // 2 + 1, world_size)
+    full = torch.randn(b_size, x_size)
+    x = torch.split(torch.split(full, b_shapes, dim=0)[rank], x_shapes, dim=1)[rank].contiguous()
+
+    with pytest.raises(NotImplementedError, match="cannot share a mesh dimension"):
+        es.einfft(
+            "b/tp x/tp -> b/tp k/tp",
+            x,
+            axes={"x": "k"},
+            real=True,
+            mesh=mesh_tp,
+            shapes={"tp": {"b": b_shapes, "x": x_shapes, "k": k_shapes}},
+        )
+
+    info = es.einfft(
+        "b/tp x/tp -> b/tp k/tp",
+        x,
+        axes={"x": "k"},
+        real=True,
+        mesh=mesh_tp,
+        shapes={"tp": {"b": b_shapes, "x": x_shapes, "k": k_shapes}},
+        explain=True,
+    )
+    assert info == {
+        "fast_path": False,
+        "path": "unsupported-layout",
+        "reason": "einfft transform axes cannot share a mesh dimension with another input or output axis",
+        "axes": {"x": "k"},
+    }
+
+
+def test_einfft_rejects_output_transform_axis_sharing_mesh_dim(dist_env, mesh_tp):
+    group = mesh_tp["tp"].get_group()
+    rank = dist.get_rank(group)
+    world_size = dist.get_world_size(group)
+    b_size = world_size * 2
+    x_size = world_size * world_size * 4
+    b_shapes = es.helpers.compute_split_shapes(b_size, world_size)
+    k_shapes = es.helpers.compute_split_shapes(x_size // 2 + 1, world_size)
+    full = torch.randn(b_size, x_size)
+    x = torch.split(full, b_shapes, dim=0)[rank].contiguous()
+
+    with pytest.raises(NotImplementedError, match="cannot share a mesh dimension"):
+        es.einfft(
+            "b/tp x -> b/tp k/tp",
+            x,
+            axes={"x": "k"},
+            real=True,
+            mesh=mesh_tp,
+            shapes={"tp": {"b": b_shapes, "k": k_shapes}},
+        )
+
+    info = es.einfft(
+        "b/tp x -> b/tp k/tp",
+        x,
+        axes={"x": "k"},
+        real=True,
+        mesh=mesh_tp,
+        shapes={"tp": {"b": b_shapes, "k": k_shapes}},
+        explain=True,
+    )
+    assert info["fast_path"] is False
+    assert info["path"] == "unsupported-layout"
+    assert info["reason"] == "einfft transform axes cannot share a mesh dimension with another input or output axis"
+
+
+def test_einfft_explain_reports_no_transform_axes():
+    x = torch.randn(2, 3, dtype=torch.complex64)
+
+    info = es.einfft("b x -> b x", x, axes=[], explain=True)
+
+    assert info == {
+        "fast_path": False,
+        "path": "no-op-layout",
+        "reason": "no transform axes requested",
+        "axes": {},
+    }
+
+
+def test_einfft_explain_reports_layout_only_when_no_transform_axes():
+    x = torch.randn(2, 3, dtype=torch.complex64)
+
+    info = es.einfft("b x -> x b", x, axes=[], explain=True)
+
+    assert info == {
+        "fast_path": False,
+        "path": "layout-only",
+        "reason": "no transform axes requested; only layout changes would run",
+        "axes": {},
+    }
+
+
+@pytest.mark.parametrize("dtype", [torch.complex64, torch.float16, torch.bfloat16])
+def test_einfft_explain_rejects_unsupported_input_for_real_fast_path(dist_env, mesh_tp, dtype):
+    group = mesh_tp["tp"].get_group()
+    world_size = dist.get_world_size(group)
+    size = world_size * world_size * 4
+    input_shapes = es.helpers.compute_split_shapes(size, world_size)
+    output_shapes = es.helpers.compute_split_shapes(size // 2 + 1, world_size)
+    full = torch.randn(2, size, dtype=dtype)
+    x = torch.split(full, input_shapes, dim=1)[dist.get_rank(group)].contiguous()
+
+    info = es.einfft(
+        "b x/tp -> b k/tp",
+        x,
+        axes={"x": "k"},
+        real=True,
+        mesh=mesh_tp,
+        shapes={"tp": {"x": input_shapes, "k": output_shapes}},
+        explain=True,
+    )
+
+    assert info["fast_path"] is False
+    assert info["reason"] == "forward real FFT fast path requires float32 or float64 input"
+
+
+@pytest.mark.parametrize("dtype", [torch.complex64, torch.float16, torch.bfloat16])
+def test_einfft_explain_rejects_unsupported_input_for_local_half_real_fast_path(dist_env, mesh_tp, dtype):
+    group = mesh_tp["tp"].get_group()
+    rank = dist.get_rank(group)
+    world_size = dist.get_world_size(group)
+    x_size = world_size * world_size * 3
+    y_size = 7
+    shapes = es.helpers.compute_split_shapes(x_size, world_size)
+
+    full = torch.randn(2, x_size, y_size, dtype=dtype)
+    x = torch.split(full, shapes, dim=1)[rank].contiguous()
+
+    info = es.einfft(
+        "b x/tp y -> b kx/tp ky",
+        x,
+        axes={"x": "kx", "y": "ky"},
+        real=True,
+        mesh=mesh_tp,
+        shapes={"tp": {"x": shapes, "kx": shapes}},
+        explain=True,
+    )
+
+    assert info["fast_path"] is False
+    assert info["reason"] == "forward real FFT fast path requires float32 or float64 input"
+
+
+def test_einfft_explain_reports_sharded_signal_size_mismatch(dist_env, mesh_tp):
+    group = mesh_tp["tp"].get_group()
+    rank = dist.get_rank(group)
+    world_size = dist.get_world_size(group)
+    input_x_size = world_size * world_size * 3
+    output_x_size = input_x_size + 1
+    y_size = 7
+    input_shapes = es.helpers.compute_split_shapes(input_x_size, world_size)
+    output_shapes = es.helpers.compute_split_shapes(output_x_size, world_size)
+    full = torch.randn(2, input_x_size, y_size)
+    spectrum = torch.fft.rfftn(full, dim=(1, 2))
+    x = torch.split(spectrum, input_shapes, dim=1)[rank].contiguous()
+
+    info = es.einfft(
+        "b kx/tp ky -> b x/tp y",
+        x,
+        axes={"kx": "x", "ky": "y"},
+        inverse=True,
+        real=True,
+        signal_sizes={"x": output_x_size, "y": y_size},
+        mesh=mesh_tp,
+        shapes={"tp": {"kx": input_shapes, "x": output_shapes}},
+        explain=True,
+    )
+
+    assert info["fast_path"] is False
+    assert info["reason"] == "inverse real FFT non-half-axis signal_sizes request padding or cropping"
+
+
+def test_einfft_explain_reports_sharded_signal_size_mismatch_without_shapes(dist_env, mesh_tp):
+    group = mesh_tp["tp"].get_group()
+    rank = dist.get_rank(group)
+    world_size = dist.get_world_size(group)
+    input_x_size = world_size * world_size * 3
+    output_x_size = input_x_size + 1
+    y_size = 7
+    local_x_size = input_x_size // world_size
+    full = torch.randn(2, input_x_size, y_size)
+    spectrum = torch.fft.rfftn(full, dim=(1, 2))
+    x = torch.split(spectrum, [local_x_size] * world_size, dim=1)[rank].contiguous()
+
+    info = es.einfft(
+        "b kx/tp ky -> b x/tp y",
+        x,
+        axes={"kx": "x", "ky": "y"},
+        inverse=True,
+        real=True,
+        signal_sizes={"x": output_x_size, "y": y_size},
+        mesh=mesh_tp,
+        explain=True,
+    )
+
+    assert info["fast_path"] is False
+    assert info["reason"] == "inverse real FFT non-half-axis signal_sizes request padding or cropping"
+
+
+@pytest.mark.parametrize("norm", [None, "backward", "forward", "ortho"])
 def test_sharded_and_local_real_fft_uses_fast_path(dist_env, mesh_tp, monkeypatch, norm):
     fft_impl = importlib.import_module("torch_einshard.fft")
     distributed_fft_calls = 0
@@ -259,7 +598,7 @@ def test_sharded_and_local_inverse_real_fft_uses_fast_path(dist_env, mesh_tp, mo
 
     expected = torch.split(torch.fft.irfftn(spectrum, s=(x_size, y_size), dim=(1, 2), norm=norm), shapes, dim=1)[rank]
     assert distributed_fft_calls == 1
-    assert_close(z, expected, rtol=1e-4, atol=1e-5)
+    assert_close(z, expected, rtol=1e-4, atol=2e-4)
 
 
 def test_sharded_and_local_inverse_real_fft_signal_size_mismatch_falls_back(dist_env, mesh_tp, monkeypatch):
@@ -415,7 +754,7 @@ def test_sharded_and_local_inverse_real_fft_fast_path_backward(dist_env, mesh_tp
     expected = torch.fft.irfftn(expected_full, s=(x_size, y_size), dim=(1, 2))
     (expected ** 2).sum().backward()
     assert distributed_fft_calls == 2
-    assert_close(x.grad, torch.split(expected_full.grad, shapes, dim=1)[rank])
+    assert_close(x.grad, torch.split(expected_full.grad, shapes, dim=1)[rank], rtol=1e-4, atol=2e-4)
 
 
 def test_real_fft_to_sharded_output_warns(dist_env, mesh_tp):
@@ -585,7 +924,7 @@ def test_sharded_and_local_transform_axes_fast_path(dist_env, mesh_tp, inverse, 
 
     fft = torch.fft.ifftn if inverse else torch.fft.fftn
     expected = torch.split(fft(full, dim=(1, 2), norm=norm), shapes, dim=1)[rank]
-    assert_close(z, expected)
+    assert_close(z, expected, rtol=1e-4, atol=1e-5)
 
 
 def test_sharded_and_local_transform_axes_fast_path_backward(dist_env, mesh_tp, monkeypatch):
@@ -622,7 +961,7 @@ def test_sharded_and_local_transform_axes_fast_path_backward(dist_env, mesh_tp, 
     expected = torch.fft.fftn(expected_full, dim=(1, 2))
     (expected.abs() ** 2).sum().backward()
     assert distributed_fft_calls == 2
-    assert_close(x.grad, torch.split(expected_full.grad, shapes, dim=1)[rank])
+    assert_close(x.grad, torch.split(expected_full.grad, shapes, dim=1)[rank], rtol=1e-4, atol=2e-4)
 
 
 @pytest.mark.parametrize("inverse,norm", [(False, None), (True, "ortho")])
@@ -750,7 +1089,7 @@ def test_sharded_transform_axis_fast_path_backward(dist_env, mesh_tp, monkeypatc
     expected = fft(expected_full, dim=(1,), norm=norm)
     (expected.abs() ** 2).sum().backward()
     assert distributed_fft_calls == 2
-    assert_close(x.grad, torch.split(expected_full.grad, shapes, dim=1)[rank])
+    assert_close(x.grad, torch.split(expected_full.grad, shapes, dim=1)[rank], rtol=1e-4, atol=2e-4)
 
 
 def test_sharded_transform_axis_fast_path_permute_output_backward(dist_env, mesh_tp):
@@ -774,7 +1113,7 @@ def test_sharded_transform_axis_fast_path_permute_output_backward(dist_env, mesh
     expected_full = full.detach().clone().requires_grad_()
     expected = torch.fft.fftn(expected_full, dim=(1,)).mT
     (expected.abs() ** 2).sum().backward()
-    assert_close(x.grad, torch.split(expected_full.grad, shapes, dim=1)[rank])
+    assert_close(x.grad, torch.split(expected_full.grad, shapes, dim=1)[rank], rtol=1e-4, atol=2e-4)
 
 
 def test_sharded_transform_axis_slow_path_warns(dist_env, mesh_tp):

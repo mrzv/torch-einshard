@@ -98,6 +98,107 @@ def _all_to_all_same_shape(input, group, build_send, build_output):
     return output.contiguous()
 
 
+def _starts(shapes):
+    result = []
+    offset = 0
+    for shape in shapes:
+        result.append(offset)
+        offset += shape
+    return result
+
+
+def _owner(starts, shapes, index):
+    for rank, (start, shape) in enumerate(zip(starts, shapes)):
+        if start <= index < start + shape:
+            return rank
+    raise ValueError(f"Global index {index} is outside the sharded axis")
+
+
+def _empty_axis_like(input, dim, size):
+    shape = list(input.shape)
+    shape[dim] = size
+    return torch.empty(*shape, dtype=input.dtype, device=input.device)
+
+
+def _prefix_repartition_no_autograd(input, group, dim, source_shapes, dest_shapes):
+    rank = dist.get_rank(group)
+    size = dist.get_world_size(group)
+    source_starts = _starts(source_shapes)
+    dest_starts = _starts(dest_shapes)
+    source_start = source_starts[rank]
+    dest_start = dest_starts[rank]
+    source_end = source_start + source_shapes[rank]
+    dest_end = dest_start + dest_shapes[rank]
+    source_total = sum(source_shapes)
+
+    z = input.movedim(dim, -1).contiguous()
+    batch_shape = z.shape[:-1]
+    z = z.reshape(-1, source_shapes[rank])
+    batch = z.shape[0]
+
+    send_chunks = []
+    send_split_sizes = []
+    recv_lengths = []
+    recv_offsets = []
+    recv_split_sizes = []
+
+    for peer in range(size):
+        peer_start = dest_starts[peer]
+        peer_end = peer_start + dest_shapes[peer]
+        start = max(source_start, peer_start)
+        end = min(source_end, peer_end, source_total)
+        length = max(0, end - start)
+        send_chunks.append(z[:, start - source_start:start - source_start + length].reshape(-1))
+        send_split_sizes.append(batch * length)
+
+    for peer in range(size):
+        peer_start = source_starts[peer]
+        peer_end = peer_start + source_shapes[peer]
+        start = max(dest_start, peer_start)
+        end = min(dest_end, peer_end, source_total)
+        length = max(0, end - start)
+        recv_lengths.append(length)
+        recv_offsets.append(start - dest_start)
+        recv_split_sizes.append(batch * length)
+
+    send = torch.cat(send_chunks) if send_chunks else z.new_empty(0)
+    recv = z.new_empty(sum(recv_split_sizes))
+    dist.all_to_all_single(recv, send, recv_split_sizes, send_split_sizes, group=group)
+
+    output = z.new_zeros(batch, dest_shapes[rank])
+    offset = 0
+    for length, recv_offset, split_size in zip(recv_lengths, recv_offsets, recv_split_sizes):
+        if split_size:
+            output[:, recv_offset:recv_offset + length].copy_(recv[offset:offset + split_size].reshape(batch, length))
+        offset += split_size
+    return output.reshape(*batch_shape, dest_shapes[rank]).movedim(-1, dim).contiguous()
+
+
+class _PrefixRepartition(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, input, group, dim, source_shapes, dest_shapes):
+        ctx.group = group
+        ctx.dim = dim
+        ctx.source_shapes = source_shapes
+        ctx.dest_shapes = dest_shapes
+        return _prefix_repartition_no_autograd(input, group, dim, source_shapes, dest_shapes)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        grad_input = _prefix_repartition_no_autograd(
+            grad_output,
+            ctx.group,
+            ctx.dim,
+            ctx.dest_shapes,
+            ctx.source_shapes,
+        )
+        return grad_input, None, None, None, None
+
+
+def _prefix_repartition(input, group, dim, source_shapes, dest_shapes):
+    return _PrefixRepartition.apply(input, group, dim, source_shapes, dest_shapes)
+
+
 def _fft_unscaled(input, *, dim, inverse):
     if inverse:
         return torch.fft.ifft(input, dim=dim) * input.shape[dim]
@@ -296,7 +397,54 @@ def _apply_fast_fft_plan(z, current_axes, output_by_name, plan, *, inverse, norm
 def _fast_real_fft_plan(x, transform_axes, input_by_name, output_by_name, input_axes, shapes, mesh, *, inverse, signal_sizes):
     half_source = next(reversed(transform_axes))
     half_target = transform_axes[half_source]
-    if not input_by_name[half_source].local() or not output_by_name[half_target].local():
+    half_input = input_by_name[half_source]
+    half_output = output_by_name[half_target]
+    if not inverse and not half_input.local() and not half_output.local() and half_input.shard_dim == half_output.shard_dim:
+        if not _is_supported_real_fft_input(x):
+            return None
+        if mesh is None:
+            return None
+        comm = _group(mesh, half_input.shard_dim)
+        full_shapes = resolve_split_shapes(shapes, half_input.shard_dim, half_input.name, comm)
+        size = dist.get_world_size(comm)
+        rank = dist.get_rank(comm)
+        dim = _axis_dim(input_axes, half_source)
+        if full_shapes is None:
+            full_shapes = [x.shape[dim]] * size
+        if len(set(full_shapes)) != 1:
+            return None
+        local_size = full_shapes[rank]
+        if x.shape[dim] != local_size or local_size % size != 0:
+            return None
+        global_size = sum(full_shapes)
+        half_shapes = resolve_split_shapes(shapes, half_output.shard_dim, half_output.name, comm)
+        if half_shapes is None:
+            return None
+        if sum(half_shapes) != global_size // 2 + 1:
+            return None
+
+        complex_axes = {source: target for source, target in transform_axes.items() if source != half_source}
+        if any(output_by_name[target].shard_dim == half_output.shard_dim for target in complex_axes.values()):
+            return None
+        complex_plan = []
+        if complex_axes:
+            complex_plan = _fast_fft_plan(
+                x,
+                complex_axes,
+                input_by_name,
+                output_by_name,
+                input_axes,
+                shapes,
+                mesh,
+                require_complex=False,
+            )
+            if complex_plan is None:
+                return None
+        return ("sharded_half_forward", half_source, half_target, dim, global_size, comm, full_shapes, half_shapes, complex_plan)
+
+    if not half_input.local() or not half_output.local():
+        return None
+    if not inverse and not _is_supported_real_fft_input(x):
         return None
 
     complex_axes = {source: target for source, target in transform_axes.items() if source != half_source}
@@ -331,6 +479,16 @@ def _fast_real_fft_plan(x, transform_axes, input_by_name, output_by_name, input_
     return plan
 
 
+def _complex_dtype(dtype):
+    if dtype in (torch.float64, torch.complex128):
+        return torch.complex128
+    return torch.complex64
+
+
+def _is_supported_real_fft_input(x):
+    return x.dtype in (torch.float32, torch.float64)
+
+
 def _apply_fast_real_fft_plan(
     z,
     current_axes,
@@ -344,6 +502,29 @@ def _apply_fast_real_fft_plan(
 ):
     half_source = next(reversed(transform_axes))
     half_target = transform_axes[half_source]
+    if isinstance(plan, tuple) and plan[0] == "sharded_half_forward":
+        _, _, _, half_dim, half_full_size, comm, full_shapes, half_shapes, complex_plan = plan
+        total_size = half_full_size
+        for item in complex_plan:
+            total_size *= item[4]
+
+        z = z.to(_complex_dtype(z.dtype))
+        z = _distributed_fft_1d(z, comm, half_dim, full_shapes, inverse=False, norm=None)
+        z = _prefix_repartition(z, comm, half_dim, full_shapes, half_shapes)
+        current_axes[half_dim] = Axis(half_target, output_by_name[half_target].shard_dim)
+
+        for item in complex_plan:
+            if item[0] == "local":
+                _, source, target, dim, _ = item
+                z = _fft_unscaled(z, dim=dim, inverse=False)
+                current_axes[dim] = Axis(target)
+            else:
+                _, source, target, dim, _, axis_comm, split_shapes = item
+                z = _distributed_fft_1d(z, axis_comm, dim, split_shapes, inverse=False, norm=None)
+                current_axes[dim] = Axis(target, output_by_name[target].shard_dim)
+
+        return _apply_fft_norm(z, n=total_size, inverse=False, norm=norm)
+
     sizes = _real_signal_sizes(transform_axes, current_axes, z, signal_sizes) if inverse else None
     half_size = sizes[-1] if inverse else None
     plan_sizes = {item[1]: item[4] for item in plan}
@@ -394,6 +575,96 @@ def _warn_slow_path():
     )
 
 
+def _fast_path_name(fast_path, *, real):
+    if fast_path is None:
+        return "fallback"
+    if real and isinstance(fast_path, tuple) and fast_path[0] == "sharded_half_forward":
+        return "distributed-rfft-sharded-half"
+    if real:
+        return "distributed-rfft-local-half"
+    return "distributed-fftn"
+
+
+def _fallback_reason(x, transform_axes, input_by_name, output_by_name, input_axes, shapes, mesh, *, real, inverse, signal_sizes):
+    if real:
+        half_source = next(reversed(transform_axes))
+        half_target = transform_axes[half_source]
+        half_input = input_by_name[half_source]
+        half_output = output_by_name[half_target]
+        if not inverse and not _is_supported_real_fft_input(x):
+            return "forward real FFT fast path requires float32 or float64 input"
+        if inverse and (not half_input.local() or not half_output.local()):
+            return "inverse real FFT with a sharded half-spectrum axis is not optimized yet"
+        if half_input.local() != half_output.local():
+            return "real FFT half-spectrum axis must be local on both sides or sharded on the same mesh dimension"
+        if not half_input.local() and half_input.shard_dim != half_output.shard_dim:
+            return "real FFT half-spectrum axis must stay on the same mesh dimension"
+        if inverse and signal_sizes is not None and isinstance(signal_sizes, Mapping):
+            for source, target in list(transform_axes.items())[:-1]:
+                requested_size = signal_sizes.get(target, signal_sizes.get(source))
+                if requested_size is not None:
+                    dim = _axis_dim(input_axes, source)
+                    actual_size = None
+                    if input_by_name[source].local():
+                        actual_size = x.shape[dim]
+                    elif mesh is not None:
+                        axis = input_by_name[source]
+                        comm = _group(mesh, axis.shard_dim)
+                        split_shapes = resolve_split_shapes(shapes, axis.shard_dim, axis.name, comm)
+                        if split_shapes is not None:
+                            actual_size = sum(split_shapes)
+                        else:
+                            actual_size = x.shape[dim] * dist.get_world_size(comm)
+                    if actual_size is not None and requested_size != actual_size:
+                        return "inverse real FFT non-half-axis signal_sizes request padding or cropping"
+    if mesh is None and any(not input_by_name[source].local() or not output_by_name[target].local() for source, target in transform_axes.items()):
+        return "distributed FFT layouts require mesh"
+    if not real and not torch.is_complex(x):
+        return "complex FFT fast path requires complex input"
+    for source, target in transform_axes.items():
+        input_axis = input_by_name[source]
+        output_axis = output_by_name[target]
+        if not input_axis.local() and output_axis.local():
+            return "sharded transform axes must stay sharded for the fast path"
+        if input_axis.local() and not output_axis.local():
+            return "local transform axes cannot become sharded in the fast path"
+        if not input_axis.local() and input_axis.shard_dim != output_axis.shard_dim:
+            return "sharded transform axes must stay on the same mesh dimension"
+        if not input_axis.local() and mesh is not None:
+            comm = _group(mesh, input_axis.shard_dim)
+            split_shapes = resolve_split_shapes(shapes, input_axis.shard_dim, input_axis.name, comm)
+            if split_shapes is not None:
+                rank = dist.get_rank(comm)
+                if len(set(split_shapes)) != 1:
+                    return "fast path requires equal shard sizes"
+                if split_shapes[rank] % dist.get_world_size(comm) != 0:
+                    return "fast path requires local shard size divisible by mesh size"
+    return "layout is not supported by an optimized FFT path"
+
+
+def _shared_transform_mesh_dim_reason(transform_axes, input_by_name, output_by_name):
+    for source, target in transform_axes.items():
+        axis = input_by_name[source]
+        if axis.local():
+            axis = output_by_name[target]
+        if not axis.local():
+            for other_name, other_axis in input_by_name.items():
+                if other_name == source or other_axis.local():
+                    continue
+                if other_axis.shard_dim == axis.shard_dim:
+                    return "einfft transform axes cannot share a mesh dimension with another input or output axis"
+
+        output_axis = output_by_name[target]
+        if output_axis.local():
+            continue
+        for other_name, other_axis in output_by_name.items():
+            if other_name == target or other_axis.local():
+                continue
+            if other_axis.shard_dim == output_axis.shard_dim:
+                return "einfft transform axes cannot share a mesh dimension with another input or output axis"
+    return None
+
+
 def _real_signal_sizes(transform_axes, current_axes, x, signal_sizes):
     if signal_sizes is None:
         signal_sizes = {}
@@ -431,6 +702,7 @@ def einfft(
     families=None,
     real=False,
     signal_sizes=None,
+    explain=False,
 ):
     """Apply a named-axis FFT with sharding-aware gather/split fallback."""
     shard, _ = cached_expand_axis_families(shard, families=families)
@@ -448,6 +720,16 @@ def einfft(
         raise ValueError("Input and output specs must have the same rank")
 
     if not transform_axes:
+        if sorted(input_names) != sorted(output_names):
+            raise ValueError("Output axes must match input axes when no FFT axes are requested")
+        if explain:
+            layout_is_noop = [axis.name for axis in _axes(input_spec)] == output_names and _axes(input_spec) == _axes(output_spec)
+            return {
+                "fast_path": False,
+                "path": "no-op-layout" if layout_is_noop else "layout-only",
+                "reason": "no transform axes requested" if layout_is_noop else "no transform axes requested; only layout changes would run",
+                "axes": {},
+            }
         return distributed_1d((input_spec, None, output_spec), x, mesh=mesh, shapes=shapes)
 
     for source, target in transform_axes.items():
@@ -475,6 +757,17 @@ def einfft(
     current_axes = Axes(Axis(axis.name, axis.shard_dim) for axis in _axes(input_spec))
     z = x
 
+    shared_mesh_reason = _shared_transform_mesh_dim_reason(transform_axes, input_by_name, output_by_name)
+    if shared_mesh_reason is not None:
+        if explain:
+            return {
+                "fast_path": False,
+                "path": "unsupported-layout",
+                "reason": shared_mesh_reason,
+                "axes": dict(transform_axes),
+            }
+        raise NotImplementedError(shared_mesh_reason)
+
     fast_path = None
     if real:
         fast_path = _fast_real_fft_plan(
@@ -499,6 +792,13 @@ def einfft(
             mesh,
         )
     if fast_path is not None:
+        if explain:
+            return {
+                "fast_path": True,
+                "path": _fast_path_name(fast_path, real=real),
+                "reason": None,
+                "axes": dict(transform_axes),
+            }
         if real:
             z = _apply_fast_real_fft_plan(
                 z,
@@ -516,6 +816,25 @@ def einfft(
         if [axis.name for axis in current_axes] == output_names and current_axes == _axes(output_spec):
             return z
         return distributed_1d((current_spec, None, output_spec), z, mesh=mesh, shapes=shapes)
+
+    if explain:
+        return {
+            "fast_path": False,
+            "path": "fallback",
+            "reason": _fallback_reason(
+                z,
+                transform_axes,
+                input_by_name,
+                output_by_name,
+                current_axes,
+                shapes,
+                mesh,
+                real=real,
+                inverse=inverse,
+                signal_sizes=signal_sizes,
+            ),
+            "axes": dict(transform_axes),
+        }
 
     if any(
         not input_by_name[source].local() or (real and not output_by_name[target].local())

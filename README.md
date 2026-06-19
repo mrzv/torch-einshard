@@ -189,7 +189,7 @@ x = es.einfft(
 
 `signal_sizes` is only needed for inverse real FFTs when the original length cannot be inferred from the half-spectrum size, such as odd-length signals.
 
-Sharded transform axes are supported. The optimized path handles complex-to-complex FFTs when each sharded transform axis stays on the same mesh dimension with equal shard sizes and local shard size divisible by the mesh size. Multiple sharded transform axes are supported when they use distinct mesh dimensions. Real FFTs also have an optimized path when the half-spectrum axis is local and any sharded transform axes are full-complex axes that satisfy the same constraints. The optimized path uses a distributed Cooley-Tukey decomposition with all-to-all transposes and local factor FFTs.
+Sharded transform axes are supported. The optimized path handles complex-to-complex FFTs when each sharded transform axis stays on the same mesh dimension with equal shard sizes and local shard size divisible by the mesh size. Multiple sharded transform axes are supported when they use distinct mesh dimensions. A sharded transform axis cannot share its mesh dimension with another input or output axis. Forward real FFT fast paths require real `float32` or `float64` input; inverse real fast paths take complex half-spectrum input. Real FFTs are optimized when the half-spectrum axis is local and any sharded transform axes are full-complex axes that satisfy the same constraints, or for forward `rfftn` when the half-spectrum axis itself stays sharded on the same mesh dimension. The optimized path uses a distributed Cooley-Tukey decomposition with all-to-all transposes and local factor FFTs.
 
 ```python
 z = es.einfft(
@@ -207,9 +207,31 @@ z = es.einfft(
     mesh=mesh,
     shapes={"tp": {"x": x_shapes, "kx": x_shapes}},
 )
+z = es.einfft(
+    "b x/tp -> b k/tp",
+    x_real_shard,
+    axes={"x": "k"},
+    real=True,
+    mesh=mesh,
+    shapes={"tp": {"x": x_shapes, "k": k_half_shapes}},
+)
 ```
 
-Inverse real fast paths require any specified non-half-axis `signal_sizes` to match the current global axis sizes; padding or cropping those axes falls back. Unsupported sharded transform layouts, including real FFTs where the half-spectrum axis is sharded, fall back to gather the full transform axis, run the local FFT, then split the output frequency axis if requested. That path emits a `RuntimeWarning` because it materializes the full transform axis on every rank. Non-FFT axes must preserve their sharding. `einfft` currently supports explicit named axes; it does not support ellipsis axes, factored axes, or partial tensor specs.
+Use `explain=True` to inspect whether a layout will use an optimized path without running the FFT:
+
+```python
+info = es.einfft(
+    "b x/tp -> b k/tp",
+    x_real_shard,
+    axes={"x": "k"},
+    real=True,
+    mesh=mesh,
+    shapes={"tp": {"x": x_shapes, "k": k_half_shapes}},
+    explain=True,
+)
+```
+
+Inverse real fast paths require any specified non-half-axis `signal_sizes` to match the current global axis sizes; padding or cropping those axes falls back. Inverse real FFTs where the half-spectrum axis is sharded are not optimized yet. Unsupported sharded transform layouts fall back to gather the full transform axis, run the local FFT, then split the output frequency axis if requested. That path emits a `RuntimeWarning` because it materializes the full transform axis on every rank. Non-FFT axes must preserve their sharding. `einfft` currently supports explicit named axes; it does not support ellipsis axes, factored axes, or partial tensor specs.
 
 ## Supported Distributed Unary Patterns
 
