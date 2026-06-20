@@ -4,6 +4,7 @@ from torch_einshard.grammar import parse_sharding
 from torch_einshard.symbolic import (
     ExecutionPlan,
     TensorState,
+    build_unary_transition_plan,
     classify_binary,
     classify_unary,
     last_plan,
@@ -76,6 +77,45 @@ def test_unary_classification_rejects_axis_mismatch():
 
     with pytest.raises(ValueError, match="axes must match"):
         classify_unary(x, z)
+
+
+def test_unary_transition_plan_splits_and_gathers():
+    x, _, z = parse_sharding("a b -> a/dp b")
+    assert build_unary_transition_plan(x, z).names() == ["split_forward_allgather_backward"]
+
+    x, _, z = parse_sharding("a/dp b -> a b")
+    assert build_unary_transition_plan(x, z).names() == ["allgather_forward_split_backward"]
+
+
+def test_unary_transition_plan_handles_partials_before_layout_changes():
+    x, _, z = parse_sharding("a b // tp -> a/tp b")
+
+    plan = build_unary_transition_plan(x, z)
+
+    assert [(step.name, step.args) for step in plan.steps] == [
+        ("reducescatter_forward_allgather_backward", ("a", "tp")),
+    ]
+
+
+def test_unary_transition_plan_uses_reduce_scatter_backward_for_output_partial():
+    x, _, z = parse_sharding("a/tp b -> a b // tp")
+
+    plan = build_unary_transition_plan(x, z)
+
+    assert [(step.name, step.args) for step in plan.steps] == [
+        ("allgather_forward_reducescatter_backward", ("a", "tp")),
+    ]
+
+
+def test_unary_transition_plan_adds_partials_and_permutation():
+    x, _, z = parse_sharding("b a -> a b // dp")
+
+    plan = build_unary_transition_plan(x, z)
+
+    assert [(step.name, step.args) for step in plan.steps] == [
+        ("identity_forward_allreduce_backward", ("dp",)),
+        ("permute", (("a", "b"),)),
+    ]
 
 
 def test_binary_classification_separates_axis_roles():

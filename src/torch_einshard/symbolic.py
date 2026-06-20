@@ -94,6 +94,15 @@ class BinaryClassification:
 
 
 @dataclass(frozen=True)
+class UnaryTransitionPlan:
+    classification: UnaryClassification
+    steps: tuple
+
+    def names(self):
+        return [step.name for step in self.steps]
+
+
+@dataclass(frozen=True)
 class PlanStep:
     name: str
     args: tuple = ()
@@ -151,6 +160,58 @@ def classify_unary(input_spec, output_spec):
         removed_partials=tuple(partial for partial in input_state.partials if partial not in output_state.partials),
         added_partials=tuple(partial for partial in output_state.partials if partial not in input_state.partials),
     )
+
+
+def build_unary_transition_plan(input_spec, output_spec):
+    classification = classify_unary(input_spec, output_spec)
+    input_state = classification.input_state
+    output_state = classification.output_state
+    current_placements = input_state.placement_dict()
+    current_partials = list(input_state.partials)
+    steps = []
+
+    for partial in classification.removed_partials:
+        scatter_axis = None
+        for axis in output_state.axes:
+            if input_state.placement(axis.name) is None and output_state.placement(axis.name) == partial:
+                scatter_axis = axis
+                break
+
+        if scatter_axis is None:
+            steps.append(PlanStep("allreduce_forward_identity_backward", (partial,)))
+        else:
+            steps.append(PlanStep("reducescatter_forward_allgather_backward", (scatter_axis.name, partial)))
+            current_placements[scatter_axis.name] = partial
+        current_partials.remove(partial)
+
+    for axis in output_state.axes:
+        source = current_placements[axis.name]
+        target = output_state.placement(axis.name)
+        if source == target:
+            continue
+        if source is None:
+            steps.append(PlanStep("split_forward_allgather_backward", (axis.name, target)))
+        elif target is None:
+            if source in output_state.partials:
+                steps.append(PlanStep("allgather_forward_reducescatter_backward", (axis.name, source)))
+                current_partials.append(source)
+            else:
+                steps.append(PlanStep("allgather_forward_split_backward", (axis.name, source)))
+        else:
+            steps.append(PlanStep("allgather_forward_split_backward", (axis.name, source)))
+            steps.append(PlanStep("split_forward_allgather_backward", (axis.name, target)))
+        current_placements[axis.name] = target
+
+    for partial in classification.added_partials:
+        if partial in current_partials:
+            continue
+        steps.append(PlanStep("identity_forward_allreduce_backward", (partial,)))
+        current_partials.append(partial)
+
+    if tuple(axis.name for axis in input_state.axes) != tuple(axis.name for axis in output_state.axes):
+        steps.append(PlanStep("permute", (tuple(axis.name for axis in output_state.axes),)))
+
+    return UnaryTransitionPlan(classification, tuple(steps))
 
 
 def classify_binary(input0_spec, input1_spec, output_spec):
