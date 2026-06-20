@@ -357,6 +357,8 @@ The remaining pre-Phase-6 work is to make optimized candidates explicit in the s
 
 Phase 6 should not start until the candidate/validation boundary is explicit and the broad distributed suite has been run against the planner-driven implementation.
 
+Verification note: after candidate/validation tracing was added, focused symbolic/local tests and targeted distributed unary/binary suites passed. A broad `./run_tests.sh -x` run stopped on an intermittent numerical tolerance failure in `tests/test_distributed_binary.py::test_binary_reduce_scatters_contraction_to_output_axis` (`2.27e-6` absolute difference with `1e-6` tolerance); an immediate targeted rerun of that test passed on all ranks.
+
 ### Phase 0: Behavior Matrix
 
 - Inventory current supported cases from the distributed unary and binary tests.
