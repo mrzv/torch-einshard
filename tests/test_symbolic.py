@@ -3,6 +3,7 @@ import pytest
 from torch_einshard.grammar import parse_sharding
 from torch_einshard.symbolic import (
     ExecutionPlan,
+    PlanPolicy,
     TensorRuntimeInfo,
     TensorState,
     build_binary_transition_plan,
@@ -11,11 +12,17 @@ from torch_einshard.symbolic import (
     classify_unary,
     clear_plan_cache,
     estimate_alternative_cost,
+    estimate_plan_cost,
     last_alternatives,
     last_candidates,
     last_plan,
     local_axis,
+    get_default_policy,
+    get_optimization_policy,
+    optimize,
     rank_alternatives,
+    resolve_plan_policy,
+    set_default_policy,
     set_last_plan,
     sharded_axis,
     tensor_spec,
@@ -237,8 +244,8 @@ def test_runtime_cost_estimate_uses_combined_forward_backward_bytes():
     input1 = TensorRuntimeInfo(tuple(y.axes), (4, 6), 4)
     output = TensorRuntimeInfo(tuple(z.axes), (8, 6), 4)
 
-    default_cost = estimate_alternative_cost(default, input0, input1, output, {"tp": 2})
-    expanded_cost = estimate_alternative_cost(expanded, input0, input1, output, {"tp": 2})
+    default_cost = estimate_alternative_cost(default, input0, input1, output, {"tp": 2}, policy=PlanPolicy.from_mode("training"))
+    expanded_cost = estimate_alternative_cost(expanded, input0, input1, output, {"tp": 2}, policy=PlanPolicy.from_mode("training"))
 
     assert default_cost.total_bytes == default_cost.forward_bytes + default_cost.backward_bytes
     assert default_cost.total_bytes < expanded_cost.total_bytes
@@ -260,11 +267,62 @@ def test_runtime_cost_estimate_scales_with_dtype_size():
         TensorRuntimeInfo(tuple(z.axes), (8, 6), 8),
     )
 
-    small_cost = estimate_alternative_cost(alternative, *small_dtype, mesh_sizes={"tp": 2})
-    large_cost = estimate_alternative_cost(alternative, *large_dtype, mesh_sizes={"tp": 2})
+    small_cost = estimate_alternative_cost(alternative, *small_dtype, mesh_sizes={"tp": 2}, policy=False)
+    large_cost = estimate_alternative_cost(alternative, *large_dtype, mesh_sizes={"tp": 2}, policy=False)
+    large_training_cost = estimate_alternative_cost(
+        alternative,
+        *large_dtype,
+        mesh_sizes={"tp": 2},
+        policy=PlanPolicy.from_mode("training"),
+    )
 
     assert large_cost.total_bytes == small_cost.total_bytes * 4
-    assert alternative.cost.score < large_cost.score
+    assert alternative.cost.score == large_cost.score
+    assert alternative.cost.score < large_training_cost.score
+
+
+def test_runtime_cost_estimate_uses_scoped_policy_by_default():
+    x, y, z = parse_sharding("a b/tp, b c -> a/tp c")
+    plan = build_binary_transition_plan(x, y, z)
+    default = next(alternative for alternative in plan.alternatives if alternative.name == "default")
+    args = (
+        default,
+        TensorRuntimeInfo(tuple(x.axes), (8, 4), 4),
+        TensorRuntimeInfo(tuple(y.axes), (4, 6), 4),
+        TensorRuntimeInfo(tuple(z.axes), (8, 6), 4),
+    )
+
+    set_default_policy("communication")
+    try:
+        default_policy_cost = estimate_alternative_cost(*args, mesh_sizes={"tp": 2})
+    finally:
+        set_default_policy(None)
+    explicit_training_cost = estimate_alternative_cost(
+        *args,
+        mesh_sizes={"tp": 2},
+        policy=PlanPolicy.from_mode("training"),
+    )
+
+    assert default_policy_cost.score != explicit_training_cost.score
+
+
+def test_runtime_cost_estimate_accepts_named_policy_modes():
+    x, y, z = parse_sharding("a b/tp, b c -> a/tp c")
+    plan = build_binary_transition_plan(x, y, z)
+    default = next(alternative for alternative in plan.alternatives if alternative.name == "default")
+    args = (
+        default,
+        TensorRuntimeInfo(tuple(x.axes), (8, 4), 4),
+        TensorRuntimeInfo(tuple(y.axes), (4, 6), 4),
+        TensorRuntimeInfo(tuple(z.axes), (8, 6), 4),
+    )
+
+    memory_cost = estimate_alternative_cost(*args, mesh_sizes={"tp": 2}, policy="memory")
+    communication_cost = estimate_alternative_cost(*args, mesh_sizes={"tp": 2}, policy="communication")
+    plan_cost = estimate_plan_cost(default.output_steps, args[3], mesh_sizes={"tp": 2}, policy="memory")
+
+    assert memory_cost.score != communication_cost.score
+    assert plan_cost.score > default.cost.score
 
 
 def test_runtime_ranking_leaves_alltoall_sets_static():
@@ -296,6 +354,67 @@ def test_runtime_ranking_keeps_reduce_scatter_before_allreduce_split():
 
     assert [alternative.name for alternative in ranked] == ["default", "allreduce_then_split"]
     assert ranked[0].cost.total_bytes < ranked[1].cost.total_bytes
+
+
+def test_named_policy_modes_are_resolved():
+    assert resolve_plan_policy(optimize="training").mode == "training"
+    assert resolve_plan_policy(optimize="memory").mode == "memory"
+    assert resolve_plan_policy(optimize="communication").mode == "communication"
+
+    with pytest.raises(ValueError, match="Unknown optimization policy"):
+        resolve_plan_policy(optimize="unknown")
+
+
+def test_policy_argument_takes_explicit_policy_and_rejects_ambiguous_optimize():
+    policy = PlanPolicy.from_mode("latency")
+
+    assert resolve_plan_policy(policy=policy) is policy
+    with pytest.raises(ValueError, match="either optimize or policy"):
+        resolve_plan_policy(optimize="memory", policy=policy)
+
+
+def test_default_and_scoped_policy_precedence():
+    set_default_policy(None)
+    assert get_default_policy().mode == "training"
+    assert get_optimization_policy().mode == "training"
+
+    set_default_policy("communication")
+    try:
+        assert get_default_policy().mode == "communication"
+        assert get_optimization_policy().mode == "communication"
+
+        with optimize("memory"):
+            assert get_optimization_policy().mode == "memory"
+            assert resolve_plan_policy().mode == "memory"
+            assert resolve_plan_policy(optimize="latency").mode == "latency"
+            explicit = PlanPolicy.from_mode("inference")
+            assert resolve_plan_policy(policy=explicit) is explicit
+
+            with optimize("training"):
+                assert get_optimization_policy().mode == "training"
+
+            assert get_optimization_policy().mode == "memory"
+
+        assert get_optimization_policy().mode == "communication"
+    finally:
+        set_default_policy(None)
+
+
+def test_policy_modes_change_runtime_scores_for_safe_alternatives():
+    x, y, z = parse_sharding("a b/tp, b c -> a/tp c")
+    plan = build_binary_transition_plan(x, y, z)
+    args = (
+        plan.alternatives,
+        TensorRuntimeInfo(tuple(x.axes), (64, 32), 4),
+        TensorRuntimeInfo(tuple(y.axes), (32, 48), 4),
+        TensorRuntimeInfo(tuple(z.axes), (64, 48), 4),
+    )
+
+    training = rank_alternatives(*args, mesh_sizes={"tp": 4}, policy=PlanPolicy.from_mode("training"))
+    communication = rank_alternatives(*args, mesh_sizes={"tp": 4}, policy=PlanPolicy.from_mode("communication"))
+
+    assert [alternative.name for alternative in training] == [alternative.name for alternative in communication]
+    assert training[0].cost.score != communication[0].cost.score
 
 
 def test_binary_transition_plan_models_owner_swap_atomically():

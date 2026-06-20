@@ -27,6 +27,34 @@ def test_outer():
     torch.testing.assert_close(z, zz)
 
 
+def test_local_einshard_accepts_optimization_policy_arguments():
+    x = torch.randn(3)
+    y = torch.randn(4)
+
+    z = es.einshard('i, j -> i j', x, y, optimize="memory")
+    zz = es.einshard('i, j -> i j', x, y, policy=es.PlanPolicy.from_mode("communication"))
+
+    torch.testing.assert_close(z, torch.einsum('i,j->ij', x, y))
+    torch.testing.assert_close(zz, torch.einsum('i,j->ij', x, y))
+
+
+def test_einshard_rejects_ambiguous_policy_arguments():
+    x = torch.randn(3)
+
+    with pytest.raises(ValueError, match="either optimize or policy"):
+        es.einshard('i -> i', x, optimize="memory", policy=es.PlanPolicy.from_mode("training"))
+
+
+def test_optimize_context_applies_to_existing_call_sites():
+    x = torch.randn(3)
+    y = torch.randn(4)
+
+    with es.optimize("memory"):
+        z = es.einshard('i, j -> i j', x, y)
+
+    torch.testing.assert_close(z, torch.einsum('i,j->ij', x, y))
+
+
 def test_diagonal():
     torch.manual_seed(333)
 

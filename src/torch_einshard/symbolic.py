@@ -1,3 +1,5 @@
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 
 from .sharding import Axis, Axes, EllipsisAxis, TensorSpec
@@ -24,6 +26,8 @@ def require_expanded_axes(spec):
 
 
 _transition_plan_cache = {}
+_context_policy = ContextVar("torch_einshard_plan_policy", default=None)
+_default_policy = None
 
 
 def _spec_cache_key(spec):
@@ -149,6 +153,125 @@ class PlanCost:
     @property
     def total_bytes(self):
         return self.forward_bytes + self.backward_bytes
+
+    def with_score(self, score):
+        return PlanCost(
+            score,
+            self.collectives,
+            self.materializations,
+            self.peak_factor,
+            self.forward_bytes,
+            self.backward_bytes,
+            self.peak_elements,
+            self.materialized_elements,
+            self.requires_shapes,
+            self.invalid_reason,
+        )
+
+
+@dataclass(frozen=True)
+class PlanPolicy:
+    mode: str = "training"
+    forward_byte_weight: int = 1
+    backward_byte_weight: int = 1
+    peak_element_weight: int = 1
+    materialized_element_weight: int = 1
+    collective_weight: int = 100
+    materialization_weight: int = 200
+    base_step_weight: int = 1
+
+    @staticmethod
+    def from_mode(mode):
+        if isinstance(mode, PlanPolicy):
+            return mode
+        if mode is None:
+            return PlanPolicy()
+        if mode == "training":
+            return PlanPolicy(mode="training")
+        if mode == "inference":
+            return PlanPolicy(mode="inference", backward_byte_weight=0)
+        if mode == "memory":
+            return PlanPolicy(
+                mode="memory",
+                forward_byte_weight=1,
+                backward_byte_weight=1,
+                peak_element_weight=64,
+                materialized_element_weight=64,
+                collective_weight=50,
+                materialization_weight=400,
+            )
+        if mode == "communication":
+            return PlanPolicy(
+                mode="communication",
+                forward_byte_weight=8,
+                backward_byte_weight=8,
+                peak_element_weight=1,
+                materialized_element_weight=1,
+                collective_weight=50,
+                materialization_weight=100,
+            )
+        if mode == "latency":
+            return PlanPolicy(
+                mode="latency",
+                forward_byte_weight=1,
+                backward_byte_weight=1,
+                peak_element_weight=1,
+                materialized_element_weight=1,
+                collective_weight=1000,
+                materialization_weight=100,
+            )
+        raise ValueError(f"Unknown optimization policy {mode!r}")
+
+    def score(self, cost):
+        return (
+            cost.score * self.base_step_weight
+            + cost.collectives * self.collective_weight
+            + cost.materializations * self.materialization_weight
+            + (cost.forward_bytes * self.forward_byte_weight + cost.backward_bytes * self.backward_byte_weight) // 1024
+            + (cost.peak_elements * self.peak_element_weight) // 1024
+            + (cost.materialized_elements * self.materialized_element_weight) // 1024
+        )
+
+
+def _coerce_policy(value):
+    return value if isinstance(value, PlanPolicy) else PlanPolicy.from_mode(value)
+
+
+def resolve_plan_policy(optimize=None, policy=None):
+    if optimize is not None and policy is not None:
+        raise ValueError("Pass either optimize or policy, not both")
+    if policy is not None:
+        return _coerce_policy(policy)
+    if optimize is not None:
+        return _coerce_policy(optimize)
+    context_policy = _context_policy.get()
+    if context_policy is not None:
+        return context_policy
+    if _default_policy is not None:
+        return _default_policy
+    return PlanPolicy.from_mode("training")
+
+
+@contextmanager
+def optimize(policy):
+    token = _context_policy.set(_coerce_policy(policy))
+    try:
+        yield
+    finally:
+        _context_policy.reset(token)
+
+
+def set_default_policy(policy):
+    global _default_policy
+    _default_policy = None if policy is None else _coerce_policy(policy)
+
+
+def get_default_policy():
+    return _default_policy if _default_policy is not None else PlanPolicy.from_mode("training")
+
+
+def get_optimization_policy():
+    return resolve_plan_policy()
 
 
 @dataclass(frozen=True)
@@ -544,15 +667,8 @@ def _dynamic_step_cost(step, info, mesh_sizes, split_shapes):
 
     forward_bytes = forward_elements * info.dtype_size
     backward_bytes = backward_elements * info.dtype_size
-    score = (
-        static.score
-        + static.collectives * 100
-        + static.materializations * 200
-        + (forward_bytes + backward_bytes) // 1024
-        + materialized_elements // 1024
-    )
     return PlanCost(
-        score,
+        static.score,
         static.collectives,
         static.materializations,
         static.peak_factor,
@@ -600,25 +716,36 @@ def _combine_costs(costs):
     )
 
 
-def estimate_plan_cost(steps, runtime_info=None, mesh_sizes=None, split_shapes=None):
+def _apply_policy(cost, policy):
+    if policy is False or policy is None:
+        return cost
+    policy = _coerce_policy(policy)
+    return cost.with_score(policy.score(cost))
+
+
+def estimate_plan_cost(steps, runtime_info=None, mesh_sizes=None, split_shapes=None, policy=None):
     costs = []
     info = runtime_info
     for step in steps:
         cost, info = _dynamic_step_cost(step, info, mesh_sizes, split_shapes)
         costs.append(cost)
-    return _combine_costs(costs)
+    if policy is None:
+        policy = resolve_plan_policy() if runtime_info is not None else False
+    return _apply_policy(_combine_costs(costs), policy)
 
 
-def estimate_alternative_cost(alternative, input0_info, input1_info, output_info, mesh_sizes=None, split_shapes=None):
+def estimate_alternative_cost(alternative, input0_info, input1_info, output_info, mesh_sizes=None, split_shapes=None, policy=None):
     costs = [
-        estimate_plan_cost(alternative.input0_steps, input0_info, mesh_sizes, split_shapes),
-        estimate_plan_cost(alternative.input1_steps, input1_info, mesh_sizes, split_shapes),
-        estimate_plan_cost(alternative.output_steps, output_info, mesh_sizes, split_shapes),
+        estimate_plan_cost(alternative.input0_steps, input0_info, mesh_sizes, split_shapes, policy=False),
+        estimate_plan_cost(alternative.input1_steps, input1_info, mesh_sizes, split_shapes, policy=False),
+        estimate_plan_cost(alternative.output_steps, output_info, mesh_sizes, split_shapes, policy=False),
     ]
-    return _combine_costs(costs)
+    if policy is None:
+        policy = resolve_plan_policy()
+    return _apply_policy(_combine_costs(costs), policy)
 
 
-def rank_alternatives(alternatives, input0_info=None, input1_info=None, output_info=None, mesh_sizes=None, split_shapes=None):
+def rank_alternatives(alternatives, input0_info=None, input1_info=None, output_info=None, mesh_sizes=None, split_shapes=None, policy=None):
     # Post-repartition alternatives can have different rank-local einsum output
     # shapes from their fallback. Until the planner carries per-alternative
     # output metadata, keep those rankings static and behavior-preserving.
@@ -626,9 +753,10 @@ def rank_alternatives(alternatives, input0_info=None, input1_info=None, output_i
         return _rank_alternatives(alternatives)
 
     if input0_info is not None and input1_info is not None and output_info is not None:
+        policy = resolve_plan_policy(policy=policy)
         alternatives = tuple(
             alternative.with_cost(
-                estimate_alternative_cost(alternative, input0_info, input1_info, output_info, mesh_sizes, split_shapes)
+                estimate_alternative_cost(alternative, input0_info, input1_info, output_info, mesh_sizes, split_shapes, policy)
             )
             for alternative in alternatives
         )

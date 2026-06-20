@@ -20,6 +20,7 @@ from .symbolic import (
     build_binary_transition_plan,
     build_unary_transition_plan,
     rank_alternatives,
+    resolve_plan_policy,
     set_last_plan,
 )
 
@@ -65,22 +66,23 @@ def augment_parallelism(shard, mesh_dim_names):
     # TODO: add replication
     pass
 
-def distributed_1d(shard, *xs, mesh, shapes):
+def distributed_1d(shard, *xs, mesh, shapes, policy=None):
     if mesh is not None:
         augment_parallelism(shard, mesh.mesh_dim_names)
 
     # X -> Z
     if shard[1] is None:
-        return distributed_1d_1(shard, *xs, mesh, shapes)
+        return distributed_1d_1(shard, *xs, mesh, shapes, policy=policy)
 
     # X,Y -> Z
     elif shard[1] is not None:
-        return distributed_1d_2(shard, *xs, mesh = mesh, shapes = shapes)
+        return distributed_1d_2(shard, *xs, mesh = mesh, shapes = shapes, policy = policy)
     else:
         return NotImplemented       # TODO: maybe raise instead?
 
-def distributed_1d_2(shard, x, y, mesh, shapes = None):
+def distributed_1d_2(shard, x, y, mesh, shapes = None, policy = None):
     plan = ExecutionPlan()
+    policy = resolve_plan_policy(policy=policy)
     original_x = x
     original_y = y
     # TODO: check the dimensions match sharding
@@ -426,6 +428,7 @@ def distributed_1d_2(shard, x, y, mesh, shapes = None):
             runtime_info(local_output_axes, z),
             mesh_sizes(),
             cost_split_shapes(),
+            policy,
         )
         plan.rank(ranked_alternatives, selected="default", reason="fallback selected")
     else:
@@ -556,8 +559,9 @@ def distributed_1d_2(shard, x, y, mesh, shapes = None):
 
     return finish(z)
 
-def distributed_1d_1(shard, x, mesh, shapes = None):
+def distributed_1d_1(shard, x, mesh, shapes = None, policy = None):
     plan = ExecutionPlan()
+    resolve_plan_policy(policy=policy)
     input_spec = shard[0]
     output_spec = shard[2]
     input_axes = _axes(input_spec)

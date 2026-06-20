@@ -23,7 +23,16 @@ from .params import (
 )
 from .roll import einroll
 from .sharding import AxisGroup
-from .symbolic import ExecutionPlan, set_last_plan
+from .symbolic import (
+    ExecutionPlan,
+    PlanPolicy,
+    get_default_policy,
+    get_optimization_policy,
+    optimize,
+    resolve_plan_policy,
+    set_default_policy,
+    set_last_plan,
+)
 
 
 def _axes(spec):
@@ -74,7 +83,8 @@ def local_operation(shard):
 
         return True
 
-def einshard(shard, *xs, mesh = None, shapes = None, sizes = None, families = None):
+def einshard(shard, *xs, mesh = None, shapes = None, sizes = None, families = None, optimize = None, policy = None):
+    policy = resolve_plan_policy(optimize=optimize, policy=policy)
     shard, sizes = cached_expand_axis_families(shard, sizes, families)
     shard = parse_sharding(shard)
 
@@ -91,4 +101,4 @@ def einshard(shard, *xs, mesh = None, shapes = None, sizes = None, families = No
     if mesh is None:
         raise ValueError("Distributed einshard operations require mesh")
 
-    return distributed_1d(shard, *xs, mesh = mesh, shapes = shapes)
+    return distributed_1d(shard, *xs, mesh = mesh, shapes = shapes, policy = policy)
