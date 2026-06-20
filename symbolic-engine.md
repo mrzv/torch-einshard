@@ -420,11 +420,32 @@ Verification note: after candidate/validation tracing was added, focused symboli
 - Keep deterministic tie-breaking for reproducibility.
 - Keep this private until the plan representation stabilizes; do not add a public `compile_einshard` boundary in this phase.
 
+### Phase 7: Cross-Formula Fusion
+
+Fusion is a separate layer above single-formula planning. The symbolic engine makes it feasible by exposing input/output tensor states, primitive effects, alternatives, and costs, but fusion requires visibility across multiple formulas before they execute.
+
+Initial fusion should be conservative and limited to adjacent formulas where the intermediate tensor has a single consumer and does not need to be materialized in its requested layout. Rewrites must preserve the autograd-paired primitive semantics, not just the forward collective shape. The first useful patterns are communication cancellation and partial-preservation rewrites:
+
+- `allgather_forward_split_backward(axis, mesh_dim)` followed by `split_forward_allgather_backward(other_axis, mesh_dim)` can become `alltoall_repartition(axis, other_axis, mesh_dim)` when split metadata validates and the backward mapping remains equivalent.
+- `allreduce_forward_identity_backward(mesh_dim)` followed by `split_forward_allgather_backward(axis, mesh_dim)` can become `reducescatter_forward_allgather_backward(axis, mesh_dim)` when the consumer only needs the sharded result.
+- `split_forward_allgather_backward(axis, mesh_dim)` followed by `allgather_forward_split_backward(axis, mesh_dim)` can be eliminated only when no intervening operation requires the sharded layout and the full-output gradients are rank-equivalent at the fused boundary, so the paired backward behavior remains a no-op.
+- A formula that produces `partial(mesh_dim)` followed by a formula that can legally consume partial inputs may keep the partial and use `reducescatter_forward_allgather_backward(axis, mesh_dim)` at the final sharded output instead of materializing a full intermediate. This is valid only when the final sharded output consumes the same `partial(mesh_dim)` and the consumer does not require the full value before the final reduction.
+
+Fusion needs additional machinery beyond the current `einshard` call boundary:
+
+- A graph, trace, or explicit fused-expression API that submits multiple formulas together.
+- Use/lifetime analysis for intermediate tensors so required materializations are preserved.
+- End-to-end autograd mappings for fused primitive sequences.
+- Shape and memory-aware ranking that compares separate execution against fused execution.
+- Clear fallback behavior when an optimized fused path fails validation.
+
+Cross-formula fusion should not be part of the first symbolic-engine rollout. Treat it as a later optimization phase once private single-formula plans, alternatives, validation, and cost reporting are stable.
+
 ## Non-Goals For The First Version
 
 - No public `compile_einshard` API until internals are stable.
 - No automatic FSDP policy inference.
-- No cross-formula fusion.
+- No cross-formula fusion in the first rollout; it is deferred to Phase 7.
 - No global model-level scheduling.
 - No topology-aware collective modeling beyond mesh dimension sizes.
 - No distributed support for factored axes unless explicitly designed and tested.
