@@ -311,7 +311,9 @@ Initial deterministic priorities:
 - Prefer `owner_swap` over gather/split for pure ownership permutation across equal-sized mesh dimensions with matching split metadata.
 - Penalize fallbacks that materialize full tensors.
 
-Later cost inputs can include tensor shapes, mesh shape, process group sizes, split metadata, dtype, device, memory budget, and whether forward-only or forward-plus-backward cost should be optimized.
+The current private cost model should optimize combined forward-plus-backward training cost by default because the primitive vocabulary is autograd-paired. Cost inputs should include tensor shapes, mesh shape, process group sizes, split metadata, dtype size, materialization pressure, and peak local tensor size.
+
+The scoring formula can stay simple and weighted for now. Later work should make the scoring mode configurable so a caller or higher-level planner can choose alternatives that optimize for memory, communication volume, computation, or forward-only inference instead of the default combined forward/backward training cost.
 
 ## Plan Cache
 
@@ -355,7 +357,7 @@ Phases 0-5 are now implemented as behavior-preserving internal machinery:
 
 The remaining pre-Phase-6 work is to make optimized candidates explicit in the symbolic model. `owner_swap` and same-mesh `alltoall_repartition` are legal symbolic candidates whose final execution still depends on runtime validation: mesh dimension sizes, resolved split-shape metadata, and matching split layouts. The symbolic plan should distinguish fallback steps from candidates that were considered and either accepted or rejected at runtime. `last_plan()` should continue to mean "what actually ran".
 
-Phase 6 is being implemented only as private internals for now. The public compile boundary remains deferred, but the internal planner now has explicit plan alternatives, simple cost estimates, deterministic ranking, runtime selection snapshots, and a private transition-plan cache. Optimized candidates still require runtime validation before their ranked alternative can be selected for execution.
+Phase 6 is being implemented only as private internals for now. The public compile boundary remains deferred, but the internal planner now has explicit plan alternatives, shape/dtype-aware combined forward/backward cost estimates for diagnostic ranking, runtime selection snapshots, and a private transition-plan cache. Optimized candidates still require runtime validation before they can execute, and current execution remains behavior-preserving rather than fully cost-driven. The exact scoring weights are intentionally provisional; later work should expose policy modes for memory, communication, computation, and inference/training preferences.
 
 Verification note: after candidate/validation tracing was added, focused symbolic/local tests and targeted distributed unary/binary suites passed. A broad `./run_tests.sh -x` run stopped on an intermittent numerical tolerance failure in `tests/test_distributed_binary.py::test_binary_reduce_scatters_contraction_to_output_axis` (`2.27e-6` absolute difference with `1e-6` tolerance); an immediate targeted rerun of that test passed on all ranks.
 
@@ -416,7 +418,10 @@ Verification note: after candidate/validation tracing was added, focused symboli
 
 - Represent plans as a small graph of tensor-state transitions.
 - Generate multiple valid plans for ambiguous cases.
-- Rank them with the cost model.
+- Report provisional cost rankings for alternatives that share compatible runtime shape metadata.
+- Use combined forward/backward training cost as the default objective for diagnostic rankings.
+- Defer fully cost-driven selection for alternatives with path-specific intermediate shapes until the planner carries per-alternative runtime metadata.
+- Keep score weights private and provisional until user-selectable policy modes are designed.
 - Keep deterministic tie-breaking for reproducibility.
 - Keep this private until the plan representation stabilizes; do not add a public `compile_einshard` boundary in this phase.
 

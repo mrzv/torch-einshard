@@ -3,16 +3,19 @@ import pytest
 from torch_einshard.grammar import parse_sharding
 from torch_einshard.symbolic import (
     ExecutionPlan,
+    TensorRuntimeInfo,
     TensorState,
     build_binary_transition_plan,
     build_unary_transition_plan,
     classify_binary,
     classify_unary,
     clear_plan_cache,
+    estimate_alternative_cost,
     last_alternatives,
     last_candidates,
     last_plan,
     local_axis,
+    rank_alternatives,
     set_last_plan,
     sharded_axis,
     tensor_spec,
@@ -223,6 +226,76 @@ def test_binary_transition_plan_detects_post_repartition():
         "default",
     ]
     assert plan.alternatives[0].reason == "requires runtime split-shape validation"
+
+
+def test_runtime_cost_estimate_uses_combined_forward_backward_bytes():
+    x, y, z = parse_sharding("a b/tp, b c -> a/tp c")
+    plan = build_binary_transition_plan(x, y, z)
+    default = next(alternative for alternative in plan.alternatives if alternative.name == "default")
+    expanded = next(alternative for alternative in plan.alternatives if alternative.name == "allreduce_then_split")
+    input0 = TensorRuntimeInfo(tuple(x.axes), (8, 4), 4)
+    input1 = TensorRuntimeInfo(tuple(y.axes), (4, 6), 4)
+    output = TensorRuntimeInfo(tuple(z.axes), (8, 6), 4)
+
+    default_cost = estimate_alternative_cost(default, input0, input1, output, {"tp": 2})
+    expanded_cost = estimate_alternative_cost(expanded, input0, input1, output, {"tp": 2})
+
+    assert default_cost.total_bytes == default_cost.forward_bytes + default_cost.backward_bytes
+    assert default_cost.total_bytes < expanded_cost.total_bytes
+    assert default_cost.score < expanded_cost.score
+
+
+def test_runtime_cost_estimate_scales_with_dtype_size():
+    x, y, z = parse_sharding("a/tp b, c d -> a c/tp")
+    plan = build_binary_transition_plan(x, y, z)
+    alternative = next(alternative for alternative in plan.alternatives if alternative.name == "alltoall_repartition")
+    small_dtype = (
+        TensorRuntimeInfo(tuple(x.axes), (4, 5), 2),
+        TensorRuntimeInfo(tuple(y.axes), (6, 7), 2),
+        TensorRuntimeInfo(tuple(z.axes), (8, 6), 2),
+    )
+    large_dtype = (
+        TensorRuntimeInfo(tuple(x.axes), (4, 5), 8),
+        TensorRuntimeInfo(tuple(y.axes), (6, 7), 8),
+        TensorRuntimeInfo(tuple(z.axes), (8, 6), 8),
+    )
+
+    small_cost = estimate_alternative_cost(alternative, *small_dtype, mesh_sizes={"tp": 2})
+    large_cost = estimate_alternative_cost(alternative, *large_dtype, mesh_sizes={"tp": 2})
+
+    assert large_cost.total_bytes == small_cost.total_bytes * 4
+    assert alternative.cost.score < large_cost.score
+
+
+def test_runtime_ranking_leaves_alltoall_sets_static():
+    x, y, z = parse_sharding("a/tp b, c d -> a c/tp")
+    plan = build_binary_transition_plan(x, y, z)
+
+    ranked = rank_alternatives(
+        plan.alternatives,
+        TensorRuntimeInfo(tuple(x.axes), (4, 5), 8),
+        TensorRuntimeInfo(tuple(y.axes), (6, 7), 8),
+        TensorRuntimeInfo(tuple(z.axes), (8, 6), 8),
+        mesh_sizes={"tp": 2},
+    )
+
+    assert ranked == plan.alternatives
+    assert all(alternative.cost.forward_bytes == 0 for alternative in ranked)
+
+
+def test_runtime_ranking_keeps_reduce_scatter_before_allreduce_split():
+    x, y, z = parse_sharding("a b/tp, b c -> a/tp c")
+    plan = build_binary_transition_plan(x, y, z)
+    ranked = rank_alternatives(
+        plan.alternatives,
+        TensorRuntimeInfo(tuple(x.axes), (16, 8), 4),
+        TensorRuntimeInfo(tuple(y.axes), (8, 12), 4),
+        TensorRuntimeInfo(tuple(z.axes), (16, 12), 4),
+        mesh_sizes={"tp": 4},
+    )
+
+    assert [alternative.name for alternative in ranked] == ["default", "allreduce_then_split"]
+    assert ranked[0].cost.total_bytes < ranked[1].cost.total_bytes
 
 
 def test_binary_transition_plan_models_owner_swap_atomically():

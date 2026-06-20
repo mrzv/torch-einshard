@@ -139,6 +139,47 @@ class PlanCost:
     collectives: int = 0
     materializations: int = 0
     peak_factor: int = 1
+    forward_bytes: int = 0
+    backward_bytes: int = 0
+    peak_elements: int = 0
+    materialized_elements: int = 0
+    requires_shapes: bool = False
+    invalid_reason: str = ""
+
+    @property
+    def total_bytes(self):
+        return self.forward_bytes + self.backward_bytes
+
+
+@dataclass(frozen=True)
+class TensorRuntimeInfo:
+    axes: tuple
+    shape: tuple
+    dtype_size: int
+
+    def dim(self, axis_name):
+        for index, axis in enumerate(self.axes):
+            if axis.name == axis_name:
+                return index
+        return None
+
+    def num_elements(self):
+        elements = 1
+        for size in self.shape:
+            elements *= size
+        return elements
+
+    def with_axis_size(self, axis_name, size):
+        dim = self.dim(axis_name)
+        if dim is None:
+            return self
+        shape = list(self.shape)
+        shape[dim] = size
+        return TensorRuntimeInfo(self.axes, tuple(shape), self.dtype_size)
+
+    def with_axis(self, axis_name, replacement):
+        axes = tuple(replacement if axis.name == axis_name else axis for axis in self.axes)
+        return TensorRuntimeInfo(axes, self.shape, self.dtype_size)
 
 
 @dataclass(frozen=True)
@@ -165,6 +206,18 @@ class PlanAlternative:
             self.cost,
             status,
             reason,
+        )
+
+    def with_cost(self, cost):
+        return PlanAlternative(
+            self.name,
+            self.input0_steps,
+            self.input1_steps,
+            self.output_steps,
+            self.candidates,
+            cost,
+            self.status,
+            self.reason,
         )
 
 
@@ -406,23 +459,188 @@ def _step_cost(step):
     return PlanCost(20, collectives=1)
 
 
-def estimate_plan_cost(steps):
+def _axis_size_from_split_shapes(split_shapes, shard_dim, axis_name, direction):
+    axis_shapes = None
+    if split_shapes is not None:
+        axis_shapes = split_shapes.get((shard_dim, axis_name))
+    if axis_shapes is None:
+        return None
+    if direction == "split":
+        return max(axis_shapes)
+    return sum(axis_shapes)
+
+
+def _mesh_size(mesh_sizes, shard_dim):
+    if mesh_sizes is None:
+        return 1
+    return mesh_sizes.get(shard_dim, 1)
+
+
+def _rescale_axis(info, axis_name, shard_dim, mesh_sizes, split_shapes, direction):
+    dim = info.dim(axis_name)
+    if dim is None:
+        return info
+
+    shape_size = _axis_size_from_split_shapes(split_shapes, shard_dim, axis_name, direction)
+    if shape_size is None:
+        if direction == "gather":
+            shape_size = info.shape[dim] * _mesh_size(mesh_sizes, shard_dim)
+        elif direction == "split":
+            mesh_size = max(_mesh_size(mesh_sizes, shard_dim), 1)
+            shape_size = max(1, (info.shape[dim] + mesh_size - 1) // mesh_size)
+        else:
+            shape_size = info.shape[dim]
+    return info.with_axis_size(axis_name, shape_size)
+
+
+def _dynamic_step_cost(step, info, mesh_sizes, split_shapes):
+    static = _step_cost(step)
+    if info is None:
+        return static, info
+
+    before_elements = info.num_elements()
+    after_info = info
+    forward_elements = before_elements
+    backward_elements = before_elements
+    materialized_elements = 0
+    peak_elements = before_elements
+    requires_shapes = False
+
+    if step.name == "rank_local_einsum":
+        return PlanCost(0, peak_elements=before_elements), info
+
+    if step.name in {"split_forward_allgather_backward", "reducescatter_forward_allgather_backward"}:
+        axis_name, shard_dim = step.args
+        after_info = _rescale_axis(info, axis_name, shard_dim, mesh_sizes, split_shapes, "split")
+        forward_elements = before_elements
+        backward_elements = max(before_elements, after_info.num_elements())
+        peak_elements = max(before_elements, after_info.num_elements())
+        after_info = after_info.with_axis(axis_name, Axis(axis_name, shard_dim))
+    elif step.name in {"allgather_forward_split_backward", "allgather_forward_reducescatter_backward"}:
+        axis_name, shard_dim = step.args
+        after_info = _rescale_axis(info, axis_name, shard_dim, mesh_sizes, split_shapes, "gather")
+        after_elements = after_info.num_elements()
+        forward_elements = after_elements
+        backward_elements = after_elements
+        materialized_elements = after_elements
+        peak_elements = max(before_elements, after_elements)
+        after_info = after_info.with_axis(axis_name, Axis(axis_name))
+    elif step.name in {"allreduce_forward_identity_backward", "identity_forward_allreduce_backward"}:
+        forward_elements = before_elements
+        backward_elements = before_elements
+    elif step.name == "alltoall_repartition":
+        source_axis, dest_axis, shard_dim = step.args
+        requires_shapes = True
+        after_info = _rescale_axis(info, source_axis, shard_dim, mesh_sizes, split_shapes, "gather")
+        after_info = _rescale_axis(after_info, dest_axis, shard_dim, mesh_sizes, split_shapes, "split")
+        forward_elements = before_elements
+        backward_elements = max(before_elements, after_info.num_elements())
+        peak_elements = max(before_elements, after_info.num_elements())
+        after_info = after_info.with_axis(source_axis, Axis(source_axis)).with_axis(dest_axis, Axis(dest_axis, shard_dim))
+    elif step.name == "owner_swap":
+        requires_shapes = True
+        forward_elements = before_elements
+        backward_elements = before_elements
+
+    forward_bytes = forward_elements * info.dtype_size
+    backward_bytes = backward_elements * info.dtype_size
+    score = (
+        static.score
+        + static.collectives * 100
+        + static.materializations * 200
+        + (forward_bytes + backward_bytes) // 1024
+        + materialized_elements // 1024
+    )
+    return PlanCost(
+        score,
+        static.collectives,
+        static.materializations,
+        static.peak_factor,
+        forward_bytes,
+        backward_bytes,
+        peak_elements,
+        materialized_elements,
+        requires_shapes,
+    ), after_info
+
+
+def _combine_costs(costs):
     score = 0
     collectives = 0
     materializations = 0
     peak_factor = 1
-    for step in steps:
-        cost = _step_cost(step)
+    forward_bytes = 0
+    backward_bytes = 0
+    peak_elements = 0
+    materialized_elements = 0
+    requires_shapes = False
+    invalid_reason = ""
+    for cost in costs:
         score += cost.score
         collectives += cost.collectives
         materializations += cost.materializations
         peak_factor = max(peak_factor, cost.peak_factor)
-    return PlanCost(score, collectives, materializations, peak_factor)
+        forward_bytes += cost.forward_bytes
+        backward_bytes += cost.backward_bytes
+        peak_elements = max(peak_elements, cost.peak_elements)
+        materialized_elements += cost.materialized_elements
+        requires_shapes = requires_shapes or cost.requires_shapes
+        invalid_reason = invalid_reason or cost.invalid_reason
+    return PlanCost(
+        score,
+        collectives,
+        materializations,
+        peak_factor,
+        forward_bytes,
+        backward_bytes,
+        peak_elements,
+        materialized_elements,
+        requires_shapes,
+        invalid_reason,
+    )
+
+
+def estimate_plan_cost(steps, runtime_info=None, mesh_sizes=None, split_shapes=None):
+    costs = []
+    info = runtime_info
+    for step in steps:
+        cost, info = _dynamic_step_cost(step, info, mesh_sizes, split_shapes)
+        costs.append(cost)
+    return _combine_costs(costs)
+
+
+def estimate_alternative_cost(alternative, input0_info, input1_info, output_info, mesh_sizes=None, split_shapes=None):
+    costs = [
+        estimate_plan_cost(alternative.input0_steps, input0_info, mesh_sizes, split_shapes),
+        estimate_plan_cost(alternative.input1_steps, input1_info, mesh_sizes, split_shapes),
+        estimate_plan_cost(alternative.output_steps, output_info, mesh_sizes, split_shapes),
+    ]
+    return _combine_costs(costs)
+
+
+def rank_alternatives(alternatives, input0_info=None, input1_info=None, output_info=None, mesh_sizes=None, split_shapes=None):
+    # Post-repartition alternatives can have different rank-local einsum output
+    # shapes from their fallback. Until the planner carries per-alternative
+    # output metadata, keep those rankings static and behavior-preserving.
+    if any(alternative.name == "alltoall_repartition" for alternative in alternatives):
+        return _rank_alternatives(alternatives)
+
+    if input0_info is not None and input1_info is not None and output_info is not None:
+        alternatives = tuple(
+            alternative.with_cost(
+                estimate_alternative_cost(alternative, input0_info, input1_info, output_info, mesh_sizes, split_shapes)
+            )
+            for alternative in alternatives
+        )
+    return _rank_alternatives(alternatives)
 
 
 def _rank_alternatives(alternatives):
     return tuple(sorted(alternatives, key=lambda alternative: (
+        bool(alternative.cost.invalid_reason),
         alternative.cost.score,
+        alternative.cost.peak_elements,
+        alternative.cost.total_bytes,
         alternative.cost.materializations,
         alternative.cost.collectives,
         alternative.name,

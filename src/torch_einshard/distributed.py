@@ -13,7 +13,15 @@ from .mappings import allreduce_forward_identity_backward, \
                         owner_swap_forward_backward
 from .helpers import resolve_split_shapes
 from .sharding import Axis, Axes, EllipsisAxis, TensorSpec
-from .symbolic import ExecutionPlan, PlanStep, build_binary_transition_plan, build_unary_transition_plan, set_last_plan
+from .symbolic import (
+    ExecutionPlan,
+    PlanStep,
+    TensorRuntimeInfo,
+    build_binary_transition_plan,
+    build_unary_transition_plan,
+    rank_alternatives,
+    set_last_plan,
+)
 
 
 def _axes(spec):
@@ -73,6 +81,8 @@ def distributed_1d(shard, *xs, mesh, shapes):
 
 def distributed_1d_2(shard, x, y, mesh, shapes = None):
     plan = ExecutionPlan()
+    original_x = x
+    original_y = y
     # TODO: check the dimensions match sharding
 
     input0_spec = shard[0]
@@ -86,6 +96,8 @@ def distributed_1d_2(shard, x, y, mesh, shapes = None):
     input0_axes = _without_ellipsis(_axes(input0_spec))
     input1_axes = _without_ellipsis(_axes(input1_spec))
     output_axes = _without_ellipsis(_axes(output_spec))
+    original_input0_axes = input0_axes
+    original_input1_axes = input1_axes
     transition_plan = build_binary_transition_plan(
         TensorSpec(input0_axes, _partials(input0_spec)),
         TensorSpec(input1_axes, _partials(input1_spec)),
@@ -139,6 +151,29 @@ def distributed_1d_2(shard, x, y, mesh, shapes = None):
 
     def group(shard_dim):
         return mesh[shard_dim].get_group()
+
+    def runtime_info(axes, tensor):
+        return TensorRuntimeInfo(tuple(_without_ellipsis(axes)), tuple(tensor.shape), tensor.element_size())
+
+    def mesh_sizes():
+        return {
+            name: int(mesh.mesh.shape[index])
+            for index, name in enumerate(mesh.mesh_dim_names)
+        }
+
+    def cost_split_shapes():
+        resolved = {}
+        for axes in (original_input0_axes, original_input1_axes, output_axes):
+            for axis in axes:
+                if isinstance(axis, EllipsisAxis) or not axis.shard_dim:
+                    continue
+                try:
+                    axis_shapes = resolve_split_shapes(shapes, axis.shard_dim, axis.name, group(axis.shard_dim))
+                except ValueError:
+                    continue
+                if axis_shapes is not None:
+                    resolved[(axis.shard_dim, axis.name)] = tuple(axis_shapes)
+        return resolved
 
     def dim_of(axes, axis_name, tensor):
         dim = 0
@@ -383,6 +418,22 @@ def distributed_1d_2(shard, x, y, mesh, shapes = None):
     plan.add("rank_local_einsum")
     z = einsum(normalized_shard, x, y)    # perform the local operation
     current_output_axes = local_output_axes
+    if post_repartition is None:
+        ranked_alternatives = rank_alternatives(
+            transition_plan.alternatives,
+            runtime_info(original_input0_axes, original_x),
+            runtime_info(original_input1_axes, original_y),
+            runtime_info(local_output_axes, z),
+            mesh_sizes(),
+            cost_split_shapes(),
+        )
+        plan.rank(ranked_alternatives, selected="default", reason="fallback selected")
+    else:
+        # The optimized all-to-all path has different intermediate shapes from
+        # the fallback. Keep build-time ranking until runtime validation has
+        # chosen the optimized path.
+        ranked_alternatives = transition_plan.alternatives
+        plan.rank(ranked_alternatives)
 
     for step in transition_plan.output_steps:
         if step.name == "rank_local_einsum":
@@ -441,7 +492,7 @@ def distributed_1d_2(shard, x, y, mesh, shapes = None):
         all_ok = torch.tensor(int(local_ok), device=z.device)
         dist.all_reduce(all_ok, op=dist.ReduceOp.MIN, group=comm)
         if not bool(all_ok.item()):
-            plan.rank(transition_plan.alternatives)
+            plan.rank(ranked_alternatives)
             plan.consider(
                 "alltoall_repartition",
                 post_repartition["source_input_axis"].name,
@@ -462,7 +513,7 @@ def distributed_1d_2(shard, x, y, mesh, shapes = None):
             post_repartition["dest_shapes"],
         )
         if result is None:
-            plan.rank(transition_plan.alternatives)
+            plan.rank(ranked_alternatives)
             plan.consider(
                 "alltoall_repartition",
                 post_repartition["source_input_axis"].name,
@@ -475,7 +526,7 @@ def distributed_1d_2(shard, x, y, mesh, shapes = None):
             raise ValueError("Runtime tensor shape does not match alltoall_repartition split metadata")
         z = result
         plan.rank(
-            transition_plan.alternatives,
+            ranked_alternatives,
             selected="alltoall_repartition",
             reason="runtime split-shape validation passed",
         )
