@@ -23,6 +23,18 @@ def require_expanded_axes(spec):
     return Axes(axes)
 
 
+_transition_plan_cache = {}
+
+
+def _spec_cache_key(spec):
+    axes = tuple((axis.name, axis.shard_dim) for axis in require_expanded_axes(spec))
+    return axes, partials_of(spec)
+
+
+def clear_plan_cache():
+    _transition_plan_cache.clear()
+
+
 @dataclass(frozen=True)
 class StateAxis:
     name: str
@@ -122,6 +134,41 @@ class PlanCandidate:
 
 
 @dataclass(frozen=True)
+class PlanCost:
+    score: int
+    collectives: int = 0
+    materializations: int = 0
+    peak_factor: int = 1
+
+
+@dataclass(frozen=True)
+class PlanAlternative:
+    name: str
+    input0_steps: tuple = ()
+    input1_steps: tuple = ()
+    output_steps: tuple = ()
+    candidates: tuple = ()
+    cost: PlanCost = PlanCost(0)
+    status: str = "ranked"
+    reason: str = ""
+
+    def steps(self):
+        return (*self.input0_steps, *self.input1_steps, *self.output_steps)
+
+    def with_result(self, status, reason=""):
+        return PlanAlternative(
+            self.name,
+            self.input0_steps,
+            self.input1_steps,
+            self.output_steps,
+            self.candidates,
+            self.cost,
+            status,
+            reason,
+        )
+
+
+@dataclass(frozen=True)
 class BinaryTransitionPlan:
     classification: BinaryClassification
     input0_steps: tuple
@@ -130,6 +177,8 @@ class BinaryTransitionPlan:
     reduction_dims: tuple
     scatter_output_by_dim: tuple
     candidates: tuple = ()
+    alternatives: tuple = ()
+    top_ranked_alternative: str = ""
     post_repartition: BinaryPostRepartition | None = None
 
     def names(self):
@@ -149,6 +198,7 @@ class ExecutionPlan:
     def __init__(self):
         self.steps = []
         self.candidates = []
+        self.alternatives = []
 
     def add(self, name, *args):
         self.steps.append(PlanStep(name, tuple(args)))
@@ -163,6 +213,12 @@ class ExecutionPlan:
         else:
             self.candidates.append(PlanCandidate(candidate, tuple(args), tuple(fallback_steps), status, reason))
 
+    def rank(self, alternatives, selected=None, reason=""):
+        self.alternatives = [
+            alternative.with_result("selected", reason) if alternative.name == selected else alternative
+            for alternative in alternatives
+        ]
+
     def names(self):
         return [step.name for step in self.steps]
 
@@ -172,12 +228,14 @@ class ExecutionPlan:
 
 _last_plan = ()
 _last_candidates = ()
+_last_alternatives = ()
 
 
 def set_last_plan(plan):
-    global _last_plan, _last_candidates
+    global _last_plan, _last_candidates, _last_alternatives
     _last_plan = tuple(plan.steps if isinstance(plan, ExecutionPlan) else plan)
     _last_candidates = tuple(plan.candidates if isinstance(plan, ExecutionPlan) else ())
+    _last_alternatives = tuple(plan.alternatives if isinstance(plan, ExecutionPlan) else ())
 
 
 def last_plan():
@@ -186,6 +244,10 @@ def last_plan():
 
 def last_candidates():
     return _last_candidates
+
+
+def last_alternatives():
+    return _last_alternatives
 
 
 def classify_unary(input_spec, output_spec):
@@ -213,6 +275,11 @@ def classify_unary(input_spec, output_spec):
 
 
 def build_unary_transition_plan(input_spec, output_spec):
+    cache_key = ("unary", _spec_cache_key(input_spec), _spec_cache_key(output_spec))
+    cached = _transition_plan_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
     classification = classify_unary(input_spec, output_spec)
     input_state = classification.input_state
     output_state = classification.output_state
@@ -261,7 +328,9 @@ def build_unary_transition_plan(input_spec, output_spec):
     if tuple(axis.name for axis in input_state.axes) != tuple(axis.name for axis in output_state.axes):
         steps.append(PlanStep("permute", (tuple(axis.name for axis in output_state.axes),)))
 
-    return UnaryTransitionPlan(classification, tuple(steps))
+    plan = UnaryTransitionPlan(classification, tuple(steps))
+    _transition_plan_cache[cache_key] = plan
+    return plan
 
 
 def classify_binary(input0_spec, input1_spec, output_spec):
@@ -315,7 +384,64 @@ def _normalize_axis_steps(axis, target_axis, active_output_dims):
     return tuple(steps)
 
 
+def _step_cost(step):
+    if step.name == "rank_local_einsum":
+        return PlanCost(0)
+    if step.name == "reducescatter_forward_allgather_backward":
+        return PlanCost(5, collectives=1)
+    if step.name == "alltoall_repartition":
+        return PlanCost(4, collectives=1)
+    if step.name == "owner_swap":
+        return PlanCost(6, collectives=1)
+    if step.name == "split_forward_allgather_backward":
+        return PlanCost(3, collectives=1)
+    if step.name == "allreduce_forward_identity_backward":
+        return PlanCost(8, collectives=1)
+    if step.name == "identity_forward_allreduce_backward":
+        return PlanCost(8, collectives=1)
+    if step.name == "allgather_forward_split_backward":
+        return PlanCost(10, collectives=1, materializations=1, peak_factor=2)
+    if step.name == "allgather_forward_reducescatter_backward":
+        return PlanCost(10, collectives=1, materializations=1, peak_factor=2)
+    return PlanCost(20, collectives=1)
+
+
+def estimate_plan_cost(steps):
+    score = 0
+    collectives = 0
+    materializations = 0
+    peak_factor = 1
+    for step in steps:
+        cost = _step_cost(step)
+        score += cost.score
+        collectives += cost.collectives
+        materializations += cost.materializations
+        peak_factor = max(peak_factor, cost.peak_factor)
+    return PlanCost(score, collectives, materializations, peak_factor)
+
+
+def _rank_alternatives(alternatives):
+    return tuple(sorted(alternatives, key=lambda alternative: (
+        alternative.cost.score,
+        alternative.cost.materializations,
+        alternative.cost.collectives,
+        alternative.name,
+    )))
+
+
+def _replace_output_steps(output_steps, replacements):
+    steps = []
+    for step in output_steps:
+        steps.extend(replacements.get(step, (step,)))
+    return tuple(steps)
+
+
 def build_binary_transition_plan(input0_spec, input1_spec, output_spec):
+    cache_key = ("binary", _spec_cache_key(input0_spec), _spec_cache_key(input1_spec), _spec_cache_key(output_spec))
+    cached = _transition_plan_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
     classification = classify_binary(input0_spec, input1_spec, output_spec)
     input0_state = classification.input0_state
     input1_state = classification.input1_state
@@ -467,16 +593,90 @@ def build_binary_transition_plan(input0_spec, input1_spec, output_spec):
         else:
             output_steps.append(PlanStep("reducescatter_forward_allgather_backward", (scatter_axis_name, shard_dim)))
 
-    return BinaryTransitionPlan(
+    input0_steps = normalize_input_steps(input0_state)
+    input1_steps = normalize_input_steps(input1_state)
+    output_steps = tuple(output_steps)
+    alternatives = []
+    selected_name = "default"
+    default_alternative = PlanAlternative(
+        selected_name,
+        input0_steps,
+        input1_steps,
+        output_steps,
+        tuple(candidates),
+        estimate_plan_cost((*input0_steps, *input1_steps, *output_steps)),
+    )
+    alternatives.append(default_alternative)
+
+    expanded_reductions = {}
+    for step in output_steps:
+        if step.name != "reducescatter_forward_allgather_backward":
+            continue
+        axis_name, shard_dim = step.args
+        expanded_reductions[step] = (
+            PlanStep("allreduce_forward_identity_backward", (shard_dim,)),
+            PlanStep("split_forward_allgather_backward", (axis_name, shard_dim)),
+        )
+    if expanded_reductions:
+        expanded_output_steps = _replace_output_steps(output_steps, expanded_reductions)
+        alternatives.append(
+            PlanAlternative(
+                "allreduce_then_split",
+                input0_steps,
+                input1_steps,
+                expanded_output_steps,
+                tuple(candidates),
+                estimate_plan_cost((*input0_steps, *input1_steps, *expanded_output_steps)),
+            )
+        )
+
+    if post_repartition is not None:
+        optimized_input0_steps = tuple(
+            PlanStep("identity_forward_allreduce_backward", (post_repartition.shard_dim,))
+            if step.args and step.args[0] == post_repartition.dest_axis else step
+            for step in input0_steps
+            if not (step.args and step.args[0] == post_repartition.source_axis)
+        )
+        optimized_input1_steps = tuple(
+            PlanStep("identity_forward_allreduce_backward", (post_repartition.shard_dim,))
+            if step.args and step.args[0] == post_repartition.dest_axis else step
+            for step in input1_steps
+            if not (step.args and step.args[0] == post_repartition.source_axis)
+        )
+        optimized_output_steps = (*output_steps, PlanStep("alltoall_repartition", (
+            post_repartition.source_axis,
+            post_repartition.dest_axis,
+            post_repartition.shard_dim,
+        )))
+        alternatives.append(
+            PlanAlternative(
+                "alltoall_repartition",
+                optimized_input0_steps,
+                optimized_input1_steps,
+                optimized_output_steps,
+                tuple(candidates),
+                estimate_plan_cost((*optimized_input0_steps, *optimized_input1_steps, *optimized_output_steps)),
+                reason="requires runtime split-shape validation",
+            )
+        )
+
+    alternatives = _rank_alternatives(alternatives)
+    selected_name = alternatives[0].name
+
+    plan = BinaryTransitionPlan(
         classification=classification,
-        input0_steps=normalize_input_steps(input0_state),
-        input1_steps=normalize_input_steps(input1_state),
-        output_steps=tuple(output_steps),
+        input0_steps=input0_steps,
+        input1_steps=input1_steps,
+        output_steps=output_steps,
         reduction_dims=tuple(reduction_dims),
         scatter_output_by_dim=tuple(scatter_output_by_dim.items()),
         candidates=tuple(candidates),
+        alternatives=alternatives,
+        top_ranked_alternative=selected_name,
         post_repartition=post_repartition,
     )
+    _transition_plan_cache[cache_key] = plan
+    return plan
 
 
 def tensor_spec(axes, partials=()):

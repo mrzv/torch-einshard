@@ -1,4 +1,5 @@
 import warnings
+import torch
 import torch.distributed as dist
 
 from .einsum import einsum
@@ -204,6 +205,11 @@ def distributed_1d_2(shard, x, y, mesh, shapes = None):
         }
 
     post_repartition = find_post_repartition()
+    plan.rank(
+        transition_plan.alternatives,
+        selected=None if post_repartition is not None else "default",
+        reason="fallback selected",
+    )
     for candidate in transition_plan.candidates:
         if candidate.name != "alltoall_repartition":
             continue
@@ -425,15 +431,38 @@ def distributed_1d_2(shard, x, y, mesh, shapes = None):
 
     if post_repartition is not None:
         comm = group(post_repartition["shard_dim"])
+        rank = dist.get_rank(comm)
+        source_dim = dim_of(current_output_axes, post_repartition["source_input_axis"].name, z)
+        dest_dim = dim_of(current_output_axes, post_repartition["dest_input_axis"].name, z)
+        local_ok = (
+            z.shape[source_dim] == post_repartition["source_shapes"][rank]
+            and z.shape[dest_dim] == sum(post_repartition["dest_shapes"])
+        )
+        all_ok = torch.tensor(int(local_ok), device=z.device)
+        dist.all_reduce(all_ok, op=dist.ReduceOp.MIN, group=comm)
+        if not bool(all_ok.item()):
+            plan.rank(transition_plan.alternatives)
+            plan.consider(
+                "alltoall_repartition",
+                post_repartition["source_input_axis"].name,
+                post_repartition["dest_input_axis"].name,
+                post_repartition["shard_dim"],
+                status="rejected",
+                reason="runtime tensor shape does not match split metadata",
+            )
+            set_last_plan(plan)
+            raise ValueError("Runtime tensor shape does not match alltoall_repartition split metadata")
+
         result = alltoall_repartition(
             z,
             comm,
-            dim_of(current_output_axes, post_repartition["source_input_axis"].name, z),
-            dim_of(current_output_axes, post_repartition["dest_input_axis"].name, z),
+            source_dim,
+            dest_dim,
             post_repartition["source_shapes"],
             post_repartition["dest_shapes"],
         )
         if result is None:
+            plan.rank(transition_plan.alternatives)
             plan.consider(
                 "alltoall_repartition",
                 post_repartition["source_input_axis"].name,
@@ -443,8 +472,13 @@ def distributed_1d_2(shard, x, y, mesh, shapes = None):
                 reason="alltoall_repartition returned None",
             )
             set_last_plan(plan)
-            return None
+            raise ValueError("Runtime tensor shape does not match alltoall_repartition split metadata")
         z = result
+        plan.rank(
+            transition_plan.alternatives,
+            selected="alltoall_repartition",
+            reason="runtime split-shape validation passed",
+        )
         plan.consider(
             "alltoall_repartition",
             post_repartition["source_input_axis"].name,

@@ -4,7 +4,7 @@ import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
 
 import torch_einshard as es
-from torch_einshard.symbolic import last_candidates, last_plan
+from torch_einshard.symbolic import last_alternatives, last_candidates, last_plan
 
 from conftest import assert_close
 
@@ -499,6 +499,9 @@ def test_two_crossed_contractions_reduce_scatter_two_output_axes(dist_env, mesh_
     expected_y_grad = _split_two(y_ref.grad, k_sp_shapes, 0, sp_rank, m_dp_shapes, 1, dp_rank)
     assert_close(x_shard.grad, expected_x_grad)
     assert_close(y_shard.grad, expected_y_grad)
+    assert [(alternative.name, alternative.status) for alternative in last_alternatives()] == [
+        ("default", "selected"),
+    ]
     assert [(candidate.name, candidate.status) for candidate in last_candidates()] == [
         ("owner_swap", "accepted"),
     ]
@@ -744,6 +747,10 @@ def test_binary_reduce_scatters_contraction_to_output_axis(dist_env, mesh_tp):
 
     assert_close(x_shard.grad, torch.split(x_ref.grad, col_shapes, dim=1)[rank])
     assert_close(y_shard.grad, torch.split(y_ref.grad, col_shapes, dim=0)[rank])
+    assert [(alternative.name, alternative.status) for alternative in last_alternatives()] == [
+        ("default", "selected"),
+        ("allreduce_then_split", "ranked"),
+    ]
 
 
 def test_binary_splits_full_contracted_axis_to_match_shard(dist_env, mesh_tp):
@@ -815,6 +822,10 @@ def test_binary_repartitions_free_axis_after_local_contraction(dist_env, mesh_tp
 
     assert_close(x_shard.grad, torch.split(x_ref.grad, row_shapes, dim=0)[rank])
     assert_close(y.grad, y_ref.grad)
+    assert [(alternative.name, alternative.status) for alternative in last_alternatives()] == [
+        ("alltoall_repartition", "selected"),
+        ("default", "ranked"),
+    ]
     assert [(candidate.name, candidate.status) for candidate in last_candidates()] == [
         ("alltoall_repartition", "accepted"),
     ]
@@ -850,10 +861,48 @@ def test_binary_repartition_candidate_falls_back_without_shapes(dist_env, mesh_t
     assert [(candidate.name, candidate.status) for candidate in last_candidates()] == [
         ("alltoall_repartition", "rejected"),
     ]
+    assert [(alternative.name, alternative.status) for alternative in last_alternatives()] == [
+        ("alltoall_repartition", "ranked"),
+        ("default", "selected"),
+    ]
     assert [step.name for step in last_plan()] == [
         "allgather_forward_reducescatter_backward",
         "split_forward_allgather_backward",
         "rank_local_einsum",
+    ]
+
+
+def test_binary_repartition_candidate_rejects_invalid_shapes(dist_env, mesh_tp):
+    group = mesh_tp["tp"].get_group()
+    rank = dist.get_rank(group)
+    world_size = dist.get_world_size(group)
+    rows = world_size * 2 + 1
+    cols = world_size * 3 + 2
+    hidden = 4
+    row_shapes = es.helpers.compute_split_shapes(rows, world_size)
+    col_shapes = es.helpers.compute_split_shapes(cols, world_size)
+    bad_row_shapes = list(row_shapes)
+    bad_row_shapes[0] += 1
+
+    x_full = torch.randn(rows, hidden)
+    y = torch.randn(hidden, cols)
+    x_shard = torch.split(x_full, row_shapes, dim=0)[rank]
+
+    with pytest.raises(ValueError, match="split metadata"):
+        es.einshard(
+            "l/tp e, e f -> l f/tp",
+            x_shard,
+            y,
+            mesh=mesh_tp,
+            shapes={"tp": {"l": bad_row_shapes, "f": col_shapes}},
+        )
+
+    assert [(candidate.name, candidate.status) for candidate in last_candidates()] == [
+        ("alltoall_repartition", "rejected"),
+    ]
+    assert [(alternative.name, alternative.status) for alternative in last_alternatives()] == [
+        ("alltoall_repartition", "ranked"),
+        ("default", "ranked"),
     ]
 
 

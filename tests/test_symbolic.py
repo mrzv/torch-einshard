@@ -8,6 +8,8 @@ from torch_einshard.symbolic import (
     build_unary_transition_plan,
     classify_binary,
     classify_unary,
+    clear_plan_cache,
+    last_alternatives,
     last_candidates,
     last_plan,
     local_axis,
@@ -120,6 +122,20 @@ def test_unary_transition_plan_adds_partials_and_permutation():
     ]
 
 
+def test_transition_plan_cache_reuses_immutable_plans():
+    clear_plan_cache()
+    x, y, z = parse_sharding("a b/tp, b c -> a/tp c")
+
+    first = build_binary_transition_plan(x, y, z)
+    second = build_binary_transition_plan(x, y, z)
+
+    assert second is first
+
+    clear_plan_cache()
+    third = build_binary_transition_plan(x, y, z)
+    assert third is not first
+
+
 def test_binary_classification_separates_axis_roles():
     x, y, z = parse_sharding("b/dp a c/sp, b/dp c/sp d -> b/dp a d")
 
@@ -164,6 +180,10 @@ def test_binary_transition_plan_reduce_scatters_to_output_axis():
         ("reducescatter_forward_allgather_backward", ("a", "tp")),
     ]
     assert plan.scatter_output_by_dim == (("tp", "a"),)
+    assert [(alternative.name, alternative.cost.score) for alternative in plan.alternatives] == [
+        ("default", 8),
+        ("allreduce_then_split", 14),
+    ]
 
 
 def test_binary_transition_plan_keeps_output_partial_reduction():
@@ -198,6 +218,11 @@ def test_binary_transition_plan_detects_post_repartition():
         ("allgather_forward_reducescatter_backward", ("a", "tp")),
         ("split_forward_allgather_backward", ("c", "tp")),
     ]
+    assert [alternative.name for alternative in plan.alternatives] == [
+        "alltoall_repartition",
+        "default",
+    ]
+    assert plan.alternatives[0].reason == "requires runtime split-shape validation"
 
 
 def test_binary_transition_plan_models_owner_swap_atomically():
@@ -243,6 +268,20 @@ def test_execution_plan_records_candidate_snapshot():
     assert candidate.args == ("a", "b", "dp")
     assert candidate.status == "rejected"
     assert candidate.reason == "missing shapes"
+
+
+def test_execution_plan_records_ranked_alternatives_snapshot():
+    plan = ExecutionPlan()
+    x, y, z = parse_sharding("a b/tp, b c -> a/tp c")
+    transition_plan = build_binary_transition_plan(x, y, z)
+
+    plan.rank(transition_plan.alternatives, selected="default", reason="validated")
+    set_last_plan(plan)
+
+    assert [(alternative.name, alternative.status) for alternative in last_alternatives()] == [
+        ("default", "selected"),
+        ("allreduce_then_split", "ranked"),
+    ]
 
 
 def test_execution_plan_execute_records_step_and_calls_function():

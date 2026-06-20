@@ -355,7 +355,7 @@ Phases 0-5 are now implemented as behavior-preserving internal machinery:
 
 The remaining pre-Phase-6 work is to make optimized candidates explicit in the symbolic model. `owner_swap` and same-mesh `alltoall_repartition` are legal symbolic candidates whose final execution still depends on runtime validation: mesh dimension sizes, resolved split-shape metadata, and matching split layouts. The symbolic plan should distinguish fallback steps from candidates that were considered and either accepted or rejected at runtime. `last_plan()` should continue to mean "what actually ran".
 
-Phase 6 should not start until the candidate/validation boundary is explicit and the broad distributed suite has been run against the planner-driven implementation.
+Phase 6 is being implemented only as private internals for now. The public compile boundary remains deferred, but the internal planner now has explicit plan alternatives, simple cost estimates, deterministic ranking, runtime selection snapshots, and a private transition-plan cache. Optimized candidates still require runtime validation before their ranked alternative can be selected for execution.
 
 Verification note: after candidate/validation tracing was added, focused symbolic/local tests and targeted distributed unary/binary suites passed. A broad `./run_tests.sh -x` run stopped on an intermittent numerical tolerance failure in `tests/test_distributed_binary.py::test_binary_reduce_scatters_contraction_to_output_axis` (`2.27e-6` absolute difference with `1e-6` tolerance); an immediate targeted rerun of that test passed on all ranks.
 
@@ -418,6 +418,7 @@ Verification note: after candidate/validation tracing was added, focused symboli
 - Generate multiple valid plans for ambiguous cases.
 - Rank them with the cost model.
 - Keep deterministic tie-breaking for reproducibility.
+- Keep this private until the plan representation stabilizes; do not add a public `compile_einshard` boundary in this phase.
 
 ## Non-Goals For The First Version
 
