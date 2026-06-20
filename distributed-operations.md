@@ -6,7 +6,7 @@ The current implementation has useful primitives for split/allgather/allreduce/r
 
 ## 1. Native Reduce-Scatter
 
-Current `reduce_scatter` is implemented as `all_reduce` followed by local `split` in `src/torch_einshard/helpers.py`.
+`reduce_scatter` now uses native `dist.reduce_scatter_tensor` for equal split sizes in `src/torch_einshard/helpers.py`, and falls back to `all_reduce` followed by local `split` for uneven split sizes.
 
 That means formulas like this can be modeled as reduce-scatter:
 
@@ -20,9 +20,9 @@ z = es.einshard(
 )
 ```
 
-But runtime does not yet get the real communication savings compared to allreduce-then-split.
+Equal-split runtime now gets the real communication savings compared to allreduce-then-split.
 
-A native `dist.reduce_scatter_tensor` path, plus an uneven-shape equivalent, would make reduce-scatter plans meaningfully distinct from allreduce-then-split plans.
+An uneven-shape equivalent would make reduce-scatter plans meaningfully distinct from allreduce-then-split plans for all split metadata, not just equal chunks.
 
 This would improve policies that prefer:
 
@@ -58,11 +58,15 @@ Useful extensions include:
 - more general uneven all-to-allv shapes beyond the current one-source-axis/one-destination-axis case
 - different output ownership choices without materializing full intermediates
 
+Single-axis ownership transfer between equal-sized mesh dimensions can now use `owner_swap` when split metadata matches, but this is still narrower than generalized all-to-all/all-to-allv repartitioning.
+
 This would give `memory`, `communication`, and `inference` policies more direct paths than gather/compute/split fallbacks.
 
 ## 3. Broadcast, Scatter, And Explicit Replication
 
 `distributed.py` currently has `augment_parallelism(...): # TODO: add replication`.
+
+A broadcast primitive and `broadcast_forward_allreduce_backward` autograd mapping now exist, but the symbolic notation still does not identify source ownership or replicated mesh dimensions explicitly.
 
 Right now, local axes often imply that every rank already has the full tensor. Explicit replication and ownership operations would let the planner choose between broadcasting, scattering, gathering, or reusing replicated operands.
 
@@ -101,7 +105,7 @@ z = es.einshard(
 )
 ```
 
-Instead of forcing one operand layout to match the other, the planner could stream panels through the mesh.
+The current planner handles this basic pattern by splitting the replicated contracting panel, performing a local einsum, and reduce-scattering the output. A fuller SUMMA planner could stream panels through the mesh instead of materializing the normalized panel for the whole local operation.
 
 This would unlock policy choices around:
 
@@ -175,10 +179,10 @@ It would unlock more direct plans for cases where the best reduction dimension a
 
 ## Highest-Impact Additions
 
-The highest-impact missing operations are likely:
+The highest-impact remaining additions are likely:
 
-1. Native efficient `reduce_scatter`.
+1. Uneven native-equivalent `reduce_scatter`.
 2. Generalized all-to-all/all-to-allv reshards.
-3. Broadcast and explicit replication support.
-4. SUMMA-style panel communication for distributed matmul.
+3. Symbolic broadcast and explicit replication/source ownership support.
+4. Full SUMMA-style panel communication for distributed matmul.
 5. Coalesced and async collectives for cross-formula policy wins.

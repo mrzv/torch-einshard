@@ -1,5 +1,5 @@
 import torch
-from .helpers import all_reduce, all_gather, all_to_all_repartition, owner_swap, reduce_scatter, roll_sharded, roll_shards, split
+from .helpers import all_reduce, all_gather, all_to_all_repartition, broadcast, owner_swap, reduce_scatter, roll_sharded, roll_shards, split
 
 class _AllReduceForwardIdentityBackward(torch.autograd.Function):
     """AllReduce in forward, Identity in backward"""
@@ -23,6 +23,23 @@ class _IdentityForwardAllReduceBackward(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         return all_reduce(grad_output, group = ctx.comm), None
+
+
+class _BroadcastForwardAllReduceBackward(torch.autograd.Function):
+    """Broadcast in forward, AllReduce in backward"""
+
+    @staticmethod
+    def forward(ctx, input, comm, src):
+        ctx.comm = comm
+        ctx.src = src
+        return broadcast(input, comm, src)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        grad_input = all_reduce(grad_output, group=ctx.comm)
+        if torch.distributed.get_rank(ctx.comm) != ctx.src:
+            grad_input = torch.zeros_like(grad_input)
+        return grad_input, None, None
 
 class _AllGatherForwardSplitBackward(torch.autograd.Function):
     """AllGather in forward and Split in backward"""
@@ -154,6 +171,9 @@ def allreduce_forward_identity_backward(input, comm):
 
 def identity_forward_allreduce_backward(input, comm):
     return _IdentityForwardAllReduceBackward.apply(input, comm)
+
+def broadcast_forward_allreduce_backward(input, comm, src=0):
+    return _BroadcastForwardAllReduceBackward.apply(input, comm, src)
 
 def allgather_forward_split_backward(input, comm, dim, shapes):
     return _AllGatherForwardSplitBackward.apply(input, comm, dim, shapes)

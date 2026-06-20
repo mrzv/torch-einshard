@@ -438,6 +438,54 @@ def test_shared_local_axis_reduce_scatters_to_sharded_output(dist_env, mesh_2d):
     assert_close(y_shard.grad, torch.split(y_ref.grad, hidden_sp_shapes, dim=1)[sp_rank])
 
 
+def test_summa_style_2d_matmul_reduce_scatters_output(dist_env, mesh_2d):
+    dp_group = mesh_2d["dp"].get_group()
+    sp_group = mesh_2d["sp"].get_group()
+    dp_rank = dist.get_rank(dp_group)
+    sp_rank = dist.get_rank(sp_group)
+    dp_size = dist.get_world_size(dp_group)
+    sp_size = dist.get_world_size(sp_group)
+    rows = dp_size * 2 + 1
+    hidden = sp_size * 3 + 2
+    cols = sp_size * 2
+    row_shapes = es.helpers.compute_split_shapes(rows, dp_size)
+    hidden_shapes = es.helpers.compute_split_shapes(hidden, sp_size)
+    col_shapes = es.helpers.compute_split_shapes(cols, sp_size)
+
+    x_full = torch.randn(rows, hidden)
+    y_full = torch.randn(hidden, cols)
+    x_shard = torch.split(x_full, row_shapes, dim=0)[dp_rank].clone().requires_grad_(True)
+    y_shard = torch.split(y_full, hidden_shapes, dim=0)[sp_rank].clone().requires_grad_(True)
+
+    z = es.einshard(
+        "a/dp k, k/sp b -> a/dp b/sp",
+        x_shard,
+        y_shard,
+        mesh=mesh_2d,
+        shapes={"dp": {"a": row_shapes}, "sp": {"k": hidden_shapes, "b": col_shapes}},
+    )
+
+    x_ref = x_full.detach().clone().requires_grad_(True)
+    y_ref = y_full.detach().clone().requires_grad_(True)
+    expected_full = torch.einsum("ak,kb->ab", x_ref, y_ref)
+    expected = torch.split(torch.split(expected_full, row_shapes, dim=0)[dp_rank], col_shapes, dim=1)[sp_rank]
+    assert_close(z, expected)
+    assert [step.name for step in last_plan()] == [
+        "split_forward_allgather_backward",
+        "identity_forward_allreduce_backward",
+        "rank_local_einsum",
+        "reducescatter_forward_allgather_backward",
+    ]
+
+    grad_full = torch.randn(rows, cols)
+    grad_shard = torch.split(torch.split(grad_full, row_shapes, dim=0)[dp_rank], col_shapes, dim=1)[sp_rank]
+    z.backward(grad_shard)
+    expected_full.backward(grad_full)
+
+    assert_close(x_shard.grad, torch.split(x_ref.grad, row_shapes, dim=0)[dp_rank])
+    assert_close(y_shard.grad, torch.split(y_ref.grad, hidden_shapes, dim=0)[sp_rank])
+
+
 def test_two_crossed_contractions_reduce_scatter_two_output_axes(dist_env, mesh_2d):
     dp_group = mesh_2d["dp"].get_group()
     sp_group = mesh_2d["sp"].get_group()
