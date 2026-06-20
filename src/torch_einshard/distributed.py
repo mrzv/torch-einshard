@@ -204,6 +204,11 @@ def distributed_1d_2(shard, x, y, mesh, shapes = None):
         }
 
     post_repartition = find_post_repartition()
+    for candidate in transition_plan.candidates:
+        if candidate.name != "alltoall_repartition":
+            continue
+        if post_repartition is None:
+            plan.consider(candidate, status="rejected", reason="runtime split-shape validation failed")
 
     def input_steps_for_runtime(steps):
         if post_repartition is None:
@@ -257,10 +262,13 @@ def distributed_1d_2(shard, x, y, mesh, shapes = None):
                     output_shape[dim_of(normalized_axes, axis.name, tensor)] = dest_shapes[dist.get_rank(dest_comm)]
 
                 if not can_owner_swap:
+                    plan.consider(step.name, *step.args, status="rejected", reason="runtime owner-swap validation failed")
+                    set_last_plan(plan)
                     raise NotImplementedError(
                         "Multiple contracted-axis shard-dimension changes require an owner-swap-compatible permutation"
                     )
 
+                plan.consider(step.name, *step.args, status="accepted")
                 tensor = plan.execute(
                     step.name,
                     owner_swap_forward_backward,
@@ -426,8 +434,24 @@ def distributed_1d_2(shard, x, y, mesh, shapes = None):
             post_repartition["dest_shapes"],
         )
         if result is None:
+            plan.consider(
+                "alltoall_repartition",
+                post_repartition["source_input_axis"].name,
+                post_repartition["dest_input_axis"].name,
+                post_repartition["shard_dim"],
+                status="rejected",
+                reason="alltoall_repartition returned None",
+            )
+            set_last_plan(plan)
             return None
         z = result
+        plan.consider(
+            "alltoall_repartition",
+            post_repartition["source_input_axis"].name,
+            post_repartition["dest_input_axis"].name,
+            post_repartition["shard_dim"],
+            status="accepted",
+        )
         plan.add(
             "alltoall_repartition",
             post_repartition["source_input_axis"].name,

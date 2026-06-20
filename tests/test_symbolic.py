@@ -8,6 +8,7 @@ from torch_einshard.symbolic import (
     build_unary_transition_plan,
     classify_binary,
     classify_unary,
+    last_candidates,
     last_plan,
     local_axis,
     set_last_plan,
@@ -190,6 +191,13 @@ def test_binary_transition_plan_detects_post_repartition():
         ("rank_local_einsum", ()),
     ]
     assert plan.post_repartition.shard_dim == "tp"
+    assert [(candidate.name, candidate.args) for candidate in plan.candidates] == [
+        ("alltoall_repartition", ("a", "c", "tp")),
+    ]
+    assert [(step.name, step.args) for step in plan.candidates[0].fallback_steps] == [
+        ("allgather_forward_reducescatter_backward", ("a", "tp")),
+        ("split_forward_allgather_backward", ("c", "tp")),
+    ]
 
 
 def test_binary_transition_plan_models_owner_swap_atomically():
@@ -198,6 +206,9 @@ def test_binary_transition_plan_models_owner_swap_atomically():
     plan = build_binary_transition_plan(x, y, z)
 
     assert [(step.name, step.args) for step in plan.input1_steps] == [
+        ("owner_swap", (("sp", "dp"), ("dp", "sp"))),
+    ]
+    assert [(candidate.name, candidate.args) for candidate in plan.candidates] == [
         ("owner_swap", (("sp", "dp"), ("dp", "sp"))),
     ]
 
@@ -218,6 +229,20 @@ def test_execution_plan_records_steps_and_last_plan_snapshot():
 
     assert plan.names() == ["split_forward_allgather_backward", "rank_local_einsum"]
     assert [step.name for step in last_plan()] == plan.names()
+    assert last_candidates() == ()
+
+
+def test_execution_plan_records_candidate_snapshot():
+    plan = ExecutionPlan()
+    plan.consider("alltoall_repartition", "a", "b", "dp", status="rejected", reason="missing shapes")
+
+    set_last_plan(plan)
+
+    candidate, = last_candidates()
+    assert candidate.name == "alltoall_repartition"
+    assert candidate.args == ("a", "b", "dp")
+    assert candidate.status == "rejected"
+    assert candidate.reason == "missing shapes"
 
 
 def test_execution_plan_execute_records_step_and_calls_function():

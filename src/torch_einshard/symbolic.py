@@ -110,6 +110,18 @@ class BinaryPostRepartition:
 
 
 @dataclass(frozen=True)
+class PlanCandidate:
+    name: str
+    args: tuple = ()
+    fallback_steps: tuple = ()
+    status: str = "considered"
+    reason: str = ""
+
+    def with_result(self, status, reason=""):
+        return PlanCandidate(self.name, self.args, self.fallback_steps, status, reason)
+
+
+@dataclass(frozen=True)
 class BinaryTransitionPlan:
     classification: BinaryClassification
     input0_steps: tuple
@@ -117,6 +129,7 @@ class BinaryTransitionPlan:
     output_steps: tuple
     reduction_dims: tuple
     scatter_output_by_dim: tuple
+    candidates: tuple = ()
     post_repartition: BinaryPostRepartition | None = None
 
     def names(self):
@@ -135,6 +148,7 @@ class PlanStep:
 class ExecutionPlan:
     def __init__(self):
         self.steps = []
+        self.candidates = []
 
     def add(self, name, *args):
         self.steps.append(PlanStep(name, tuple(args)))
@@ -142,6 +156,12 @@ class ExecutionPlan:
     def execute(self, name, fn, *fn_args, step_args=(), **fn_kwargs):
         self.add(name, *step_args)
         return fn(*fn_args, **fn_kwargs)
+
+    def consider(self, candidate, *args, status="considered", reason="", fallback_steps=()):
+        if isinstance(candidate, PlanCandidate):
+            self.candidates.append(candidate.with_result(status, reason))
+        else:
+            self.candidates.append(PlanCandidate(candidate, tuple(args), tuple(fallback_steps), status, reason))
 
     def names(self):
         return [step.name for step in self.steps]
@@ -151,15 +171,21 @@ class ExecutionPlan:
 
 
 _last_plan = ()
+_last_candidates = ()
 
 
 def set_last_plan(plan):
-    global _last_plan
+    global _last_plan, _last_candidates
     _last_plan = tuple(plan.steps if isinstance(plan, ExecutionPlan) else plan)
+    _last_candidates = tuple(plan.candidates if isinstance(plan, ExecutionPlan) else ())
 
 
 def last_plan():
     return _last_plan
+
+
+def last_candidates():
+    return _last_candidates
 
 
 def classify_unary(input_spec, output_spec):
@@ -336,6 +362,7 @@ def build_binary_transition_plan(input0_spec, input1_spec, output_spec):
         elif input_axis.local() and output_axis.shard_dim:
             split_candidates.append((input_axis, output_axis))
 
+    candidates = []
     post_repartition = None
     if len(gather_candidates) == 1 and len(split_candidates) == 1:
         source_input_axis, _ = gather_candidates[0]
@@ -346,6 +373,16 @@ def build_binary_transition_plan(input0_spec, input1_spec, output_spec):
                 shard_dim=shard_dim,
                 source_axis=source_input_axis.name,
                 dest_axis=dest_output_axis.name,
+            )
+            candidates.append(
+                PlanCandidate(
+                    "alltoall_repartition",
+                    (source_input_axis.name, dest_output_axis.name, shard_dim),
+                    (
+                        PlanStep("allgather_forward_reducescatter_backward", (source_input_axis.name, shard_dim)),
+                        PlanStep("split_forward_allgather_backward", (dest_output_axis.name, shard_dim)),
+                    ),
+                )
             )
 
     active_output_dims = output_partials | {axis.shard_dim for axis in output_state.axes if axis.shard_dim}
@@ -381,7 +418,9 @@ def build_binary_transition_plan(input0_spec, input1_spec, output_spec):
                 raise NotImplementedError(
                     "Multiple contracted-axis shard-dimension changes require an owner-swap-compatible permutation"
                 )
-            steps.append(PlanStep("owner_swap", (source_shard_dims, dest_shard_dims)))
+            owner_swap_step = PlanStep("owner_swap", (source_shard_dims, dest_shard_dims))
+            steps.append(owner_swap_step)
+            candidates.append(PlanCandidate("owner_swap", owner_swap_step.args))
             owner_swapped_axes.update(changed_names)
 
         for axis in state.axes:
@@ -435,6 +474,7 @@ def build_binary_transition_plan(input0_spec, input1_spec, output_spec):
         output_steps=tuple(output_steps),
         reduction_dims=tuple(reduction_dims),
         scatter_output_by_dim=tuple(scatter_output_by_dim.items()),
+        candidates=tuple(candidates),
         post_repartition=post_repartition,
     )
 
