@@ -4,6 +4,7 @@ from torch_einshard.grammar import parse_sharding
 from torch_einshard.symbolic import (
     ExecutionPlan,
     TensorState,
+    build_binary_transition_plan,
     build_unary_transition_plan,
     classify_binary,
     classify_unary,
@@ -134,6 +135,78 @@ def test_binary_classification_reports_output_only_axes():
 
     classification = classify_binary(x, y, z)
     assert classification.output_only_axes == ("d",)
+
+
+def test_binary_transition_plan_normalizes_contracted_axis_and_allreduces():
+    x, y, z = parse_sharding("a b/tp, b c -> a c")
+
+    plan = build_binary_transition_plan(x, y, z)
+
+    assert [step.name for step in plan.input0_steps] == []
+    assert [(step.name, step.args) for step in plan.input1_steps] == [
+        ("split_forward_allgather_backward", ("b", "tp")),
+    ]
+    assert [(step.name, step.args) for step in plan.output_steps] == [
+        ("rank_local_einsum", ()),
+        ("allreduce_forward_identity_backward", ("tp",)),
+    ]
+    assert plan.reduction_dims == ("tp",)
+
+
+def test_binary_transition_plan_reduce_scatters_to_output_axis():
+    x, y, z = parse_sharding("a b/tp, b c -> a/tp c")
+
+    plan = build_binary_transition_plan(x, y, z)
+
+    assert [(step.name, step.args) for step in plan.output_steps] == [
+        ("rank_local_einsum", ()),
+        ("reducescatter_forward_allgather_backward", ("a", "tp")),
+    ]
+    assert plan.scatter_output_by_dim == (("tp", "a"),)
+
+
+def test_binary_transition_plan_keeps_output_partial_reduction():
+    x, y, z = parse_sharding("a b/tp, b c -> a c // tp")
+
+    plan = build_binary_transition_plan(x, y, z)
+
+    assert [(step.name, step.args) for step in plan.output_steps] == [
+        ("rank_local_einsum", ()),
+    ]
+
+
+def test_binary_transition_plan_detects_post_repartition():
+    x, y, z = parse_sharding("a/tp b, c d -> a c/tp")
+
+    plan = build_binary_transition_plan(x, y, z)
+
+    assert [(step.name, step.args) for step in plan.input0_steps] == [
+        ("allgather_forward_reducescatter_backward", ("a", "tp")),
+    ]
+    assert [(step.name, step.args) for step in plan.input1_steps] == [
+        ("split_forward_allgather_backward", ("c", "tp")),
+    ]
+    assert [(step.name, step.args) for step in plan.output_steps] == [
+        ("rank_local_einsum", ()),
+    ]
+    assert plan.post_repartition.shard_dim == "tp"
+
+
+def test_binary_transition_plan_models_owner_swap_atomically():
+    x, y, z = parse_sharding("a k/dp m/sp, k/sp m/dp b -> a/sp b/dp")
+
+    plan = build_binary_transition_plan(x, y, z)
+
+    assert [(step.name, step.args) for step in plan.input1_steps] == [
+        ("owner_swap", (("sp", "dp"), ("dp", "sp"))),
+    ]
+
+
+def test_binary_transition_plan_rejects_non_owner_swap_permutation():
+    x, y, z = parse_sharding("a k/dp m/sp n/dp, k/sp m/dp n/tp b -> a b")
+
+    with pytest.raises(NotImplementedError, match="owner-swap-compatible"):
+        build_binary_transition_plan(x, y, z)
 
 
 def test_execution_plan_records_steps_and_last_plan_snapshot():

@@ -12,7 +12,7 @@ from .mappings import allreduce_forward_identity_backward, \
                         owner_swap_forward_backward
 from .helpers import resolve_split_shapes
 from .sharding import Axis, Axes, EllipsisAxis, TensorSpec
-from .symbolic import ExecutionPlan, build_unary_transition_plan, set_last_plan
+from .symbolic import ExecutionPlan, build_binary_transition_plan, build_unary_transition_plan, set_last_plan
 
 
 def _axes(spec):
@@ -85,6 +85,11 @@ def distributed_1d_2(shard, x, y, mesh, shapes = None):
     input0_axes = _without_ellipsis(_axes(input0_spec))
     input1_axes = _without_ellipsis(_axes(input1_spec))
     output_axes = _without_ellipsis(_axes(output_spec))
+    transition_plan = build_binary_transition_plan(
+        TensorSpec(input0_axes, _partials(input0_spec)),
+        TensorSpec(input1_axes, _partials(input1_spec)),
+        TensorSpec(output_axes, _partials(output_spec)),
+    )
     input0_by_name = {axis.name: axis for axis in input0_axes}
     input1_by_name = {axis.name: axis for axis in input1_axes}
     output_by_name = {axis.name: axis for axis in output_axes}
@@ -125,6 +130,11 @@ def distributed_1d_2(shard, x, y, mesh, shapes = None):
         ]
         if axis.shard_dim in reduction_dims and any(input_axis.local() or input_axis == axis for input_axis in matching_input_axes):
             scatter_output_by_dim[axis.shard_dim] = axis
+
+    assert transition_plan.reduction_dims == tuple(reduction_dims)
+    assert dict(transition_plan.scatter_output_by_dim) == {
+        shard_dim: axis.name for shard_dim, axis in scatter_output_by_dim.items()
+    }
 
     def group(shard_dim):
         return mesh[shard_dim].get_group()
@@ -450,48 +460,50 @@ def distributed_1d_2(shard, x, y, mesh, shapes = None):
     z = einsum(normalized_shard, x, y)    # perform the local operation
     current_output_axes = local_output_axes
 
-    for shard_dim in reduction_dims:
-        if shard_dim in _partials(shard[2]):
-            scatter_axis = scatter_output_by_dim.get(shard_dim)
-            if scatter_axis is not None:
-                dim = dim_of(current_output_axes, scatter_axis.name, z)
-                comm = group(shard_dim)
-                split_shapes = resolve_split_shapes(shapes, shard_dim, scatter_axis.name, comm)
-                z = plan.execute(
-                    "split_forward_allgather_backward",
-                    split_forward_allgather_backward,
-                    z,
-                    comm,
-                    dim,
-                    split_shapes,
-                    step_args=(scatter_axis.name, shard_dim),
-                )
-                current_output_axes = replace_axis(current_output_axes, scatter_axis.name, scatter_axis)
+    for step in transition_plan.output_steps:
+        if step.name == "rank_local_einsum":
             continue
-        scatter_axis = scatter_output_by_dim.get(shard_dim)
-        if scatter_axis is None:
+        if step.name == "alltoall_repartition":
+            continue
+        if step.name == "allreduce_forward_identity_backward":
+            shard_dim, = step.args
             z = plan.execute(
-                "allreduce_forward_identity_backward",
+                step.name,
                 allreduce_forward_identity_backward,
                 z,
                 comm=group(shard_dim),
-                step_args=(shard_dim,),
+                step_args=step.args,
             )
             continue
 
-        dim = dim_of(current_output_axes, scatter_axis.name, z)
+        axis_name, shard_dim = step.args
+        scatter_axis = scatter_output_by_dim[shard_dim]
+        dim = dim_of(current_output_axes, axis_name, z)
         comm = group(shard_dim)
-        split_shapes = resolve_split_shapes(shapes, shard_dim, scatter_axis.name, comm)
-        z = plan.execute(
-            "reducescatter_forward_allgather_backward",
-            reducescatter_forward_allgather_backward,
-            z,
-            comm,
-            dim,
-            split_shapes,
-            step_args=(scatter_axis.name, shard_dim),
-        )
-        current_output_axes = replace_axis(current_output_axes, scatter_axis.name, scatter_axis)
+        split_shapes = resolve_split_shapes(shapes, shard_dim, axis_name, comm)
+        if step.name == "split_forward_allgather_backward":
+            z = plan.execute(
+                step.name,
+                split_forward_allgather_backward,
+                z,
+                comm,
+                dim,
+                split_shapes,
+                step_args=step.args,
+            )
+        elif step.name == "reducescatter_forward_allgather_backward":
+            z = plan.execute(
+                step.name,
+                reducescatter_forward_allgather_backward,
+                z,
+                comm,
+                dim,
+                split_shapes,
+                step_args=step.args,
+            )
+        else:
+            raise NotImplementedError(f"Unsupported binary output plan step {step.name!r}")
+        current_output_axes = replace_axis(current_output_axes, axis_name, scatter_axis)
 
     if post_repartition is not None:
         comm = group(post_repartition["shard_dim"])
