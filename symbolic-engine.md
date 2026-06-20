@@ -342,6 +342,21 @@ Warnings should be used when the operation is valid but falls back to a more exp
 
 ## Implementation Strategy
 
+## Implementation Status
+
+Phases 0-5 are now implemented as behavior-preserving internal machinery:
+
+- Phase 0 is covered by the existing local and distributed tests, with targeted plan assertions for the important primitive choices.
+- Phase 1 added private symbolic state/classification helpers in `symbolic.py`.
+- Phase 2 added private `PlanStep` / `ExecutionPlan` tracing, with `last_plan()` reporting the primitives that actually executed.
+- Phase 3 rewired unary distributed execution to use `build_unary_transition_plan()` for the generic transition path while preserving optimized owner-swap and same-mesh all-to-all probes.
+- Phase 4 now builds binary normalization and reduction decisions through `build_binary_transition_plan()` and executes binary input/output normalization from those symbolic steps.
+- Phase 5 exists as internal inspection only: tests can inspect `last_plan()` for executed primitives, but there is no public plan API yet.
+
+The remaining pre-Phase-6 work is to make optimized candidates explicit in the symbolic model. `owner_swap` and same-mesh `alltoall_repartition` are legal symbolic candidates whose final execution still depends on runtime validation: mesh dimension sizes, resolved split-shape metadata, and matching split layouts. The symbolic plan should distinguish fallback steps from candidates that were considered and either accepted or rejected at runtime. `last_plan()` should continue to mean "what actually ran".
+
+Phase 6 should not start until the candidate/validation boundary is explicit and the broad distributed suite has been run against the planner-driven implementation.
+
 ### Phase 0: Behavior Matrix
 
 - Inventory current supported cases from the distributed unary and binary tests.
