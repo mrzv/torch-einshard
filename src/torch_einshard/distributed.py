@@ -4,6 +4,7 @@ import torch.distributed as dist
 
 from .einsum import einsum
 from .mappings import allreduce_forward_identity_backward, \
+                       broadcast_forward_allreduce_backward, \
                        split_forward_allgather_backward, \
                        allgather_forward_split_backward, \
                         identity_forward_allreduce_backward, \
@@ -294,11 +295,16 @@ def distributed_1d_2(shard, x, y, mesh, shapes = None, policy = None):
                         continue
                     changes.append((axis, target_axis))
 
-                can_owner_swap = True
+                can_owner_swap = (
+                    len(set(source_shard_dims)) == len(source_shard_dims)
+                    and len(set(dest_shard_dims)) == len(dest_shard_dims)
+                )
                 output_shape = list(tensor.shape)
                 mesh_shape = mesh.mesh.shape
                 mesh_dim_names = mesh.mesh_dim_names
                 for axis, target_axis in changes:
+                    if not can_owner_swap:
+                        break
                     source_mesh_dim = mesh_dim_names.index(axis.shard_dim)
                     dest_mesh_dim = mesh_dim_names.index(target_axis.shard_dim)
                     if mesh_shape[source_mesh_dim] != mesh_shape[dest_mesh_dim]:
@@ -347,6 +353,19 @@ def distributed_1d_2(shard, x, y, mesh, shapes = None, policy = None):
                     identity_forward_allreduce_backward,
                     tensor,
                     group(shard_dim),
+                    step_args=step.args,
+                )
+                continue
+
+            if step.name == "broadcast_forward_allreduce_backward":
+                shard_dim = step.args[0]
+                src = step.args[1] if len(step.args) > 1 else 0
+                tensor = plan.execute(
+                    step.name,
+                    broadcast_forward_allreduce_backward,
+                    tensor,
+                    group(shard_dim),
+                    src,
                     step_args=step.args,
                 )
                 continue
@@ -468,10 +487,15 @@ def distributed_1d_2(shard, x, y, mesh, shapes = None, policy = None):
         )
         plan.rank(ranked_alternatives, selected="default", reason="fallback selected")
     else:
-        # The optimized all-to-all path has different intermediate shapes from
-        # the fallback. Keep build-time ranking until runtime validation has
-        # chosen the optimized path.
-        ranked_alternatives = transition_plan.alternatives
+        ranked_alternatives = rank_alternatives(
+            transition_plan.alternatives,
+            runtime_info(original_input0_axes, original_x),
+            runtime_info(original_input1_axes, original_y),
+            mesh_sizes=mesh_sizes(),
+            split_shapes=cost_split_shapes(),
+            policy=policy,
+            output_infos={"alltoall_repartition": runtime_info(local_output_axes, z)},
+        )
         plan.rank(ranked_alternatives)
 
     for step in transition_plan.output_steps:
@@ -723,6 +747,100 @@ def distributed_1d_1(shard, x, mesh, shapes = None, policy = None):
                 step_args=step.args,
             )
             current_partials.append(partial)
+        elif step.name == "broadcast_forward_allreduce_backward":
+            shard_dim = step.args[0]
+            src = step.args[1] if len(step.args) > 1 else 0
+            z = plan.execute(
+                step.name,
+                broadcast_forward_allreduce_backward,
+                z,
+                group(shard_dim),
+                src,
+                step_args=step.args,
+            )
+        elif step.name == "owner_swap":
+            source_shard_dims, dest_shard_dims = step.args
+            changed = [
+                (in_by_name[name], out_by_name[name])
+                for name in shard_dim_changes
+                if in_by_name[name].shard_dim in source_shard_dims
+                and out_by_name[name].shard_dim in dest_shard_dims
+            ]
+            output_shape = list(z.shape)
+            can_owner_swap = (
+                len(set(source_shard_dims)) == len(source_shard_dims)
+                and len(set(dest_shard_dims)) == len(dest_shard_dims)
+            )
+            for in_axis, out_axis in changed:
+                if not can_owner_swap:
+                    break
+                source_mesh_dim = mesh.mesh_dim_names.index(in_axis.shard_dim)
+                dest_mesh_dim = mesh.mesh_dim_names.index(out_axis.shard_dim)
+                if mesh.mesh.shape[source_mesh_dim] != mesh.mesh.shape[dest_mesh_dim]:
+                    can_owner_swap = False
+                    break
+                source_comm = group(in_axis.shard_dim)
+                dest_comm = group(out_axis.shard_dim)
+                source_shapes = resolve_split_shapes(shapes, in_axis.shard_dim, in_axis.name, source_comm)
+                dest_shapes = resolve_split_shapes(shapes, out_axis.shard_dim, out_axis.name, dest_comm)
+                if source_shapes is None or dest_shapes is None or source_shapes != dest_shapes:
+                    can_owner_swap = False
+                    break
+                if z.shape[dim_of(in_axis.name)] != source_shapes[dist.get_rank(source_comm)]:
+                    can_owner_swap = False
+                    break
+                output_shape[dim_of(out_axis.name)] = dest_shapes[dist.get_rank(dest_comm)]
+
+            if not can_owner_swap:
+                warnings.warn(
+                    "Using gather/split fallback for distributed repartition; this may materialize a larger tensor. "
+                    "The optimized path currently requires same-mesh axis-to-axis repartition with explicit split metadata.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                for in_axis, _ in changed:
+                    source_dim = dim_of(in_axis.name)
+                    source_comm = group(in_axis.shard_dim)
+                    source_shapes = resolve_split_shapes(shapes, in_axis.shard_dim, in_axis.name, source_comm)
+                    z = plan.execute(
+                        "allgather_forward_split_backward",
+                        allgather_forward_split_backward,
+                        z,
+                        source_comm,
+                        source_dim,
+                        source_shapes,
+                        step_args=(in_axis.name, in_axis.shard_dim),
+                    )
+                    current[source_dim] = Axis(in_axis.name)
+
+                for _, out_axis in changed:
+                    dest_dim = dim_of(out_axis.name)
+                    dest_comm = group(out_axis.shard_dim)
+                    dest_shapes = resolve_split_shapes(shapes, out_axis.shard_dim, out_axis.name, dest_comm)
+                    z = plan.execute(
+                        "split_forward_allgather_backward",
+                        split_forward_allgather_backward,
+                        z,
+                        dest_comm,
+                        dest_dim,
+                        dest_shapes,
+                        step_args=(out_axis.name, out_axis.shard_dim),
+                    )
+                    current[dest_dim] = out_axis
+                return
+
+            z = plan.execute(
+                step.name,
+                owner_swap_forward_backward,
+                z,
+                mesh,
+                source_shard_dims,
+                dest_shard_dims,
+                tuple(output_shape),
+                step_args=step.args,
+            )
+            for in_axis, out_axis in changed:
+                current[dim_of(in_axis.name)] = out_axis
         elif step.name == "permute":
             plan.add(step.name, *step.args)
             z = einsum(shard, z, name_only=True)
@@ -792,6 +910,8 @@ def distributed_1d_1(shard, x, mesh, shapes = None, policy = None):
         changed = [(in_by_name[name], out_by_name[name]) for name in shard_dim_changes]
         source_shard_dims = tuple(in_axis.shard_dim for in_axis, _ in changed)
         dest_shard_dims = tuple(out_axis.shard_dim for _, out_axis in changed)
+        if len(set(source_shard_dims)) != len(source_shard_dims) or len(set(dest_shard_dims)) != len(dest_shard_dims):
+            return None
         if len(changed) > 1 and set(source_shard_dims) != set(dest_shard_dims):
             return None
         involved_dims = set(source_shard_dims) | set(dest_shard_dims)
@@ -839,7 +959,8 @@ def distributed_1d_1(shard, x, mesh, shapes = None, policy = None):
     }:
         execute_transition_step(remaining_steps.pop(0))
 
-    optimized = try_multi_axis_owner_swap()
+    has_planned_owner_swap = any(step.name == "owner_swap" for step in remaining_steps)
+    optimized = None if has_planned_owner_swap else try_multi_axis_owner_swap()
     owner_swap_applied = False
     if optimized is not None:
         z = optimized
@@ -851,9 +972,6 @@ def distributed_1d_1(shard, x, mesh, shapes = None, policy = None):
         ]
         owner_swap_applied = True
 
-    if not owner_swap_applied:
-        assert len(shard_dim_changes) <= 1, "Cannot repartition multiple sharded axes between shard dimensions yet"
-
     optimized = try_same_mesh_repartition()
     if optimized is not None:
         z = optimized
@@ -861,7 +979,7 @@ def distributed_1d_1(shard, x, mesh, shapes = None, policy = None):
         if [axis.name for axis in current] == [axis.name for axis in output_axes]:
             return finish(z)
 
-    if has_repartition_change() and not owner_swap_applied:
+    if has_repartition_change() and not owner_swap_applied and not has_planned_owner_swap:
         warnings.warn(
             "Using gather/split fallback for distributed repartition; this may materialize a larger tensor. "
             "The optimized path currently requires same-mesh axis-to-axis repartition with explicit split metadata.",

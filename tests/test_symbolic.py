@@ -4,6 +4,7 @@ from torch_einshard.grammar import parse_sharding
 from torch_einshard.symbolic import (
     ExecutionPlan,
     PlanPolicy,
+    PlanStep,
     TensorRuntimeInfo,
     TensorState,
     build_binary_transition_plan,
@@ -37,6 +38,14 @@ def test_tensor_state_from_spec_tracks_placements_and_partials():
     assert [axis.name for axis in state.axes] == ["a", "b", "c"]
     assert state.placement_dict() == {"a": "dp", "b": None, "c": "tp"}
     assert state.partials == ("sp",)
+
+
+def test_tensor_state_tracks_replicated_mesh_dims():
+    x, _, _ = parse_sharding("a/dp b // tp -> a b")
+
+    state = TensorState.from_spec(x, mesh_dim_names=("dp", "sp", "tp"))
+
+    assert state.replicated_dims == ("sp",)
 
 
 def test_tensor_state_flattens_axis_groups():
@@ -99,6 +108,35 @@ def test_unary_transition_plan_splits_and_gathers():
 
     x, _, z = parse_sharding("a/dp b -> a b")
     assert build_unary_transition_plan(x, z).names() == ["allgather_forward_split_backward"]
+
+
+def test_unary_transition_plan_models_owner_swap_atomically():
+    x, _, z = parse_sharding("a/dp b/sp -> a/sp b/dp")
+
+    plan = build_unary_transition_plan(x, z)
+
+    assert [(step.name, step.args) for step in plan.steps] == [
+        ("owner_swap", (("dp", "sp"), ("sp", "dp"))),
+    ]
+
+
+def test_unary_transition_plan_rejects_owner_swap_with_unchanged_involved_axis():
+    x, _, z = parse_sharding("a/dp b/sp -> a/sp b/sp")
+
+    plan = build_unary_transition_plan(x, z)
+
+    assert [(step.name, step.args) for step in plan.steps] == [
+        ("allgather_forward_split_backward", ("a", "dp")),
+        ("split_forward_allgather_backward", ("a", "sp")),
+    ]
+
+
+def test_unary_transition_plan_rejects_conflicting_owner_swap_mapping():
+    x, _, z = parse_sharding("a/dp b/dp c/sp d/tp -> a/sp b/tp c/dp d/dp")
+
+    plan = build_unary_transition_plan(x, z)
+
+    assert "owner_swap" not in plan.names()
 
 
 def test_unary_transition_plan_handles_partials_before_layout_changes():
@@ -325,7 +363,7 @@ def test_runtime_cost_estimate_accepts_named_policy_modes():
     assert plan_cost.score > default.cost.score
 
 
-def test_runtime_ranking_leaves_alltoall_sets_static():
+def test_runtime_ranking_costs_alltoall_sets():
     x, y, z = parse_sharding("a/tp b, c d -> a c/tp")
     plan = build_binary_transition_plan(x, y, z)
 
@@ -337,8 +375,60 @@ def test_runtime_ranking_leaves_alltoall_sets_static():
         mesh_sizes={"tp": 2},
     )
 
-    assert ranked == plan.alternatives
-    assert all(alternative.cost.forward_bytes == 0 for alternative in ranked)
+    assert [alternative.name for alternative in ranked] == ["alltoall_repartition", "default"]
+    assert all(alternative.cost.forward_bytes > 0 for alternative in ranked)
+
+
+def test_plan_cost_estimate_models_broadcast_step():
+    x, _, _ = parse_sharding("a b -> a b")
+    info = TensorRuntimeInfo(tuple(x.axes), (8, 4), 4)
+
+    cost = estimate_plan_cost(
+        [PlanStep("broadcast_forward_allreduce_backward", ("dp", 0))],
+        info,
+        policy=False,
+    )
+    assert cost.collectives == 1
+    assert cost.forward_bytes == 8 * 4 * 4
+
+
+def test_binary_transition_plan_includes_replicated_gradient_allreduce():
+    x, y, z = parse_sharding("a/dp k, k/sp b -> a/dp b/sp")
+
+    plan = build_binary_transition_plan(x, y, z)
+
+    assert [(step.name, step.args) for step in plan.input1_steps] == [
+        ("identity_forward_allreduce_backward", ("dp",)),
+    ]
+
+
+def test_uneven_reduce_scatter_cost_models_fallback_materialization():
+    x, y, z = parse_sharding("a b/tp, b c -> a/tp c")
+    plan = build_binary_transition_plan(x, y, z)
+    default = next(alternative for alternative in plan.alternatives if alternative.name == "default")
+    info = (
+        TensorRuntimeInfo(tuple(x.axes), (5, 8), 4),
+        TensorRuntimeInfo(tuple(y.axes), (8, 6), 4),
+        TensorRuntimeInfo(tuple(z.axes), (3, 6), 4),
+    )
+
+    even = estimate_alternative_cost(
+        default,
+        *info,
+        mesh_sizes={"tp": 2},
+        split_shapes={("tp", "a"): (3, 3)},
+        policy=False,
+    )
+    uneven = estimate_alternative_cost(
+        default,
+        *info,
+        mesh_sizes={"tp": 2},
+        split_shapes={("tp", "a"): (3, 2)},
+        policy=False,
+    )
+
+    assert uneven.materialized_elements > even.materialized_elements
+    assert uneven.forward_bytes > even.forward_bytes
 
 
 def test_runtime_ranking_keeps_reduce_scatter_before_allreduce_split():

@@ -53,17 +53,20 @@ class TensorState:
     axes: tuple
     placements: tuple
     partials: tuple
+    replicated_dims: tuple = ()
 
     @classmethod
-    def from_spec(cls, spec):
+    def from_spec(cls, spec, mesh_dim_names=()):
         axes = tuple(StateAxis(axis.name, axis.shard_dim) for axis in require_expanded_axes(spec))
         names = [axis.name for axis in axes]
         if len(set(names)) != len(names):
             raise ValueError("Symbolic TensorState requires unique axis names")
+        used_dims = {axis.shard_dim for axis in axes if axis.shard_dim} | set(partials_of(spec))
         return cls(
             axes=axes,
             placements=tuple((axis.name, axis.shard_dim or None) for axis in axes),
             partials=partials_of(spec),
+            replicated_dims=tuple(dim for dim in mesh_dim_names if dim not in used_dims),
         )
 
     def placement(self, name):
@@ -463,6 +466,31 @@ def build_unary_transition_plan(input_spec, output_spec):
     current_partials = list(input_state.partials)
     steps = []
 
+    def owner_swap_changes():
+        if output_state.partials or tuple(axis.name for axis in input_state.axes) != tuple(axis.name for axis in output_state.axes):
+            return ()
+        changed = []
+        for output_axis in output_state.axes:
+            input_axis = input_state.axis(output_axis.name)
+            if input_axis.shard_dim and output_axis.shard_dim and input_axis.shard_dim != output_axis.shard_dim:
+                changed.append((input_axis, output_axis))
+        if not changed:
+            return ()
+        source_shard_dims = tuple(input_axis.shard_dim for input_axis, _ in changed)
+        dest_shard_dims = tuple(output_axis.shard_dim for _, output_axis in changed)
+        if len(set(source_shard_dims)) != len(source_shard_dims) or len(set(dest_shard_dims)) != len(dest_shard_dims):
+            return ()
+        if len(changed) > 1 and set(source_shard_dims) != set(dest_shard_dims):
+            return ()
+        involved_dims = set(source_shard_dims) | set(dest_shard_dims)
+        changed_names = {input_axis.name for input_axis, _ in changed}
+        for input_axis, output_axis in zip(input_state.axes, output_state.axes):
+            if input_axis.name in changed_names:
+                continue
+            if input_axis.shard_dim in involved_dims or output_axis.shard_dim in involved_dims:
+                return ()
+        return tuple(changed)
+
     for partial in classification.removed_partials:
         scatter_axis = None
         for axis in output_state.axes:
@@ -477,7 +505,22 @@ def build_unary_transition_plan(input_spec, output_spec):
             current_placements[scatter_axis.name] = partial
         current_partials.remove(partial)
 
+    swapped_axes = owner_swap_changes()
+    swapped_names = {input_axis.name for input_axis, _ in swapped_axes}
+    if swapped_axes:
+        steps.append(PlanStep(
+            "owner_swap",
+            (
+                tuple(input_axis.shard_dim for input_axis, _ in swapped_axes),
+                tuple(output_axis.shard_dim for _, output_axis in swapped_axes),
+            ),
+        ))
+        for input_axis, output_axis in swapped_axes:
+            current_placements[input_axis.name] = output_axis.shard_dim
+
     for axis in output_state.axes:
+        if axis.name in swapped_names:
+            continue
         source = current_placements[axis.name]
         target = output_state.placement(axis.name)
         if source == target:
@@ -569,6 +612,8 @@ def _step_cost(step):
         return PlanCost(4, collectives=1)
     if step.name == "owner_swap":
         return PlanCost(6, collectives=1)
+    if step.name == "broadcast_forward_allreduce_backward":
+        return PlanCost(7, collectives=1)
     if step.name == "split_forward_allgather_backward":
         return PlanCost(3, collectives=1)
     if step.name == "allreduce_forward_identity_backward":
@@ -634,10 +679,17 @@ def _dynamic_step_cost(step, info, mesh_sizes, split_shapes):
 
     if step.name in {"split_forward_allgather_backward", "reducescatter_forward_allgather_backward"}:
         axis_name, shard_dim = step.args
+        axis_shapes = split_shapes.get((shard_dim, axis_name)) if split_shapes is not None else None
         after_info = _rescale_axis(info, axis_name, shard_dim, mesh_sizes, split_shapes, "split")
         forward_elements = before_elements
         backward_elements = max(before_elements, after_info.num_elements())
         peak_elements = max(before_elements, after_info.num_elements())
+        if step.name == "reducescatter_forward_allgather_backward" and axis_shapes is not None and len(set(axis_shapes)) != 1:
+            full_info = _rescale_axis(info, axis_name, shard_dim, mesh_sizes, split_shapes, "gather")
+            full_elements = full_info.num_elements()
+            forward_elements = full_elements
+            materialized_elements = full_elements
+            peak_elements = max(peak_elements, full_elements)
         after_info = after_info.with_axis(axis_name, Axis(axis_name, shard_dim))
     elif step.name in {"allgather_forward_split_backward", "allgather_forward_reducescatter_backward"}:
         axis_name, shard_dim = step.args
@@ -648,7 +700,11 @@ def _dynamic_step_cost(step, info, mesh_sizes, split_shapes):
         materialized_elements = after_elements
         peak_elements = max(before_elements, after_elements)
         after_info = after_info.with_axis(axis_name, Axis(axis_name))
-    elif step.name in {"allreduce_forward_identity_backward", "identity_forward_allreduce_backward"}:
+    elif step.name in {
+        "allreduce_forward_identity_backward",
+        "identity_forward_allreduce_backward",
+        "broadcast_forward_allreduce_backward",
+    }:
         forward_elements = before_elements
         backward_elements = before_elements
     elif step.name == "alltoall_repartition":
@@ -745,21 +801,51 @@ def estimate_alternative_cost(alternative, input0_info, input1_info, output_info
     return _apply_policy(_combine_costs(costs), policy)
 
 
-def rank_alternatives(alternatives, input0_info=None, input1_info=None, output_info=None, mesh_sizes=None, split_shapes=None, policy=None):
-    # Post-repartition alternatives can have different rank-local einsum output
-    # shapes from their fallback. Until the planner carries per-alternative
-    # output metadata, keep those rankings static and behavior-preserving.
-    if any(alternative.name == "alltoall_repartition" for alternative in alternatives):
-        return _rank_alternatives(alternatives)
-
+def rank_alternatives(
+    alternatives,
+    input0_info=None,
+    input1_info=None,
+    output_info=None,
+    mesh_sizes=None,
+    split_shapes=None,
+    policy=None,
+    output_infos=None,
+):
     if input0_info is not None and input1_info is not None and output_info is not None:
         policy = resolve_plan_policy(policy=policy)
         alternatives = tuple(
             alternative.with_cost(
-                estimate_alternative_cost(alternative, input0_info, input1_info, output_info, mesh_sizes, split_shapes, policy)
+                estimate_alternative_cost(
+                    alternative,
+                    input0_info,
+                    input1_info,
+                    output_infos.get(alternative.name, output_info) if output_infos is not None else output_info,
+                    mesh_sizes,
+                    split_shapes,
+                    policy,
+                )
             )
             for alternative in alternatives
         )
+    elif input0_info is not None and input1_info is not None and output_infos is not None:
+        policy = resolve_plan_policy(policy=policy)
+        alternatives = tuple(
+            alternative.with_cost(
+                estimate_alternative_cost(
+                    alternative,
+                    input0_info,
+                    input1_info,
+                    output_infos[alternative.name],
+                    mesh_sizes,
+                    split_shapes,
+                    policy,
+                )
+            ) if alternative.name in output_infos else alternative
+            for alternative in alternatives
+        )
+        if all(alternative.name in output_infos for alternative in alternatives):
+            return _rank_alternatives(alternatives)
+        return alternatives
     return _rank_alternatives(alternatives)
 
 
@@ -923,6 +1009,26 @@ def build_binary_transition_plan(input0_spec, input1_spec, output_spec):
             if axis.local() and output_axis.shard_dim in reduction_dims:
                 continue
             steps.extend(_normalize_axis_steps(axis, output_axis, active_output_dims))
+
+        input_axis_names = {axis.name for axis in state.axes}
+        input_shard_dims = {axis.shard_dim for axis in state.axes if axis.shard_dim}
+        backward_reduced_dims = {
+            step.args[-1]
+            for step in steps
+            if step.name in {
+                "allgather_forward_reducescatter_backward",
+                "identity_forward_allreduce_backward",
+            }
+        }
+        for output_axis in output_state.axes:
+            if not output_axis.shard_dim or output_axis.name in input_axis_names:
+                continue
+            if output_axis.shard_dim in reduction_dims or output_axis.shard_dim in input_shard_dims:
+                continue
+            if output_axis.shard_dim in backward_reduced_dims:
+                continue
+            steps.append(PlanStep("identity_forward_allreduce_backward", (output_axis.shard_dim,)))
+            backward_reduced_dims.add(output_axis.shard_dim)
         return tuple(steps)
 
     output_steps = [PlanStep("rank_local_einsum")]
