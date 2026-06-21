@@ -1,9 +1,12 @@
+from contextlib import nullcontext
+
 import pytest
 import torch
 import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
 
 import torch_einshard as es
+from torch_einshard.symbolic import last_plan
 
 from conftest import assert_close
 
@@ -25,9 +28,11 @@ def test_single_axis_split_gather_round_trip(dist_env, mesh_1d):
     z = es.einshard("a b -> a/dp b", x, mesh=mesh_1d, shapes=shapes)
 
     assert z.shape == (shapes[rank], 3)
+    assert [step.name for step in last_plan()] == ["split_forward_allgather_backward"]
 
     zz = es.einshard("a/dp b -> a b", z, mesh=mesh_1d, shapes=shapes)
     assert_close(zz, x)
+    assert [step.name for step in last_plan()] == ["allgather_forward_split_backward"]
 
     (z ** 2).sum().backward()
     assert_close(x.grad, 2 * x)
@@ -108,6 +113,7 @@ def test_repartition_between_axes(dist_env, mesh_1d):
 
     expected = torch.split(full.detach(), col_shapes, dim=1)[rank]
     assert_close(z, expected)
+    assert [step.name for step in last_plan()] == ["alltoall_repartition"]
 
 
 def test_repartition_between_axes_uneven_shards(dist_env, mesh_1d):
@@ -176,7 +182,11 @@ def test_repartition_between_mesh_dimensions(dist_env, mesh_2d):
     full = torch.randn(rows, 3, requires_grad=True)
     x = torch.split(full.detach(), dp_shapes, dim=0)[dp_rank].clone().requires_grad_(True)
 
-    with pytest.warns(RuntimeWarning, match="gather/split fallback"):
+    context = nullcontext() if dp_size == sp_size and dp_shapes == sp_shapes else pytest.warns(
+        RuntimeWarning,
+        match="gather/split fallback",
+    )
+    with context:
         z = es.einshard(
             "a/dp b -> a/sp b",
             x,
@@ -186,6 +196,101 @@ def test_repartition_between_mesh_dimensions(dist_env, mesh_2d):
 
     expected = torch.split(full.detach(), sp_shapes, dim=0)[sp_rank]
     assert_close(z, expected)
+    if dp_size == sp_size and dp_shapes == sp_shapes:
+        assert [step.name for step in last_plan()] == ["owner_swap"]
+
+
+def test_single_axis_ownership_swap_on_equal_mesh_dims(dist_env):
+    if dist_env.world_size % 4 != 0:
+        pytest.skip("test requires a world size divisible by 4")
+    mesh = init_device_mesh(dist_env.device, (2, 2, dist_env.world_size // 4), mesh_dim_names=("dp", "sp", "tp"))
+    dp_group = mesh["dp"].get_group()
+    sp_group = mesh["sp"].get_group()
+    dp_rank = dist.get_rank(dp_group)
+    sp_rank = dist.get_rank(sp_group)
+    dp_size = dist.get_world_size(dp_group)
+    sp_size = dist.get_world_size(sp_group)
+    rows = dp_size * sp_size * 2
+    shapes = es.helpers.compute_split_shapes(rows, dp_size)
+
+    full = torch.randn(rows, 3, requires_grad=True)
+    x = torch.split(full.detach(), shapes, dim=0)[dp_rank].clone().requires_grad_(True)
+
+    z = es.einshard(
+        "a/dp b -> a/sp b",
+        x,
+        mesh=mesh,
+        shapes={"dp": {"a": shapes}, "sp": {"a": shapes}},
+    )
+
+    expected = torch.split(full.detach(), shapes, dim=0)[sp_rank]
+    assert_close(z, expected)
+    assert [step.name for step in last_plan()] == ["owner_swap"]
+
+
+def test_single_axis_ownership_swap_rejects_unchanged_axes_on_involved_dims(dist_env):
+    if dist_env.world_size % 4 != 0:
+        pytest.skip("test requires a world size divisible by 4")
+    mesh = init_device_mesh(dist_env.device, (2, 2, dist_env.world_size // 4), mesh_dim_names=("dp", "sp", "tp"))
+    dp_group = mesh["dp"].get_group()
+    sp_group = mesh["sp"].get_group()
+    dp_rank = dist.get_rank(dp_group)
+    sp_rank = dist.get_rank(sp_group)
+    dp_size = dist.get_world_size(dp_group)
+    sp_size = dist.get_world_size(sp_group)
+    a_shapes = es.helpers.compute_split_shapes(5, dp_size)
+    c_shapes = es.helpers.compute_split_shapes(7, sp_size)
+
+    full = torch.randn(5, 7, 3, requires_grad=True)
+    x = torch.split(full.detach(), a_shapes, dim=0)[dp_rank]
+    x = torch.split(x, c_shapes, dim=1)[sp_rank].clone().requires_grad_(True)
+
+    with pytest.warns(RuntimeWarning, match="gather/split fallback"):
+        z = es.einshard(
+            "a/dp c/sp b -> a/sp c/sp b",
+            x,
+            mesh=mesh,
+            shapes={"dp": {"a": a_shapes}, "sp": {"a": a_shapes, "c": c_shapes}},
+        )
+
+    expected = torch.split(full.detach(), a_shapes, dim=0)[sp_rank]
+    expected = torch.split(expected, c_shapes, dim=1)[sp_rank]
+    assert_close(z, expected)
+    assert [step.name for step in last_plan()] == [
+        "allgather_forward_split_backward",
+        "split_forward_allgather_backward",
+    ]
+
+
+def test_single_axis_ownership_swap_keeps_independent_transitions(dist_env):
+    if dist_env.world_size % 4 != 0:
+        pytest.skip("test requires a world size divisible by 4")
+    mesh = init_device_mesh(dist_env.device, (2, 2, dist_env.world_size // 4), mesh_dim_names=("dp", "sp", "tp"))
+    dp_group = mesh["dp"].get_group()
+    sp_group = mesh["sp"].get_group()
+    tp_group = mesh["tp"].get_group()
+    dp_rank = dist.get_rank(dp_group)
+    sp_rank = dist.get_rank(sp_group)
+    tp_rank = dist.get_rank(tp_group)
+    dp_size = dist.get_world_size(dp_group)
+    tp_size = dist.get_world_size(tp_group)
+    a_shapes = es.helpers.compute_split_shapes(5, dp_size)
+    b_shapes = es.helpers.compute_split_shapes(7, tp_size)
+
+    full = torch.randn(5, 7, requires_grad=True)
+    x = torch.split(full.detach(), a_shapes, dim=0)[dp_rank].clone().requires_grad_(True)
+
+    z = es.einshard(
+        "a/dp b -> a/sp b/tp",
+        x,
+        mesh=mesh,
+        shapes={"dp": {"a": a_shapes}, "sp": {"a": a_shapes}, "tp": {"b": b_shapes}},
+    )
+
+    expected = torch.split(full.detach(), a_shapes, dim=0)[sp_rank]
+    expected = torch.split(expected, b_shapes, dim=1)[tp_rank]
+    assert_close(z, expected)
+    assert [step.name for step in last_plan()] == ["owner_swap", "split_forward_allgather_backward"]
 
 
 def test_multi_axis_ownership_swap(dist_env):
@@ -224,6 +329,48 @@ def test_multi_axis_ownership_swap(dist_env):
 
     z.sum().backward()
     assert_close(x.grad, torch.ones_like(x))
+
+
+def test_three_axis_cyclic_ownership_swap(dist_env):
+    if dist_env.world_size % 8 != 0:
+        pytest.skip("test requires a world size divisible by 8")
+    mesh = init_device_mesh(dist_env.device, (2, 2, dist_env.world_size // 4), mesh_dim_names=("dp", "sp", "tp"))
+    dp_group = mesh["dp"].get_group()
+    sp_group = mesh["sp"].get_group()
+    tp_group = mesh["tp"].get_group()
+    dp_rank = dist.get_rank(dp_group)
+    sp_rank = dist.get_rank(sp_group)
+    tp_rank = dist.get_rank(tp_group)
+    dp_size = dist.get_world_size(dp_group)
+    sp_size = dist.get_world_size(sp_group)
+    tp_size = dist.get_world_size(tp_group)
+    if dp_size != sp_size or sp_size != tp_size:
+        pytest.skip("test requires equal mesh dimension sizes")
+
+    a_shapes = es.helpers.compute_split_shapes(5, dp_size)
+    b_shapes = es.helpers.compute_split_shapes(7, dp_size)
+    c_shapes = es.helpers.compute_split_shapes(9, dp_size)
+    full = torch.randn(5, 7, 9, requires_grad=True)
+    x = torch.split(full.detach(), a_shapes, dim=0)[dp_rank]
+    x = torch.split(x, b_shapes, dim=1)[sp_rank]
+    x = torch.split(x, c_shapes, dim=2)[tp_rank].clone().requires_grad_(True)
+
+    z = es.einshard(
+        "a/dp b/sp c/tp -> a/sp b/tp c/dp",
+        x,
+        mesh=mesh,
+        shapes={
+            "dp": {"a": a_shapes, "c": c_shapes},
+            "sp": {"a": a_shapes, "b": b_shapes},
+            "tp": {"b": b_shapes, "c": c_shapes},
+        },
+    )
+
+    expected = torch.split(full.detach(), a_shapes, dim=0)[sp_rank]
+    expected = torch.split(expected, b_shapes, dim=1)[tp_rank]
+    expected = torch.split(expected, c_shapes, dim=2)[dp_rank]
+    assert_close(z, expected)
+    assert [step.name for step in last_plan()] == ["owner_swap"]
 
 
 def test_partial_to_full(dist_env, mesh_tp):

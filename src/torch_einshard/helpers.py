@@ -30,6 +30,13 @@ def all_reduce(input, group):
     dist.all_reduce(output, group = group)
     return output
 
+
+def broadcast(input, group, src=0):
+    output = input.contiguous().clone()
+    global_src = dist.get_global_rank(group, src)
+    dist.broadcast(output, global_src, group=group)
+    return output
+
 def split(input, group, dim, shapes):
     """Split the tensor along dim."""
     # Bypass the function if we are using only 1 GPU or if
@@ -105,8 +112,30 @@ def all_gather(input, group, dim, shapes):
 
 def reduce_scatter(input, group, dim, shapes):
     """Reduce the tensor across ranks, then split the result along dim."""
-    reduced = all_reduce(input, group)
-    return split(reduced, group, dim, shapes)
+    size = dist.get_world_size(group)
+    if size == 1:
+        return input
+
+    if shapes is None:
+        shapes = compute_split_shapes(input.shape[dim], size)
+
+    if len(shapes) != size:
+        raise ValueError(f"Error: passed shapes of size {len(shapes)} not equal to {size}")
+
+    if len(set(shapes)) != 1:
+        reduced = all_reduce(input, group)
+        return split(reduced, group, dim, shapes)
+
+    chunk_size = shapes[0]
+    if input.shape[dim] != chunk_size * size:
+        raise ValueError(
+            f"Error: tensor size {input.shape[dim]} along dim {dim} does not match reduce_scatter shapes {shapes}"
+        )
+
+    moved = input.movedim(dim, 0).contiguous()
+    output = torch.empty((chunk_size, *moved.shape[1:]), dtype=input.dtype, device=input.device)
+    dist.reduce_scatter_tensor(output, moved, group=group)
+    return output.movedim(0, dim).contiguous()
 
 
 def all_to_all_repartition(input, group, source_dim, dest_dim, source_shapes, dest_shapes):
@@ -161,11 +190,20 @@ def owner_swap(input, mesh, source_shard_dims, dest_shard_dims, output_shape):
 
     send_coord = list(coord)
     recv_coord = list(coord)
-    for source_shard_dim, dest_shard_dim in zip(source_shard_dims, dest_shard_dims):
-        source_mesh_dim = name_to_dim[source_shard_dim]
-        dest_mesh_dim = name_to_dim[dest_shard_dim]
-        send_coord[dest_mesh_dim] = coord[source_mesh_dim]
-        recv_coord[source_mesh_dim] = coord[dest_mesh_dim]
+    if set(source_shard_dims) == set(dest_shard_dims):
+        for source_shard_dim, dest_shard_dim in zip(source_shard_dims, dest_shard_dims):
+            source_mesh_dim = name_to_dim[source_shard_dim]
+            dest_mesh_dim = name_to_dim[dest_shard_dim]
+            send_coord[dest_mesh_dim] = coord[source_mesh_dim]
+            recv_coord[source_mesh_dim] = coord[dest_mesh_dim]
+    else:
+        for source_shard_dim, dest_shard_dim in zip(source_shard_dims, dest_shard_dims):
+            source_mesh_dim = name_to_dim[source_shard_dim]
+            dest_mesh_dim = name_to_dim[dest_shard_dim]
+            send_coord[source_mesh_dim] = coord[dest_mesh_dim]
+            send_coord[dest_mesh_dim] = coord[source_mesh_dim]
+            recv_coord[source_mesh_dim] = coord[dest_mesh_dim]
+            recv_coord[dest_mesh_dim] = coord[source_mesh_dim]
 
     send_rank = int(mesh_tensor[tuple(send_coord)].item())
     recv_rank = int(mesh_tensor[tuple(recv_coord)].item())

@@ -4,6 +4,7 @@ import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
 
 import torch_einshard as es
+from torch_einshard.symbolic import last_alternatives, last_candidates, last_plan
 
 from conftest import assert_close
 
@@ -103,6 +104,10 @@ def test_row_parallel_linear_pattern(dist_env, mesh_tp):
 
     expected = torch.einsum("bnc,hc->bnh", x, weight)
     assert_close(z, expected)
+    assert [step.name for step in last_plan()] == [
+        "rank_local_einsum",
+        "allreduce_forward_identity_backward",
+    ]
 
 
 def test_row_parallel_linear_explicit_partial_output(dist_env, mesh_tp):
@@ -120,6 +125,7 @@ def test_row_parallel_linear_explicit_partial_output(dist_env, mesh_tp):
 
     expected = torch.einsum("bnc,hc->bnh", x_shard, weight_shard)
     assert_close(z, expected)
+    assert [step.name for step in last_plan()] == ["rank_local_einsum"]
 
 
 def test_multi_axis_sharded_contraction(dist_env, mesh_2d):
@@ -432,6 +438,54 @@ def test_shared_local_axis_reduce_scatters_to_sharded_output(dist_env, mesh_2d):
     assert_close(y_shard.grad, torch.split(y_ref.grad, hidden_sp_shapes, dim=1)[sp_rank])
 
 
+def test_summa_style_2d_matmul_reduce_scatters_output(dist_env, mesh_2d):
+    dp_group = mesh_2d["dp"].get_group()
+    sp_group = mesh_2d["sp"].get_group()
+    dp_rank = dist.get_rank(dp_group)
+    sp_rank = dist.get_rank(sp_group)
+    dp_size = dist.get_world_size(dp_group)
+    sp_size = dist.get_world_size(sp_group)
+    rows = dp_size * 2 + 1
+    hidden = sp_size * 3 + 2
+    cols = sp_size * 2
+    row_shapes = es.helpers.compute_split_shapes(rows, dp_size)
+    hidden_shapes = es.helpers.compute_split_shapes(hidden, sp_size)
+    col_shapes = es.helpers.compute_split_shapes(cols, sp_size)
+
+    x_full = torch.randn(rows, hidden)
+    y_full = torch.randn(hidden, cols)
+    x_shard = torch.split(x_full, row_shapes, dim=0)[dp_rank].clone().requires_grad_(True)
+    y_shard = torch.split(y_full, hidden_shapes, dim=0)[sp_rank].clone().requires_grad_(True)
+
+    z = es.einshard(
+        "a/dp k, k/sp b -> a/dp b/sp",
+        x_shard,
+        y_shard,
+        mesh=mesh_2d,
+        shapes={"dp": {"a": row_shapes}, "sp": {"k": hidden_shapes, "b": col_shapes}},
+    )
+
+    x_ref = x_full.detach().clone().requires_grad_(True)
+    y_ref = y_full.detach().clone().requires_grad_(True)
+    expected_full = torch.einsum("ak,kb->ab", x_ref, y_ref)
+    expected = torch.split(torch.split(expected_full, row_shapes, dim=0)[dp_rank], col_shapes, dim=1)[sp_rank]
+    assert_close(z, expected)
+    assert [step.name for step in last_plan()] == [
+        "split_forward_allgather_backward",
+        "identity_forward_allreduce_backward",
+        "rank_local_einsum",
+        "reducescatter_forward_allgather_backward",
+    ]
+
+    grad_full = torch.randn(rows, cols)
+    grad_shard = torch.split(torch.split(grad_full, row_shapes, dim=0)[dp_rank], col_shapes, dim=1)[sp_rank]
+    z.backward(grad_shard)
+    expected_full.backward(grad_full)
+
+    assert_close(x_shard.grad, torch.split(x_ref.grad, row_shapes, dim=0)[dp_rank])
+    assert_close(y_shard.grad, torch.split(y_ref.grad, hidden_shapes, dim=0)[sp_rank])
+
+
 def test_two_crossed_contractions_reduce_scatter_two_output_axes(dist_env, mesh_2d):
     dp_group = mesh_2d["dp"].get_group()
     sp_group = mesh_2d["sp"].get_group()
@@ -493,6 +547,13 @@ def test_two_crossed_contractions_reduce_scatter_two_output_axes(dist_env, mesh_
     expected_y_grad = _split_two(y_ref.grad, k_sp_shapes, 0, sp_rank, m_dp_shapes, 1, dp_rank)
     assert_close(x_shard.grad, expected_x_grad)
     assert_close(y_shard.grad, expected_y_grad)
+    assert [(alternative.name, alternative.status) for alternative in last_alternatives()] == [
+        ("default", "selected"),
+    ]
+    assert [(candidate.name, candidate.status) for candidate in last_candidates()] == [
+        ("owner_swap", "accepted"),
+    ]
+    assert "owner_swap" in [step.name for step in last_plan()]
 
 
 def test_owner_swap_with_additional_local_contracted_axis(dist_env):
@@ -734,6 +795,10 @@ def test_binary_reduce_scatters_contraction_to_output_axis(dist_env, mesh_tp):
 
     assert_close(x_shard.grad, torch.split(x_ref.grad, col_shapes, dim=1)[rank])
     assert_close(y_shard.grad, torch.split(y_ref.grad, col_shapes, dim=0)[rank])
+    assert [(alternative.name, alternative.status) for alternative in last_alternatives()] == [
+        ("default", "selected"),
+        ("allreduce_then_split", "ranked"),
+    ]
 
 
 def test_binary_splits_full_contracted_axis_to_match_shard(dist_env, mesh_tp):
@@ -805,6 +870,88 @@ def test_binary_repartitions_free_axis_after_local_contraction(dist_env, mesh_tp
 
     assert_close(x_shard.grad, torch.split(x_ref.grad, row_shapes, dim=0)[rank])
     assert_close(y.grad, y_ref.grad)
+    assert [(alternative.name, alternative.status) for alternative in last_alternatives()] == [
+        ("alltoall_repartition", "selected"),
+        ("default", "ranked"),
+    ]
+    assert [(candidate.name, candidate.status) for candidate in last_candidates()] == [
+        ("alltoall_repartition", "accepted"),
+    ]
+    assert [step.name for step in last_plan()] == [
+        "identity_forward_allreduce_backward",
+        "rank_local_einsum",
+        "alltoall_repartition",
+    ]
+
+
+def test_binary_repartition_candidate_falls_back_without_shapes(dist_env, mesh_tp):
+    group = mesh_tp["tp"].get_group()
+    rank = dist.get_rank(group)
+    world_size = dist.get_world_size(group)
+    rows = world_size * 2
+    cols = world_size * 3
+    hidden = 4
+
+    x_full = torch.randn(rows, hidden)
+    y = torch.randn(hidden, cols)
+    x_shard = torch.split(x_full, rows // world_size, dim=0)[rank]
+
+    z = es.einshard(
+        "l/tp e, e f -> l f/tp",
+        x_shard,
+        y,
+        mesh=mesh_tp,
+    )
+
+    expected_full = torch.einsum("le,ef->lf", x_full, y)
+    expected = torch.split(expected_full, cols // world_size, dim=1)[rank]
+    assert_close(z, expected)
+    assert [(candidate.name, candidate.status) for candidate in last_candidates()] == [
+        ("alltoall_repartition", "rejected"),
+    ]
+    assert [(alternative.name, alternative.status) for alternative in last_alternatives()] == [
+        ("alltoall_repartition", "ranked"),
+        ("default", "selected"),
+    ]
+    assert [step.name for step in last_plan()] == [
+        "allgather_forward_reducescatter_backward",
+        "split_forward_allgather_backward",
+        "rank_local_einsum",
+    ]
+
+
+def test_binary_repartition_candidate_rejects_invalid_shapes(dist_env, mesh_tp):
+    group = mesh_tp["tp"].get_group()
+    rank = dist.get_rank(group)
+    world_size = dist.get_world_size(group)
+    rows = world_size * 2 + 1
+    cols = world_size * 3 + 2
+    hidden = 4
+    row_shapes = es.helpers.compute_split_shapes(rows, world_size)
+    col_shapes = es.helpers.compute_split_shapes(cols, world_size)
+    bad_row_shapes = list(row_shapes)
+    bad_row_shapes[0] += 1
+
+    x_full = torch.randn(rows, hidden)
+    y = torch.randn(hidden, cols)
+    x_shard = torch.split(x_full, row_shapes, dim=0)[rank]
+
+    with pytest.raises(ValueError, match="split metadata"):
+        es.einshard(
+            "l/tp e, e f -> l f/tp",
+            x_shard,
+            y,
+            mesh=mesh_tp,
+            shapes={"tp": {"l": bad_row_shapes, "f": col_shapes}},
+        )
+
+    assert [(candidate.name, candidate.status) for candidate in last_candidates()] == [
+        ("alltoall_repartition", "rejected"),
+    ]
+    assert [(alternative.name, alternative.status) for alternative in last_alternatives()] == [
+        ("alltoall_repartition", "ranked"),
+        ("default", "ranked"),
+    ]
 
 
 def test_binary_elementwise_shared_sharded_axis(dist_env, mesh_tp):

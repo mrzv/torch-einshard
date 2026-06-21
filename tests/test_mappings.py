@@ -6,6 +6,7 @@ from torch_einshard.mappings import (
     allgather_forward_split_backward,
     allgather_forward_reducescatter_backward,
     allreduce_forward_identity_backward,
+    broadcast_forward_allreduce_backward,
     identity_forward_allreduce_backward,
     reducescatter_forward_allgather_backward,
     split_forward_allgather_backward,
@@ -42,6 +43,21 @@ def test_identity_forward_allreduce_backward(dist_env, mesh_1d):
 
     z.sum().backward()
     assert_close(x.grad, torch.ones_like(x) * world_size)
+
+
+def test_broadcast_forward_allreduce_backward(dist_env, mesh_1d):
+    group = mesh_1d["dp"].get_group()
+    rank = dist.get_rank(group)
+    world_size = dist.get_world_size(group)
+
+    x = torch.full((2, 3), float(rank + 1), requires_grad=True)
+    z = broadcast_forward_allreduce_backward(x, group, src=0)
+
+    assert_close(z, torch.ones_like(x))
+
+    z.sum().backward()
+    expected_grad = torch.ones_like(x) * world_size if rank == 0 else torch.zeros_like(x)
+    assert_close(x.grad, expected_grad)
 
 
 def test_split_forward_allgather_backward(dist_env, mesh_1d):

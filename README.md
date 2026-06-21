@@ -233,6 +233,52 @@ info = es.einfft(
 
 Inverse real fast paths require any specified non-half-axis `signal_sizes` to match the current global axis sizes; padding or cropping those axes falls back. Inverse real FFTs where the half-spectrum axis is sharded are not optimized yet. Unsupported sharded transform layouts fall back to gather the full transform axis, run the local FFT, then split the output frequency axis if requested. That path emits a `RuntimeWarning` because it materializes the full transform axis on every rank. Non-FFT axes must preserve their sharding. `einfft` currently supports explicit named axes; it does not support ellipsis axes, factored axes, or partial tensor specs.
 
+## Optimization Policies
+
+`einshard` accepts an optional optimization policy for symbolic plan ranking diagnostics:
+
+```python
+z = es.einshard("a b/tp, b c -> a/tp c", x, w, mesh=mesh, optimize="memory")
+```
+
+Available named modes are:
+
+- `training`: default; scores combined forward and backward costs.
+- `inference`: ignores backward communication in the cost score.
+- `memory`: weights peak and materialized local tensor size more heavily.
+- `communication`: weights estimated communicated bytes more heavily.
+- `latency`: weights collective count more heavily.
+
+For explicit weights, pass a `PlanPolicy` object:
+
+```python
+policy = es.PlanPolicy.from_mode("communication")
+z = es.einshard("a b/tp, b c -> a/tp c", x, w, mesh=mesh, policy=policy)
+```
+
+Pass either `optimize=` or `policy=`, not both.
+
+Existing call sites can use a scoped default policy:
+
+```python
+with es.optimize("memory"):
+    z = es.einshard("a b/tp, b c -> a/tp c", x, w, mesh=mesh)
+```
+
+Or set a process default:
+
+```python
+es.set_default_policy("communication")
+try:
+    z = es.einshard("a b/tp, b c -> a/tp c", x, w, mesh=mesh)
+finally:
+    es.set_default_policy(None)
+```
+
+Policy precedence is explicit `policy=`, explicit `optimize=`, scoped `with es.optimize(...)`, process default, then the library default `training` policy.
+
+Current policies affect cost rankings and inspection snapshots for alternatives that can be compared safely. Execution remains behavior-preserving for paths whose alternatives need additional runtime validation or per-alternative shape metadata.
+
 ## Supported Distributed Unary Patterns
 
 Unary distributed operations support split, gather, multi-axis split/gather, optimized ownership swaps, and gather-then-split repartition.
