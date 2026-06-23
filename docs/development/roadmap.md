@@ -1,4 +1,4 @@
-# Distributed Pattern Plan
+# Roadmap
 
 This document tracks remaining distributed-pattern work inspired by `../MachineLearning/SciGPT/scaling-transformers-physical-sciences`.
 
