@@ -1,8 +1,9 @@
 # Parameter Metadata
 
-`ParamSpec` describes persistent parameter layout plus synchronization and
-gradient-reduction metadata. It does not replace `einshard`; tensor computations
-still use explicit `einshard(...)` expressions.
+Parameter metadata describes persistent parameter layout plus synchronization and
+gradient-reduction obligations. `ParamSpec` is the compatibility API for writing
+that metadata explicitly. Annotated `einshard(...)` operands can also register
+`ParameterState` metadata from the formula itself.
 
 ```python
 mesh = es.wrap_mesh(mesh)
@@ -36,17 +37,93 @@ process groups.
 example, `ParamSpec("out/tp in", shared="tp")` is rejected because `out` is
 already sharded over `tp`.
 
+## Formula Annotations
+
+Input operands can be annotated as persistent parameters:
+
+```python
+weight = torch.nn.Parameter(torch.ones(3))
+
+y = es.einshard(
+    "batch/dp channel, channel [param, grad=async] -> batch/dp channel",
+    x,
+    weight,
+    mesh=mesh,
+)
+state = es.get_parameter_state(weight)
+```
+
+The annotated tensor argument must be a `torch.nn.Parameter`. `einshard` validates
+parameter metadata before dispatch, executes the tensor operation, and attaches
+the resulting `ParameterState` only after the operation succeeds. Failed shape,
+mesh, or metadata checks do not leave partial formula state attached.
+
+Supported annotation forms include:
+
+```text
+[param]
+[param, grad=async]
+[param, grad=sp1-sp2]
+[param, grad=sp1-sp2:async]
+[param, grad=ddp]
+[param, grad=external]
+[param, grad=dp:ddp]
+[param, grad=dp:external]
+[param, grad=none]
+[param, init_sync=none]
+[param, init_sync=external]
+[param, init_sync=tp]
+```
+
+For local formulas, inferred native gradient obligations are recorded in
+`state.grad_comm`. In the example above, the parameter gradient is reduced over
+`batch`, and `batch` is sharded over `dp`, so the state records a native async
+gradient obligation over `dp`.
+
+Distributed formulas are more conservative. If the operation plan may already
+perform backward communication for the annotated operand, `grad=async` remains a
+pending inferred obligation instead of guessing an extra reduction. Calling
+`reduce_grad_`, `reduce_module_grads_`, or the DDP hook with a pending native/DDP
+obligation raises an error until a later planner-aware inference step or an
+explicit override resolves it.
+
+Explicit mesh-dim annotations such as `grad=sp1-sp2`, `grad=dp:ddp`, and
+`grad=dp:external` are concrete. Legacy `ParamSpec.reduce` metadata is also
+concrete native metadata. Bare forms such as `grad=async`, `grad=ddp`, and
+`grad=external` request inference; distributed formulas can leave those
+obligations pending until planner-aware inference resolves them. `grad=external`
+records that another system owns the obligation, and native reduction helpers
+skip it. `grad=none` is an explicit opt-out and conflicts with later non-none
+formula metadata for the same parameter.
+
+Initialization sync is inferred from managed mesh dimension names when a mesh is
+available: dimensions used by the parameter layout are excluded, and remaining
+managed dimensions become `state.shared`. Use `init_sync=none`,
+`init_sync=external`, or an explicit mesh group to override this inference.
+
 ## Module Helpers
 
-For modules, attach specs to parameters and use the module-level helpers:
+For modules, attach specs or states to parameters and use the module-level
+helpers:
 
 ```python
 es.set_param_spec(weight, weight_spec)
+
+state = es.ParameterState.from_param_spec(weight_spec)
+es.set_parameter_state(weight, state)
+
 for name, param, spec in es.iter_param_specs(module):
     print(name, spec.layout)
+for name, param, state in es.iter_parameter_states(module):
+    print(name, state.layout_shard_dims)
 es.sync_module_params_(module, mesh)
 es.reduce_module_grads_(module, mesh)
 ```
+
+`set_param_spec` attaches both the legacy spec and the equivalent
+`ParameterState`. Formula annotations merge with layout-only or semantically
+compatible `ParamSpec` metadata and reject incompatible layouts, conflicting
+explicit opt-outs, or conflicting gradient/init-sync obligations.
 
 ## DDP Communication Hook
 
@@ -59,7 +136,10 @@ es.register_grad_reduction_hook_(ddp, mesh, ddp_group="dp")
 ```
 
 The hook performs DDP-style averaging over `ddp_group`, then applies sum
-all-reduces for attached `ParamSpec.reduce` groups.
+all-reduces for concrete native attached gradient obligations. Legacy
+`ParamSpec.reduce` groups are represented as native `ParameterState.grad_comm`
+metadata. Pending inferred obligations, DDP-backed obligations, and external
+obligations are not executed by the native extra-reduction path.
 
 For buckets where every parameter has the same extra reduction metadata, the
 hook can combine DDP averaging and the extra reduction into one all-reduce over a
@@ -78,15 +158,17 @@ es.register_grad_reduction_hook_(
 This is equivalent to summing the bucket over `dp-sp1-sp2` and then dividing by
 the `dp` group size. It avoids a separate `dp` all-reduce followed by an
 `sp1-sp2` all-reduce. The fast path is used only when all parameters in a bucket
-have exactly `reduce=("sp1-sp2",)`. Mixed buckets fall back to the
-per-parameter-spec reductions.
+have compatible native reductions such as `reduce=("sp1-sp2",)` or an equivalent
+`ParameterState.grad_comm`. Mixed buckets fall back to per-parameter native
+reductions.
 
 ## Shard Metadata
 
-Parameter specs can derive checkpoint/test-copy shard metadata:
+Parameter specs and states can derive checkpoint/test-copy shard metadata:
 
 ```python
 metadata = es.param_shard_metadata(weight_spec, global_shape=(1024, 2048), mesh=mesh)
+metadata = es.param_shard_metadata(state, global_shape=(1024, 2048), mesh=mesh)
 local_slices = metadata.local_slices
 local_shape = metadata.local_shape
 ```

@@ -115,7 +115,7 @@ Implemented behavior:
 
 ## Parameter Metadata
 
-Parameter sharding is expressible with axis notation. `ParamSpec` now represents persistent parameter layout plus shared-value and gradient-reduction metadata.
+Parameter sharding is expressible with axis notation. `ParamSpec` remains the compatibility API for persistent parameter layout plus shared-value and gradient-reduction metadata. Annotated formula operands can now register `ParameterState` metadata directly from `einshard` formulas.
 
 The planned replacement is described in [Parameter Inference Plan](parameter-inference.md). The direction is to make the symbolic engine parameter-aware so `ParamSpec` becomes a compatibility layer over inferred `ParameterState` metadata and can eventually be removed from the primary API.
 
@@ -130,14 +130,18 @@ es.ParamSpec("o c/tp", shared=("sp1-sp2",), reduce=("sp1-sp2",))
 Implemented behavior:
 
 - `sync_param_` broadcasts parameter values from group rank 0 over `shared` mesh groups.
-- `reduce_grad_` sum-all-reduces `param.grad` over `reduce` mesh groups.
-- `sync_module_params_` and `reduce_module_grads_` apply attached specs over a whole module.
+- `reduce_grad_` sum-all-reduces `param.grad` over concrete native gradient obligations.
+- `sync_module_params_` and `reduce_module_grads_` apply attached specs or states over a whole module.
 - `iter_param_specs` yields attached `(name, param, spec)` triples for diagnostics and checkpoint/test helpers.
-- `register_grad_reduction_hook_` adds DDP-style averaging plus extra `ParamSpec.reduce` reductions as a DDP communication hook.
+- `iter_parameter_states` yields attached `(name, param, state)` triples for state-aware helpers.
+- `register_grad_reduction_hook_` adds DDP-style averaging plus extra concrete native reductions as a DDP communication hook.
 - `register_grad_reduction_hook_` can optionally combine DDP averaging and a uniform extra reduction into one compound-group all-reduce for matching buckets.
 - Compound names work through `wrap_mesh`.
 - `shared` metadata is rejected when it overlaps with axis shard dimensions.
-- `param_local_slices`, `param_local_shape`, and `param_shard_metadata` derive local shard metadata from `ParamSpec` layouts.
+- `param_local_slices`, `param_local_shape`, and `param_shard_metadata` derive local shard metadata from `ParamSpec` or `ParameterState` layouts.
+- Input operand annotations such as `[param]`, `[param, grad=async]`, `[param, grad=none]`, and `[param, init_sync=none]` are parsed and stored in `TensorSpec`.
+- `einshard` registers annotated `torch.nn.Parameter` operands after successful execution, merges compatible formula metadata with layout-only or semantically compatible legacy `ParamSpec` metadata, and rejects conflicting layouts or conflicting explicit opt-outs.
+- Local formula uses infer visible native gradient obligations; distributed inferred obligations remain pending until planner-aware inference can prove the correct execution behavior.
 - SciGPT-style tensor-parallel MLP and attention projection patterns are covered by tests using explicit `einshard` calls.
 
 Deferred string notation:
@@ -150,10 +154,10 @@ Deferred string notation:
 
 Remaining work:
 
-- Implement parameter-aware symbolic inference as described in the parameter inference plan.
-- Add formula operand annotations for parameters, gradient communication obligations, scheduling, and init-sync overrides.
+- Add planner-aware distributed backward inference for pending annotated parameter obligations.
+- Add execution backends for native async parameter-gradient reductions and DDP-backed obligations.
 - Add higher-level module/layer wrappers for hidden-parameter cases that cannot be represented by formula annotations alone.
-- Make `ParamSpec` a compatibility wrapper once inferred `ParameterState` has feature parity.
+- Make `ParamSpec` a thin compatibility wrapper once inferred `ParameterState` has feature parity and downstream users have migrated.
 
 ## Deferred Cleanup
 

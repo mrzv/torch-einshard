@@ -48,6 +48,33 @@ Bare scheduling annotations such as `[async]` are intentionally not part of the
 design. `async` modifies a concrete semantic obligation such as `grad`; it does
 not stand alone.
 
+## Current Implementation Status
+
+The initial foundation is implemented.
+
+- Input operand annotations are parsed and stored on `TensorSpec`; output
+  annotations and standalone scheduling annotations such as `[async]` are
+  rejected.
+- `ParameterState`, `ParameterInitSync`, and `ParameterGradComm` exist, and
+  legacy `ParamSpec` metadata is mirrored into compatible `ParameterState`
+  objects.
+- Parameter helpers, module sync/reduce helpers, shard metadata helpers, and the
+  DDP communication hook consume `ParameterState` while preserving `ParamSpec`
+  compatibility.
+- `einshard` registers annotated `torch.nn.Parameter` operands after successful
+  operation execution and validates metadata conflicts before dispatch.
+- Local formula uses can infer visible native gradient obligations from sharded
+  axes that are reduced while forming the parameter gradient.
+- Distributed formula uses remain conservative: inferred native/DDP gradient
+  obligations stay pending unless the user provides an explicit concrete
+  override. Pending native/DDP obligations intentionally fail in reduction
+  helpers until planner-aware distributed backward inference resolves them.
+
+The remaining major gap is execution-layer and planner-aware distributed
+inference work. The current implementation records obligations and preserves
+unsafe cases as pending metadata; it does not yet launch native async gradient
+communication from formula annotations.
+
 ## Current `ParamSpec` Responsibilities
 
 `ParamSpec` currently combines four responsibilities.
@@ -518,22 +545,35 @@ The migration should happen in stages.
 
 ### Stage 1: Parser And Data Model
 
+Status: implemented foundation.
+
 - Extend the grammar to parse operand annotations.
 - Add `ParameterState` and gradient/init-sync obligation data structures.
-- Add a registry keyed by `torch.nn.Parameter` identity.
-- Convert annotated parameter operands into registry entries during `einshard`.
-- Keep `ParamSpec` unchanged during this stage.
+- Attach metadata to `torch.nn.Parameter` objects and use parameter identity for
+  conflict checks during each `einshard` registration pass.
+- Convert annotated parameter operands into attached parameter metadata during
+  `einshard`.
+- Mirror `ParamSpec` into compatible `ParameterState` metadata during this stage.
 
 ### Stage 2: Inference
 
-- Infer parameter layout from annotated operand specs.
-- Infer init sync dims from managed mesh dims minus layout shard dims.
-- Add symbolic backward analysis for `[param]` operands.
-- Infer `grad` obligations from parameter-gradient partials.
-- Implement `grad=none`, `grad=external`, `grad=ddp`, and explicit mesh-dim
-  overrides.
+Status: partially implemented.
+
+- Implemented: infer parameter layout from annotated operand specs.
+- Implemented: infer init sync dims from managed mesh dims minus layout shard dims.
+- Implemented: local formula inference for visible sharded axes that become
+  parameter-gradient reductions.
+- Implemented: `grad=none`, `grad=external`, `grad=ddp`, explicit mesh-dim
+  overrides, and explicit scheduling/backend suffixes at the metadata layer.
+- Remaining: planner-aware symbolic backward analysis for distributed `[param]`
+  operands, including subtracting communication already handled by autograd
+  mappings.
+- Remaining: finalization of pending inferred obligations before gradient
+  execution helpers run.
 
 ### Stage 3: Helper Migration
+
+Status: implemented foundation.
 
 - Reimplement parameter shard metadata helpers on `ParameterState`.
 - Reimplement module init sync on inferred init-sync obligations.
