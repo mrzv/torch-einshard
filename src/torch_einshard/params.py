@@ -237,6 +237,31 @@ class ParamShardMetadata:
     shard_dims: tuple[str, ...]
 
 
+def _state_from_metadata(metadata):
+    if isinstance(metadata, ParameterState):
+        return metadata
+    if isinstance(metadata, ParamSpec):
+        return ParameterState.from_param_spec(metadata)
+    raise TypeError("Parameter metadata must be a ParameterState or ParamSpec")
+
+
+def _require_state(param_or_metadata):
+    if isinstance(param_or_metadata, (ParameterState, ParamSpec)):
+        return _state_from_metadata(param_or_metadata)
+    state = get_parameter_state(param_or_metadata)
+    if state is None:
+        raise ValueError("Parameter does not have an attached ParameterState or ParamSpec")
+    return state
+
+
+def _native_reduce_groups(state):
+    if state is None:
+        return ()
+    if state.grad_comm.mode == "none" or state.grad_comm.backend != "native":
+        return ()
+    return state.grad_comm.mesh_dims
+
+
 def _group(mesh, name):
     try:
         return mesh[name].get_group()
@@ -249,7 +274,8 @@ def _group(mesh, name):
 
 
 def sync_param_(param, spec, mesh):
-    for name in spec.shared:
+    state = _state_from_metadata(spec)
+    for name in state.shared:
         group = _group(mesh, name)
         if dist.get_world_size(group) == 1:
             continue
@@ -260,7 +286,8 @@ def sync_param_(param, spec, mesh):
 def reduce_grad_(param, spec, mesh):
     if param.grad is None:
         return param
-    for name in spec.reduce:
+    state = _state_from_metadata(spec)
+    for name in _native_reduce_groups(state):
         param.grad = all_reduce(param.grad, _group(mesh, name))
     return param
 
@@ -316,8 +343,8 @@ def _require_spec(param_or_spec):
 
 
 def param_shard_dims(param_or_spec):
-    spec = _require_spec(param_or_spec)
-    return tuple(spec.axes.all_shard_dims())
+    state = _require_state(param_or_spec)
+    return state.layout_shard_dims
 
 
 def _mesh_rank_and_size(mesh, shard_dim):
@@ -370,15 +397,16 @@ def _factor_for(axis, factors):
 
 
 def param_local_slices(param_or_spec, global_shape, mesh, factors=None):
-    spec = _require_spec(param_or_spec)
+    state = _require_state(param_or_spec)
+    axes = state.axes
     global_shape = tuple(int(size) for size in global_shape)
-    if len(global_shape) != len(spec.axes):
+    if len(global_shape) != len(axes):
         raise ValueError(
-            f"Global shape rank {len(global_shape)} does not match ParamSpec rank {len(spec.axes)}"
+            f"Global shape rank {len(global_shape)} does not match parameter metadata rank {len(axes)}"
         )
 
     slices = []
-    for axis, size in zip(spec.axes, global_shape):
+    for axis, size in zip(axes, global_shape):
         shard_dim = _axis_shard_dim(axis)
         if not shard_dim:
             slices.append(slice(None))
@@ -406,30 +434,30 @@ def _shape_from_slices(global_shape, slices):
 
 
 def param_shard_metadata(param_or_spec, global_shape, mesh, factors=None):
-    spec = _require_spec(param_or_spec)
+    state = _require_state(param_or_spec)
     global_shape = tuple(int(size) for size in global_shape)
-    local_slices = param_local_slices(spec, global_shape, mesh, factors=factors)
+    local_slices = param_local_slices(state, global_shape, mesh, factors=factors)
     return ParamShardMetadata(
         global_shape=global_shape,
         local_slices=local_slices,
         local_shape=_shape_from_slices(global_shape, local_slices),
-        shard_dims=param_shard_dims(spec),
+        shard_dims=param_shard_dims(state),
     )
 
 
 def sync_module_params_(module, mesh):
     for param in module.parameters():
-        spec = get_param_spec(param)
-        if spec is not None:
-            sync_param_(param, spec, mesh)
+        state = get_parameter_state(param)
+        if state is not None:
+            sync_param_(param, state, mesh)
     return module
 
 
 def reduce_module_grads_(module, mesh):
     for param in module.parameters():
-        spec = get_param_spec(param)
-        if spec is not None:
-            reduce_grad_(param, spec, mesh)
+        state = get_parameter_state(param)
+        if state is not None:
+            reduce_grad_(param, state, mesh)
     return module
 
 
@@ -450,7 +478,7 @@ def register_grad_reduction_hook_(
         buffer = bucket.buffer()
         for param in bucket.parameters():
             view = buffer.narrow(0, offset, param.numel()).view_as(param)
-            views.append((param, view, get_param_spec(param)))
+            views.append((param, view, get_parameter_state(param)))
             offset += param.numel()
         return views
 
@@ -460,22 +488,22 @@ def register_grad_reduction_hook_(
         if not views:
             return False
         expected = set(combined_reduce)
-        for _, _, spec in views:
-            if spec is None or set(spec.reduce) != expected:
+        for _, _, state in views:
+            if state is None or set(_native_reduce_groups(state)) != expected:
                 return False
         return True
 
-    def reduce_by_param_specs(buffer, views):
+    def reduce_by_parameter_states(buffer, views):
         groups = sorted({
             name
-            for _, _, spec in views
-            for name in (spec.reduce if spec is not None else ())
+            for _, _, state in views
+            for name in _native_reduce_groups(state)
         })
         for name in groups:
             grad_views = [
                 view
-                for _, view, spec in views
-                if spec is not None and name in spec.reduce
+                for _, view, state in views
+                if name in _native_reduce_groups(state)
             ]
             if not grad_views:
                 continue
@@ -522,7 +550,7 @@ def register_grad_reduction_hook_(
             if group_size > 1:
                 buffer.div_(group_size)
 
-            return reduce_by_param_specs(buffer, views)
+            return reduce_by_parameter_states(buffer, views)
 
         return future.then(finish)
 

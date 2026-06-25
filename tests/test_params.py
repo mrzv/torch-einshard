@@ -79,6 +79,15 @@ def test_param_shard_dims_reads_specs_from_params():
     assert es.param_shard_dims(param) == ("tp", "sp")
 
 
+def test_param_shard_dims_accepts_parameter_states():
+    param = torch.nn.Parameter(torch.zeros(2, 3))
+    state = es.ParameterState.from_spec(es.parse_sharding("o/tp c/sp [param] -> o c")[0])
+    es.set_parameter_state(param, state)
+
+    assert es.param_shard_dims(state) == ("tp", "sp")
+    assert es.param_shard_dims(param) == ("tp", "sp")
+
+
 def test_param_shard_dims_requires_attached_spec():
     param = torch.nn.Parameter(torch.zeros(2, 3))
 
@@ -305,6 +314,19 @@ def test_param_local_slices_accepts_attached_params(dist_env, mesh_2d):
     assert es.param_local_slices(param, (2, 3), mesh_2d)[1] == slice(None)
 
 
+def test_param_local_slices_accepts_attached_parameter_states(dist_env, mesh_2d):
+    param = torch.nn.Parameter(torch.zeros(2, 3))
+    state = es.ParameterState.from_spec(es.parse_sharding("o/dp c [param] -> o c")[0])
+    es.set_parameter_state(param, state)
+
+    assert es.param_local_slices(state, (2, 3), mesh_2d) == es.param_local_slices(
+        es.ParamSpec("o/dp c"),
+        (2, 3),
+        mesh_2d,
+    )
+    assert es.param_local_slices(param, (2, 3), mesh_2d)[1] == slice(None)
+
+
 def test_param_local_slices_rejects_rank_mismatch(dist_env, mesh_2d):
     spec = es.ParamSpec("o/dp c")
 
@@ -381,6 +403,16 @@ def test_param_shard_metadata_normalizes_compound_group_order(dist_env, mesh_2d)
     assert dp_sp.local_shape == sp_dp.local_shape
 
 
+def test_param_shard_metadata_accepts_parameter_states(dist_env, mesh_2d):
+    global_shape = (dist_env.world_size + 3, 2)
+    state = es.ParameterState.from_spec(es.parse_sharding("o/dp c [param] -> o c")[0])
+
+    metadata = es.param_shard_metadata(state, global_shape, mesh_2d)
+    expected = es.param_shard_metadata(es.ParamSpec("o/dp c"), global_shape, mesh_2d)
+
+    assert metadata == expected
+
+
 def test_param_local_slices_rejects_sharded_factored_axes(dist_env, mesh_2d):
     spec = es.ParamSpec("(a/dp b) c")
 
@@ -418,6 +450,24 @@ def test_module_param_helpers_use_attached_specs(dist_env, mesh_2d):
     assert_close(module.weight.grad, torch.full_like(module.weight, expected))
 
 
+def test_module_param_helpers_use_attached_parameter_states(dist_env, mesh_2d):
+    mesh = es.wrap_mesh(mesh_2d)
+    module = nn.Linear(3, 2, bias=False)
+    state = es.ParameterState.from_spec(
+        es.parse_sharding("o c [param, init_sync=dp-sp, grad=dp-sp] -> o c")[0]
+    )
+    es.set_parameter_state(module.weight, state)
+    module.weight.data.fill_(float(dist.get_rank() + 1))
+
+    assert es.sync_module_params_(module, mesh) is module
+    assert_close(module.weight, torch.ones_like(module.weight))
+
+    module.weight.grad = torch.full_like(module.weight, float(dist.get_rank() + 1))
+    es.reduce_module_grads_(module, mesh)
+    expected = float(dist.get_world_size() * (dist.get_world_size() + 1) // 2)
+    assert_close(module.weight.grad, torch.full_like(module.weight, expected))
+
+
 def test_reduce_grad_allreduces_reduce_groups(dist_env, mesh_2d):
     mesh = es.wrap_mesh(mesh_2d)
     spec = es.ParamSpec("o c", reduce="dp-sp")
@@ -429,6 +479,20 @@ def test_reduce_grad_allreduces_reduce_groups(dist_env, mesh_2d):
 
     expected = float(world_size * (world_size + 1) // 2)
     assert_close(param.grad, torch.full_like(param, expected))
+
+
+def test_reduce_grad_skips_external_and_ddp_backends(dist_env, mesh_2d):
+    mesh = es.wrap_mesh(mesh_2d)
+    for annotation in ("grad=dp-sp:external", "grad=dp-sp:ddp"):
+        state = es.ParameterState.from_spec(
+            es.parse_sharding(f"o c [param, {annotation}] -> o c")[0]
+        )
+        param = torch.nn.Parameter(torch.zeros(2, 3))
+        param.grad = torch.full_like(param, float(dist.get_rank() + 1))
+
+        es.reduce_grad_(param, state, mesh)
+
+        assert_close(param.grad, torch.full_like(param, float(dist.get_rank() + 1)))
 
 
 def test_reduce_grad_allows_missing_grad(dist_env, mesh_2d):
@@ -460,6 +524,26 @@ def test_ddp_grad_reduction_hook_uses_param_specs(dist_env, mesh_2d):
     assert_close(model.weight.grad, torch.full_like(model.weight.grad, expected))
 
 
+def test_ddp_grad_reduction_hook_uses_parameter_states(dist_env, mesh_2d):
+    model = nn.Linear(1, 1, bias=False)
+    model.weight.data.fill_(1.0)
+    state = es.ParameterState.from_spec(es.parse_sharding("o c [param, grad=sp] -> o c")[0])
+    es.set_parameter_state(model.weight, state)
+    ddp = DistributedDataParallel(model, process_group=mesh_2d["dp"].get_group())
+    es.register_grad_reduction_hook_(ddp, mesh_2d, ddp_group="dp")
+
+    x = torch.tensor([[float(dist.get_rank() + 1)]])
+    ddp(x).sum().backward()
+
+    dp_size = dist.get_world_size(mesh_2d["dp"].get_group())
+    sp_size = dist.get_world_size(mesh_2d["sp"].get_group())
+    expected = 0.0
+    for peer_sp_rank in range(sp_size):
+        expected += 1.0 + peer_sp_rank + sp_size * (dp_size - 1) / 2
+
+    assert_close(model.weight.grad, torch.full_like(model.weight.grad, expected))
+
+
 def test_ddp_grad_reduction_hook_combines_uniform_reduce_specs(dist_env, mesh_2d):
     mesh = es.wrap_mesh(mesh_2d)
     model = nn.Linear(1, 1, bias=False)
@@ -480,6 +564,33 @@ def test_ddp_grad_reduction_hook_combines_uniform_reduce_specs(dist_env, mesh_2d
     dp_size = dist.get_world_size(mesh_2d["dp"].get_group())
     sp_size = dist.get_world_size(mesh_2d["sp"].get_group())
     sp_rank = dist.get_rank(mesh_2d["sp"].get_group())
+    expected = 0.0
+    for peer_sp_rank in range(sp_size):
+        expected += 1.0 + peer_sp_rank + sp_size * (dp_size - 1) / 2
+
+    assert_close(model.weight.grad, torch.full_like(model.weight.grad, expected))
+
+
+def test_ddp_grad_reduction_hook_combines_uniform_parameter_states(dist_env, mesh_2d):
+    mesh = es.wrap_mesh(mesh_2d)
+    model = nn.Linear(1, 1, bias=False)
+    model.weight.data.fill_(1.0)
+    state = es.ParameterState.from_spec(es.parse_sharding("o c [param, grad=sp] -> o c")[0])
+    es.set_parameter_state(model.weight, state)
+    ddp = DistributedDataParallel(model, process_group=mesh_2d["dp"].get_group())
+    es.register_grad_reduction_hook_(
+        ddp,
+        mesh,
+        ddp_group="dp",
+        combined_reduce_group="dp-sp",
+        combined_reduce="sp",
+    )
+
+    x = torch.tensor([[float(dist.get_rank() + 1)]])
+    ddp(x).sum().backward()
+
+    dp_size = dist.get_world_size(mesh_2d["dp"].get_group())
+    sp_size = dist.get_world_size(mesh_2d["sp"].get_group())
     expected = 0.0
     for peer_sp_rank in range(sp_size):
         expected += 1.0 + peer_sp_rank + sp_size * (dp_size - 1) / 2
