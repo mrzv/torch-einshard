@@ -117,6 +117,8 @@ Implemented behavior:
 
 Parameter sharding is expressible with axis notation. `ParamSpec` now represents persistent parameter layout plus shared-value and gradient-reduction metadata.
 
+The planned replacement is described in [Parameter Inference Plan](parameter-inference.md). The direction is to make the symbolic engine parameter-aware so `ParamSpec` becomes a compatibility layer over inferred `ParameterState` metadata and can eventually be removed from the primary API.
+
 Implemented Python API:
 
 ```python
@@ -148,8 +150,10 @@ Deferred string notation:
 
 Remaining work:
 
-- Decide whether bracketed string notation is needed in addition to the Python API.
-- Add higher-level module/layer wrappers only if model integration needs them.
+- Implement parameter-aware symbolic inference as described in the parameter inference plan.
+- Add formula operand annotations for parameters, gradient communication obligations, scheduling, and init-sync overrides.
+- Add higher-level module/layer wrappers for hidden-parameter cases that cannot be represented by formula annotations alone.
+- Make `ParamSpec` a compatibility wrapper once inferred `ParameterState` has feature parity.
 
 ## Deferred Cleanup
 

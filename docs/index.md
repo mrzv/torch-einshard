@@ -44,6 +44,7 @@ development/testing
 development/performance
 development/roadmap
 development/symbolic-engine
+development/parameter-inference
 development/distributed-operations
 development/fft-plan
 ```
