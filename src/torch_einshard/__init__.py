@@ -10,6 +10,7 @@ from . import params as _params
 from .params import (
     ParamShardMetadata,
     ParamSpec,
+    NativeGradReductionHandle,
     ParameterGradComm,
     ParameterInitSync,
     ParameterState,
@@ -24,6 +25,7 @@ from .params import (
     reduce_grad_,
     reduce_module_grads_,
     register_grad_reduction_hook_,
+    register_native_grad_reduction_hooks_,
     register_parameter_operand,
     register_parameter_state,
     parameter_operand_state,

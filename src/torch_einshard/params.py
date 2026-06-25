@@ -294,6 +294,40 @@ def _native_reduce_groups(state):
     return state.grad_comm.mesh_dims
 
 
+class NativeGradReductionHandle:
+    def __init__(self):
+        self._hooks = []
+        self._works = []
+
+    @property
+    def pending(self):
+        return len(self._works)
+
+    def _add_hook(self, hook):
+        self._hooks.append(hook)
+
+    def _add_work(self, work):
+        self._works.append(work)
+
+    def wait(self):
+        works = self._works
+        self._works = []
+        for index, work in enumerate(works):
+            try:
+                work.wait()
+            except Exception:
+                self._works = works[index:] + self._works
+                raise
+        return self
+
+    def remove(self):
+        self.wait()
+        for hook in self._hooks:
+            hook.remove()
+        self._hooks = []
+        return self
+
+
 def _group(mesh, name):
     try:
         return mesh[name].get_group()
@@ -724,6 +758,48 @@ def reduce_module_grads_(module, mesh):
         if state is not None:
             reduce_grad_(param, state, mesh)
     return module
+
+
+def register_native_grad_reduction_hooks_(module, mesh):
+    """Register native per-parameter gradient reductions.
+
+    Every registered parameter must participate in backward in the same order on
+    every rank. Use the DDP communication hook or an external backend for models
+    with rank-dependent control flow or unused parameters.
+    """
+    handle = NativeGradReductionHandle()
+    hook_specs = []
+
+    for param in module.parameters():
+        state = _parameter_state_from_attached_metadata(param)
+        if state is None:
+            continue
+
+        if state.grad_comm.backend != "native":
+            continue
+
+        groups = tuple((name, _group(mesh, name)) for name in _native_reduce_groups(state))
+        if not groups:
+            continue
+
+        if not param.requires_grad:
+            raise ValueError("Cannot register gradient reduction hook for a parameter that does not require gradients")
+        hook_specs.append((param, groups))
+
+    try:
+        for param, groups in hook_specs:
+            def hook(grad, *, groups=groups):
+                for _, group in groups:
+                    if dist.get_world_size(group) > 1:
+                        grad = all_reduce(grad, group)
+                return grad
+
+            handle._add_hook(param.register_hook(hook))
+    except Exception:
+        handle.remove()
+        raise
+
+    return handle
 
 
 def register_grad_reduction_hook_(

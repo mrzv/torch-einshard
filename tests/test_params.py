@@ -1196,6 +1196,191 @@ def test_reduce_grad_allows_missing_grad(dist_env, mesh_2d):
     assert param.grad is None
 
 
+def test_native_grad_reduction_hooks_allreduce_concrete_native_state(dist_env, mesh_2d):
+    mesh = es.wrap_mesh(mesh_2d)
+    model = nn.Linear(1, 1, bias=False)
+    model.weight.data.fill_(1.0)
+    state = es.ParameterState.from_spec(
+        es.parse_sharding("o c [param, grad=dp-sp:async] -> o c")[0]
+    )
+    es.set_parameter_state(model.weight, state)
+    handle = es.register_native_grad_reduction_hooks_(model, mesh)
+
+    x = torch.tensor([[float(dist.get_rank() + 1)]])
+    model(x).sum().backward()
+    handle.wait()
+
+    world_size = dist.get_world_size()
+    expected = float(world_size * (world_size + 1) // 2)
+    assert_close(model.weight.grad, torch.full_like(model.weight.grad, expected))
+    assert handle.pending == 0
+    handle.remove()
+
+
+def test_native_grad_reduction_hooks_support_param_specs(dist_env, mesh_2d):
+    mesh = es.wrap_mesh(mesh_2d)
+    model = nn.Linear(1, 1, bias=False)
+    model.weight.data.fill_(1.0)
+    es.set_param_spec(model.weight, es.ParamSpec("o c", reduce="dp-sp"))
+    handle = es.register_native_grad_reduction_hooks_(model, mesh)
+
+    x = torch.tensor([[float(dist.get_rank() + 1)]])
+    model(x).sum().backward()
+
+    world_size = dist.get_world_size()
+    expected = float(world_size * (world_size + 1) // 2)
+    assert_close(model.weight.grad, torch.full_like(model.weight.grad, expected))
+    assert handle.pending == 0
+    handle.remove()
+
+
+def test_native_grad_reduction_hooks_skip_external_and_ddp_backends(dist_env, mesh_2d):
+    mesh = es.wrap_mesh(mesh_2d)
+    for annotation in ("grad=dp-sp:external", "grad=external", "grad=dp-sp:ddp", "grad=ddp"):
+        model = nn.Linear(1, 1, bias=False)
+        model.weight.data.fill_(1.0)
+        state = es.ParameterState.from_spec(
+            es.parse_sharding(f"o c [param, {annotation}] -> o c")[0]
+        )
+        es.set_parameter_state(model.weight, state)
+        handle = es.register_native_grad_reduction_hooks_(model, mesh)
+
+        x = torch.tensor([[float(dist.get_rank() + 1)]])
+        model(x).sum().backward()
+        handle.wait()
+
+        assert_close(model.weight.grad, torch.tensor([[float(dist.get_rank() + 1)]]))
+        handle.remove()
+
+
+def test_native_grad_reduction_hooks_support_gradient_accumulation(dist_env, mesh_2d):
+    mesh = es.wrap_mesh(mesh_2d)
+    model = nn.Linear(1, 1, bias=False)
+    model.weight.data.fill_(1.0)
+    state = es.ParameterState.from_spec(
+        es.parse_sharding("o c [param, grad=dp-sp] -> o c")[0]
+    )
+    es.set_parameter_state(model.weight, state)
+    handle = es.register_native_grad_reduction_hooks_(model, mesh)
+
+    x = torch.tensor([[float(dist.get_rank() + 1)]])
+    model(x).sum().backward()
+    model(x).sum().backward()
+
+    world_size = dist.get_world_size()
+    expected = 2.0 * float(world_size * (world_size + 1) // 2)
+    assert_close(model.weight.grad, torch.full_like(model.weight.grad, expected))
+    handle.remove()
+
+
+def test_native_grad_reduction_hooks_reject_pending_native_grad(mesh_2d):
+    model = nn.Linear(1, 1, bias=False)
+    state = es.ParameterState.from_spec(
+        es.parse_sharding("o c [param, grad=async] -> o c")[0]
+    )
+    es.set_parameter_state(model.weight, state)
+
+    try:
+        es.register_native_grad_reduction_hooks_(model, mesh_2d)
+    except ValueError as error:
+        assert "pending inference" in str(error)
+    else:
+        raise AssertionError("Expected pending gradient communication to fail")
+
+
+def test_native_grad_reduction_hooks_validate_before_registering(dist_env, mesh_2d):
+    mesh = es.wrap_mesh(mesh_2d)
+    model = nn.Module()
+    model.left = nn.Linear(1, 1, bias=False)
+    model.right = nn.Linear(1, 1, bias=False)
+    es.set_parameter_state(
+        model.left.weight,
+        es.ParameterState.from_spec(es.parse_sharding("o c [param, grad=dp-sp] -> o c")[0]),
+    )
+    es.set_parameter_state(
+        model.right.weight,
+        es.ParameterState.from_spec(es.parse_sharding("o c [param, grad=async] -> o c")[0]),
+    )
+
+    try:
+        es.register_native_grad_reduction_hooks_(model, mesh)
+    except ValueError as error:
+        assert "pending inference" in str(error)
+    else:
+        raise AssertionError("Expected pending gradient communication to fail")
+
+    x = torch.tensor([[float(dist.get_rank() + 1)]])
+    model.left(x).sum().backward()
+
+    assert_close(model.left.weight.grad, torch.tensor([[float(dist.get_rank() + 1)]]))
+
+
+def test_native_grad_reduction_hooks_failure_does_not_lazily_attach_legacy_state(dist_env, mesh_2d):
+    mesh = es.wrap_mesh(mesh_2d)
+    model = nn.Module()
+    model.left = nn.Linear(1, 1, bias=False)
+    model.right = nn.Linear(1, 1, bias=False)
+    es.set_parameter_state(
+        model.left.weight,
+        es.ParameterState.from_spec(es.parse_sharding("o c [param, grad=dp-sp] -> o c")[0]),
+    )
+    setattr(model.right.weight, PARAM_SPEC_ATTR, es.ParamSpec("o c", reduce="dp-sp"))
+    model.right.weight.requires_grad_(False)
+
+    try:
+        es.register_native_grad_reduction_hooks_(model, mesh)
+    except ValueError as error:
+        assert "does not require gradients" in str(error)
+    else:
+        raise AssertionError("Expected frozen parameter hook registration to fail")
+
+    x = torch.tensor([[float(dist.get_rank() + 1)]])
+    model.left(x).sum().backward()
+
+    assert_close(model.left.weight.grad, torch.tensor([[float(dist.get_rank() + 1)]]))
+    assert getattr(model.right.weight, PARAM_STATE_ATTR, None) is None
+
+
+def test_native_grad_reduction_hooks_validate_requires_grad_before_registering(dist_env, mesh_2d):
+    mesh = es.wrap_mesh(mesh_2d)
+    model = nn.Module()
+    model.left = nn.Linear(1, 1, bias=False)
+    model.right = nn.Linear(1, 1, bias=False)
+    model.right.weight.requires_grad_(False)
+    state = es.ParameterState.from_spec(es.parse_sharding("o c [param, grad=dp-sp] -> o c")[0])
+    es.set_parameter_state(model.left.weight, state)
+    es.set_parameter_state(model.right.weight, state)
+
+    try:
+        es.register_native_grad_reduction_hooks_(model, mesh)
+    except ValueError as error:
+        assert "does not require gradients" in str(error)
+    else:
+        raise AssertionError("Expected frozen parameter hook registration to fail")
+
+    x = torch.tensor([[float(dist.get_rank() + 1)]])
+    model.left(x).sum().backward()
+
+    assert_close(model.left.weight.grad, torch.tensor([[float(dist.get_rank() + 1)]]))
+
+
+def test_native_grad_reduction_hook_remove_detaches_hooks(dist_env, mesh_2d):
+    mesh = es.wrap_mesh(mesh_2d)
+    model = nn.Linear(1, 1, bias=False)
+    model.weight.data.fill_(1.0)
+    state = es.ParameterState.from_spec(
+        es.parse_sharding("o c [param, grad=dp-sp] -> o c")[0]
+    )
+    es.set_parameter_state(model.weight, state)
+    handle = es.register_native_grad_reduction_hooks_(model, mesh)
+    handle.remove()
+
+    x = torch.tensor([[float(dist.get_rank() + 1)]])
+    model(x).sum().backward()
+
+    assert_close(model.weight.grad, torch.tensor([[float(dist.get_rank() + 1)]]))
+
+
 def test_ddp_grad_reduction_hook_uses_param_specs(dist_env, mesh_2d):
     model = nn.Linear(1, 1, bias=False)
     model.weight.data.fill_(1.0)
