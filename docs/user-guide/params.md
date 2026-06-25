@@ -125,6 +125,35 @@ es.reduce_module_grads_(module, mesh)
 compatible `ParamSpec` metadata and reject incompatible layouts, conflicting
 explicit opt-outs, or conflicting gradient/init-sync obligations.
 
+## Native Gradient Hooks
+
+For non-DDP training loops, concrete native gradient obligations can be executed
+with per-parameter autograd hooks:
+
+```python
+handle = es.register_native_grad_reduction_hooks_(module, mesh)
+
+loss.backward()
+handle.wait()
+optimizer.step()
+handle.remove()
+```
+
+The hook path executes concrete native obligations such as `ParamSpec.reduce` or
+`grad=sp1-sp2`. It skips external and DDP-backed obligations, and it rejects
+pending native obligations because the correct mesh dimensions have not been
+finalized yet.
+
+Today these hooks reduce each incoming gradient contribution synchronously, which
+keeps repeated `backward()` gradient accumulation correct. The returned handle is
+used to remove hooks and is reserved for future asynchronous work; `wait()` is a
+safe no-op when no async work has been launched.
+
+All registered parameters must participate in backward in the same order on every
+rank. Use PyTorch DDP, the DDP communication hook below, or `grad=external` for
+models with rank-dependent control flow, unused parameters, or more complex
+bucket scheduling requirements.
+
 ## DDP Communication Hook
 
 When using PyTorch DDP, SciGPT-style extra gradient reductions can be registered

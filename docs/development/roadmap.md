@@ -134,6 +134,7 @@ Implemented behavior:
 - `sync_module_params_` and `reduce_module_grads_` apply attached specs or states over a whole module.
 - `iter_param_specs` yields attached `(name, param, spec)` triples for diagnostics and checkpoint/test helpers.
 - `iter_parameter_states` yields attached `(name, param, state)` triples for state-aware helpers.
+- `register_native_grad_reduction_hooks_` executes concrete native gradient obligations with per-parameter autograd hooks for non-DDP training loops.
 - `register_grad_reduction_hook_` adds DDP-style averaging plus extra concrete native reductions as a DDP communication hook.
 - `register_grad_reduction_hook_` can optionally combine DDP averaging and a uniform extra reduction into one compound-group all-reduce for matching buckets.
 - Compound names work through `wrap_mesh`.
@@ -156,6 +157,7 @@ Remaining work:
 
 - Add planner-aware distributed backward inference for pending annotated parameter obligations.
 - Add execution backends for native async parameter-gradient reductions and DDP-backed obligations.
+- Add bucketed/native scheduling for unused-parameter or rank-dependent-control-flow cases; the current native hook path requires identical backward participation and hook order across ranks.
 - Add higher-level module/layer wrappers for hidden-parameter cases that cannot be represented by formula annotations alone.
 - Make `ParamSpec` a thin compatibility wrapper once inferred `ParameterState` has feature parity and downstream users have migrated.
 

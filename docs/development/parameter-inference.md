@@ -69,11 +69,15 @@ The initial foundation is implemented.
   obligations stay pending unless the user provides an explicit concrete
   override. Pending native/DDP obligations intentionally fail in reduction
   helpers until planner-aware distributed backward inference resolves them.
+- Concrete native obligations can be executed with per-parameter native autograd
+  hooks for non-DDP training loops. This path reduces each incoming gradient
+  contribution synchronously and requires identical backward participation and
+  hook order across ranks.
 
 The remaining major gap is execution-layer and planner-aware distributed
 inference work. The current implementation records obligations and preserves
 unsafe cases as pending metadata; it does not yet launch native async gradient
-communication from formula annotations.
+communication or execute DDP-backed obligations from formula annotations.
 
 ## Current `ParamSpec` Responsibilities
 
@@ -580,6 +584,8 @@ Status: implemented foundation.
 - Reimplement gradient reduction helpers on inferred grad obligations.
 - Migrate the DDP communication hook to `ParameterState.grad_comm`.
 - Preserve the combined DDP reduction optimization for compatible buckets.
+- Add a concrete-native per-parameter autograd hook path for simple non-DDP
+  training loops.
 - Expose `ParameterState` metadata needed by downstream group validation and norm
   accounting.
 
