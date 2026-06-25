@@ -1,4 +1,4 @@
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import torch.distributed as dist
 import torch
@@ -80,6 +80,28 @@ def _tensor_state_or_none(spec, mesh_dim_names):
         return None
 
 
+def _flat_axes(spec):
+    axes = spec.axes if hasattr(spec, "axes") else spec
+    return axes.flat() if hasattr(axes, "flat") else axes
+
+
+def _axis_signature(axis):
+    if isinstance(axis, EllipsisAxis):
+        return ("ellipsis",)
+    if isinstance(axis, AxisGroup):
+        return ("group", tuple(_axis_signature(inner) for inner in axis.axes))
+    return ("axis", axis.name, axis.shard_dim)
+
+
+def _spec_layout_signature(spec):
+    return tuple(_axis_signature(axis) for axis in spec.axes)
+
+
+def _add_unique_mesh_dim(mesh_dims, name):
+    if name and name not in mesh_dims:
+        mesh_dims.append(name)
+
+
 @dataclass(frozen=True)
 class ParameterInitSync:
     mode: str = "none"
@@ -143,6 +165,8 @@ class ParameterState:
     init_sync: ParameterInitSync = field(default_factory=ParameterInitSync)
     grad_comm: ParameterGradComm = field(default_factory=ParameterGradComm)
     source: str = "inferred"
+    explicit_init_sync_none: bool = False
+    explicit_grad_comm_none: bool = False
 
     @classmethod
     def from_spec(cls, spec, *, mesh_dim_names=(), source="inferred"):
@@ -158,6 +182,8 @@ class ParameterState:
         )
         _validate_parameter_layout(layout_shard_dims, init_sync)
         grad_comm = ParameterGradComm.from_annotation(getattr(annotation, "grad", None), is_param=is_param)
+        init_sync_annotation = getattr(annotation, "init_sync", None)
+        grad_annotation = getattr(annotation, "grad", None)
         return cls(
             spec=spec,
             tensor_state=_tensor_state_or_none(spec, tuple(mesh_dim_names)),
@@ -165,6 +191,8 @@ class ParameterState:
             init_sync=init_sync,
             grad_comm=grad_comm,
             source=source,
+            explicit_init_sync_none=init_sync_annotation is not None and init_sync_annotation.mode == "none",
+            explicit_grad_comm_none=grad_annotation is not None and grad_annotation.mode == "none",
         )
 
     @classmethod
@@ -257,6 +285,10 @@ def _require_state(param_or_metadata):
 def _native_reduce_groups(state):
     if state is None:
         return ()
+    if state.grad_comm.pending_inference:
+        if state.grad_comm.backend in {"native", "ddp"}:
+            raise ValueError("Parameter gradient communication is still pending inference")
+        return ()
     if state.grad_comm.mode == "none" or state.grad_comm.backend != "native":
         return ()
     return state.grad_comm.mesh_dims
@@ -308,14 +340,11 @@ def set_parameter_state(param, state):
 
 
 def get_parameter_state(param):
-    state = getattr(param, PARAM_STATE_ATTR, None)
-    if state is not None:
-        return state
-    spec = get_param_spec(param)
-    if spec is None:
+    state = _parameter_state_from_attached_metadata(param)
+    if state is None:
         return None
-    state = ParameterState.from_param_spec(spec)
-    setattr(param, PARAM_STATE_ATTR, state)
+    if getattr(param, PARAM_STATE_ATTR, None) is None:
+        setattr(param, PARAM_STATE_ATTR, state)
     return state
 
 
@@ -324,6 +353,242 @@ def iter_parameter_states(module):
         state = get_parameter_state(param)
         if state is not None:
             yield name, param, state
+
+
+def _compatible_init_sync(existing, state):
+    if existing == state:
+        return True
+    if existing.mode in {"none", "external"} or state.mode in {"none", "external"}:
+        return False
+    return existing.mesh_dims == state.mesh_dims
+
+
+def _merge_grad_schedule(existing, new):
+    if existing.schedule == new.schedule:
+        return existing.schedule
+    if existing.schedule == "backend_default":
+        return new.schedule
+    if new.schedule == "backend_default":
+        return existing.schedule
+    raise ValueError("Parameter is already registered with incompatible metadata")
+
+
+def _merge_non_none_grad_comm(existing, new):
+    if existing.backend != new.backend:
+        raise ValueError("Parameter is already registered with incompatible metadata")
+    schedule = _merge_grad_schedule(existing, new)
+    if existing.pending_inference and new.pending_inference:
+        return replace(existing, schedule=schedule)
+    if existing.pending_inference or new.pending_inference:
+        concrete = new if existing.pending_inference else existing
+        pending = existing if existing.pending_inference else new
+        if concrete.mode == "explicit":
+            return replace(concrete, schedule=schedule)
+        return replace(pending, schedule=schedule)
+    if existing.mesh_dims != new.mesh_dims:
+        raise ValueError("Parameter is already registered with incompatible metadata")
+    return replace(existing, schedule=schedule)
+
+
+def _parameter_state_from_attached_metadata(param):
+    state = getattr(param, PARAM_STATE_ATTR, None)
+    if state is not None:
+        return state
+    spec = get_param_spec(param)
+    if spec is None:
+        return None
+    return ParameterState.from_param_spec(spec)
+
+
+def _explicit_init_sync_none(state):
+    if getattr(state, "explicit_init_sync_none", False):
+        return True
+    annotation = getattr(state.spec, "annotation", None)
+    init_sync = getattr(annotation, "init_sync", None)
+    return init_sync is not None and init_sync.mode == "none"
+
+
+def _explicit_grad_comm_none(state):
+    if getattr(state, "explicit_grad_comm_none", False):
+        return True
+    annotation = getattr(state.spec, "annotation", None)
+    grad = getattr(annotation, "grad", None)
+    return grad is not None and grad.mode == "none"
+
+
+def _merge_init_sync(existing_state, state):
+    existing = existing_state.init_sync
+    new = state.init_sync
+    if _explicit_init_sync_none(state):
+        if existing.mode != "none":
+            raise ValueError("Parameter is already registered with incompatible metadata")
+        return existing
+    if new.mode == "none":
+        return existing
+    if existing.mode == "none":
+        if _explicit_init_sync_none(existing_state):
+            raise ValueError("Parameter is already registered with incompatible metadata")
+        return new
+    if not _compatible_init_sync(existing, new):
+        raise ValueError("Parameter is already registered with incompatible metadata")
+    return existing
+
+
+def _merge_grad_comm(existing_state, state):
+    existing = existing_state.grad_comm
+    new = state.grad_comm
+    if _explicit_grad_comm_none(state):
+        if existing.mode != "none":
+            raise ValueError("Parameter is already registered with incompatible metadata")
+        return existing
+    if new.mode == "none":
+        return existing
+    if existing.mode == "none":
+        if _explicit_grad_comm_none(existing_state):
+            raise ValueError("Parameter is already registered with incompatible metadata")
+        return new
+    return _merge_non_none_grad_comm(existing, new)
+
+
+def _merged_source(existing, state):
+    if existing.source == "ParamSpec" and state.source != "ParamSpec":
+        return "ParamSpec+formula"
+    return existing.source
+
+
+def _merge_tensor_state(existing, state):
+    if state.tensor_state is None:
+        return existing.tensor_state
+    if existing.tensor_state is None:
+        return state.tensor_state
+    if len(state.tensor_state.replicated_dims) > len(existing.tensor_state.replicated_dims):
+        return state.tensor_state
+    return existing.tensor_state
+
+
+def _merge_parameter_state(existing, state):
+    if existing is None:
+        return state
+    if _spec_layout_signature(existing.spec) != _spec_layout_signature(state.spec):
+        raise ValueError("Parameter is already registered with a different layout")
+    init_sync = _merge_init_sync(existing, state)
+    grad_comm = _merge_grad_comm(existing, state)
+    tensor_state = _merge_tensor_state(existing, state)
+    source = _merged_source(existing, state)
+    explicit_init_sync_none = _explicit_init_sync_none(existing) or _explicit_init_sync_none(state)
+    explicit_grad_comm_none = _explicit_grad_comm_none(existing) or _explicit_grad_comm_none(state)
+    if (
+        init_sync == existing.init_sync
+        and grad_comm == existing.grad_comm
+        and tensor_state == existing.tensor_state
+        and source == existing.source
+        and explicit_init_sync_none == existing.explicit_init_sync_none
+        and explicit_grad_comm_none == existing.explicit_grad_comm_none
+    ):
+        return existing
+    return replace(
+        existing,
+        spec=state.spec,
+        tensor_state=tensor_state,
+        init_sync=init_sync,
+        grad_comm=grad_comm,
+        source=source,
+        explicit_init_sync_none=explicit_init_sync_none,
+        explicit_grad_comm_none=explicit_grad_comm_none,
+    )
+
+
+def register_parameter_state(param, state):
+    existing = _parameter_state_from_attached_metadata(param)
+    merged = _merge_parameter_state(existing, state)
+    return set_parameter_state(param, merged)
+
+
+def _infer_parameter_grad_mesh_dims(input_specs, output_spec, operand_index, *, include_axes=True):
+    param_spec = input_specs[operand_index]
+    param_axis_names = {
+        axis.name
+        for axis in _flat_axes(param_spec)
+        if not isinstance(axis, EllipsisAxis)
+    }
+    mesh_dims = []
+
+    if include_axes:
+        for spec in (*input_specs[:operand_index], *input_specs[operand_index + 1:], output_spec):
+            for axis in _flat_axes(spec):
+                if isinstance(axis, EllipsisAxis) or axis.name in param_axis_names:
+                    continue
+                _add_unique_mesh_dim(mesh_dims, axis.shard_dim)
+
+    for partial in getattr(output_spec, "partials", ()):  # incoming output gradients preserve partial obligations
+        _add_unique_mesh_dim(mesh_dims, partial)
+
+    return tuple(mesh_dims)
+
+
+def _with_inferred_parameter_grad_comm(state, input_specs, output_spec, operand_index, *, include_axes=True):
+    grad_comm = state.grad_comm
+    if not grad_comm.pending_inference:
+        return state
+
+    mesh_dims = _infer_parameter_grad_mesh_dims(
+        input_specs,
+        output_spec,
+        operand_index,
+        include_axes=include_axes,
+    )
+    if not mesh_dims:
+        grad_comm = ParameterGradComm()
+    else:
+        grad_comm = replace(grad_comm, mesh_dims=mesh_dims)
+    return replace(state, grad_comm=grad_comm)
+
+
+def parameter_operand_state(
+    param,
+    input_specs,
+    output_spec,
+    operand_index,
+    *,
+    mesh_dim_names=(),
+    source="formula",
+    infer_grad=True,
+):
+    if not isinstance(param, torch.nn.Parameter):
+        raise TypeError("Annotated parameter operands must be torch.nn.Parameter instances")
+    spec = input_specs[operand_index]
+    state = ParameterState.from_spec(spec, mesh_dim_names=mesh_dim_names, source=source)
+    if not infer_grad:
+        return state
+    return _with_inferred_parameter_grad_comm(
+        state,
+        input_specs,
+        output_spec,
+        operand_index,
+        include_axes=infer_grad != "partials",
+    )
+
+
+def register_parameter_operand(
+    param,
+    input_specs,
+    output_spec,
+    operand_index,
+    *,
+    mesh_dim_names=(),
+    source="formula",
+    infer_grad=True,
+):
+    state = parameter_operand_state(
+        param,
+        input_specs,
+        output_spec,
+        operand_index,
+        mesh_dim_names=mesh_dim_names,
+        source=source,
+        infer_grad=infer_grad,
+    )
+    return register_parameter_state(param, state)
 
 
 def iter_param_specs(module):

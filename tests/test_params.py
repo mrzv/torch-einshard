@@ -4,6 +4,13 @@ from torch import nn
 from torch.nn.parallel import DistributedDataParallel
 
 import torch_einshard as es
+from torch_einshard.params import (
+    PARAM_SPEC_ATTR,
+    PARAM_STATE_ATTR,
+    parameter_operand_state,
+    register_parameter_operand,
+    register_parameter_state,
+)
 
 from conftest import assert_close
 
@@ -265,6 +272,692 @@ def test_iter_parameter_states_yields_attached_states():
     assert name == "1.weight"
     assert param is module[1].weight
     assert actual_state is state
+
+
+def test_einshard_registers_annotated_parameter_operands():
+    x = torch.ones(2, 3)
+    weight = torch.nn.Parameter(torch.ones(4, 3))
+
+    output = es.einshard("b c, o c [param, grad=async] -> b o", x, weight)
+    state = es.get_parameter_state(weight)
+
+    assert output.shape == (2, 4)
+    assert state.source == "formula"
+    assert state.layout_shard_dims == ()
+    assert state.init_sync.mode == "none"
+    assert state.grad_comm.mode == "none"
+    assert not state.grad_comm.pending_inference
+
+
+def test_einshard_infers_parameter_grad_dims_from_visible_sharded_axes(dist_env, mesh_2d):
+    x = torch.ones(2, 3)
+    weight = torch.nn.Parameter(torch.ones(3))
+
+    es.einshard(
+        "b/dp c, c [param, grad=async] -> b/dp c",
+        x,
+        weight,
+        mesh=mesh_2d,
+    )
+    state = es.get_parameter_state(weight)
+
+    assert state.init_sync.mode == "inferred"
+    assert state.shared == ("dp", "sp")
+    assert state.grad_comm.mode == "inferred"
+    assert state.grad_comm.mesh_dims == ("dp",)
+    assert state.grad_comm.backend == "native"
+    assert state.grad_comm.schedule == "async"
+    assert not state.grad_comm.pending_inference
+
+
+def test_einshard_preserves_explicit_parameter_grad_override(dist_env, mesh_2d):
+    x = torch.ones(2, 3)
+    weight = torch.nn.Parameter(torch.ones(3))
+
+    es.einshard(
+        "b/dp c, c [param, grad=sp] -> b/dp c",
+        x,
+        weight,
+        mesh=mesh_2d,
+    )
+    state = es.get_parameter_state(weight)
+
+    assert state.grad_comm.mode == "explicit"
+    assert state.grad_comm.mesh_dims == ("sp",)
+
+
+def test_einshard_infers_external_parameter_grad_obligation(dist_env, mesh_2d):
+    x = torch.ones(2, 3)
+    weight = torch.nn.Parameter(torch.ones(3))
+
+    es.einshard(
+        "b/dp c, c [param, grad=external] -> b/dp c",
+        x,
+        weight,
+        mesh=mesh_2d,
+    )
+    state = es.get_parameter_state(weight)
+
+    assert state.grad_comm.mode == "inferred"
+    assert state.grad_comm.mesh_dims == ("dp",)
+    assert state.grad_comm.backend == "external"
+    assert state.reduce == ()
+
+
+def test_einshard_infers_parameter_grad_dims_from_output_partials(dist_env, mesh_2d):
+    weight = torch.nn.Parameter(torch.ones(3))
+    input_spec, param_spec, output_spec = es.parse_sharding(
+        "b/dp c, c [param, grad=async] -> b/dp c // sp"
+    )
+
+    state = parameter_operand_state(
+        weight,
+        (input_spec, param_spec),
+        output_spec,
+        1,
+        mesh_dim_names=mesh_2d.mesh_dim_names,
+    )
+
+    assert state.grad_comm.mesh_dims == ("dp", "sp")
+
+
+def test_einshard_public_path_defers_output_partial_grad_dims(dist_env, mesh_2d):
+    x = torch.ones(2, 3)
+    weight = torch.nn.Parameter(torch.ones(3))
+
+    es.einshard(
+        "b c, c [param, grad=async] -> b c // sp",
+        x,
+        weight,
+        mesh=mesh_2d,
+    )
+    state = es.get_parameter_state(weight)
+
+    assert state.grad_comm.pending_inference
+    assert state.grad_comm.mesh_dims == ()
+    assert state.grad_comm.schedule == "async"
+
+
+def test_einshard_public_path_defers_output_partial_param_shard_overlap(dist_env, mesh_2d):
+    x = torch.ones(2, 3)
+    weight = torch.nn.Parameter(torch.ones(3))
+
+    es.einshard(
+        "b c/sp, c/sp [param, grad=async] -> b // sp",
+        x,
+        weight,
+        mesh=mesh_2d,
+    )
+    state = es.get_parameter_state(weight)
+
+    assert state.grad_comm.pending_inference
+    assert state.grad_comm.mesh_dims == ()
+
+
+def test_einshard_defers_unary_output_partial_parameter_grad(dist_env, mesh_2d):
+    weight = torch.nn.Parameter(torch.ones(3))
+
+    es.einshard("c [param, grad=async] -> c // dp", weight, mesh=mesh_2d)
+    state = es.get_parameter_state(weight)
+
+    assert state.grad_comm.pending_inference
+    assert state.grad_comm.mesh_dims == ()
+
+
+def test_einshard_defers_inferred_parameter_grad_for_distributed_formula(dist_env, mesh_2d):
+    x = torch.ones(2, 3)
+    weight = torch.nn.Parameter(torch.ones(3))
+
+    es.einshard(
+        "b/dp c/sp, c [param, grad=async] -> b/dp c",
+        x,
+        weight,
+        mesh=mesh_2d,
+    )
+    state = es.get_parameter_state(weight)
+
+    assert state.grad_comm.pending_inference
+    assert state.grad_comm.mesh_dims == ()
+
+
+def test_reduce_grad_rejects_pending_native_parameter_grad(dist_env, mesh_2d):
+    x = torch.ones(2, 3)
+    weight = torch.nn.Parameter(torch.ones(3))
+
+    es.einshard(
+        "b/dp c/sp, c [param, grad=async] -> b/dp c",
+        x,
+        weight,
+        mesh=mesh_2d,
+    )
+    weight.grad = torch.ones_like(weight)
+
+    try:
+        es.reduce_grad_(weight, es.get_parameter_state(weight), mesh_2d)
+    except ValueError as error:
+        assert "pending inference" in str(error)
+    else:
+        raise AssertionError("Expected pending gradient communication to fail")
+
+
+def test_einshard_distributed_pending_grad_fills_nonexplicit_none(dist_env, mesh_2d):
+    x = torch.ones(2, 3)
+    weight = torch.nn.Parameter(torch.ones(3))
+
+    es.einshard("b c, c [param] -> b c", x, weight)
+    es.einshard(
+        "b/dp c/sp, c [param, grad=async] -> b/dp c",
+        x,
+        weight,
+        mesh=mesh_2d,
+    )
+    state = es.get_parameter_state(weight)
+
+    assert state.grad_comm.pending_inference
+    assert state.grad_comm.mesh_dims == ()
+
+
+def test_einshard_distributed_pending_grad_overrides_prior_inferred_concrete(dist_env, mesh_2d):
+    x = torch.ones(2, 3)
+    weight = torch.nn.Parameter(torch.ones(3))
+
+    es.einshard("b/dp c, c [param, grad=async] -> b/dp c", x, weight, mesh=mesh_2d)
+    assert es.get_parameter_state(weight).grad_comm.mesh_dims == ("dp",)
+
+    es.einshard(
+        "b/dp c/sp, c [param, grad=async] -> b/dp c",
+        x,
+        weight,
+        mesh=mesh_2d,
+    )
+    state = es.get_parameter_state(weight)
+
+    assert state.grad_comm.pending_inference
+    assert state.grad_comm.mesh_dims == ()
+    assert state.grad_comm.schedule == "async"
+
+
+def test_einshard_prior_pending_grad_masks_later_inferred_concrete(dist_env, mesh_2d):
+    x = torch.ones(2, 3)
+    weight = torch.nn.Parameter(torch.ones(3))
+
+    es.einshard(
+        "b/dp c/sp, c [param, grad=async] -> b/dp c",
+        x,
+        weight,
+        mesh=mesh_2d,
+    )
+    es.einshard("b/dp c, c [param, grad=async] -> b/dp c", x, weight, mesh=mesh_2d)
+    state = es.get_parameter_state(weight)
+
+    assert state.grad_comm.pending_inference
+    assert state.grad_comm.mesh_dims == ()
+    assert state.grad_comm.schedule == "async"
+
+
+def test_einshard_distributed_pending_grad_conflicts_with_explicit_none(dist_env, mesh_2d):
+    x = torch.ones(2, 3)
+    weight = torch.nn.Parameter(torch.ones(3))
+
+    es.einshard("b c, c [param, grad=none] -> b c", x, weight)
+
+    try:
+        es.einshard(
+            "b/dp c/sp, c [param, grad=async] -> b/dp c",
+            x,
+            weight,
+            mesh=mesh_2d,
+        )
+    except ValueError as error:
+        assert "incompatible metadata" in str(error)
+    else:
+        raise AssertionError("Expected explicit gradient opt-out conflict to fail")
+
+    assert es.get_parameter_state(weight).explicit_grad_comm_none
+
+
+def test_einshard_pending_grad_backend_conflicts_with_existing_native_reduce(dist_env, mesh_2d):
+    x = torch.ones(2, 3)
+    weight = torch.nn.Parameter(torch.ones(3))
+    es.set_param_spec(weight, es.ParamSpec("c", reduce="sp"))
+
+    try:
+        es.einshard(
+            "b/dp c/sp, c [param, grad=external] -> b/dp c",
+            x,
+            weight,
+            mesh=mesh_2d,
+        )
+    except ValueError as error:
+        assert "incompatible metadata" in str(error)
+    else:
+        raise AssertionError("Expected native/external gradient backend conflict to fail")
+
+    assert es.get_parameter_state(weight).grad_comm.backend == "native"
+
+
+def test_einshard_pending_external_grad_conflicts_with_later_native_inference(dist_env, mesh_2d):
+    x = torch.ones(2, 3)
+    weight = torch.nn.Parameter(torch.ones(3))
+
+    es.einshard(
+        "b/dp c/sp, c [param, grad=external] -> b/dp c",
+        x,
+        weight,
+        mesh=mesh_2d,
+    )
+
+    try:
+        es.einshard(
+            "b/dp c, c [param, grad=async] -> b/dp c",
+            x,
+            weight,
+            mesh=mesh_2d,
+        )
+    except ValueError as error:
+        assert "incompatible metadata" in str(error)
+    else:
+        raise AssertionError("Expected external/native gradient backend conflict to fail")
+
+    assert es.get_parameter_state(weight).grad_comm.backend == "external"
+
+
+def test_einshard_later_async_annotation_refines_default_schedule(dist_env, mesh_2d):
+    x = torch.ones(2, 3)
+    weight = torch.nn.Parameter(torch.ones(3))
+
+    es.einshard("b/dp c, c [param] -> b/dp c", x, weight, mesh=mesh_2d)
+    assert es.get_parameter_state(weight).grad_comm.schedule == "backend_default"
+
+    es.einshard(
+        "b/dp c, c [param, grad=async] -> b/dp c",
+        x,
+        weight,
+        mesh=mesh_2d,
+    )
+    state = es.get_parameter_state(weight)
+
+    assert state.grad_comm.mesh_dims == ("dp",)
+    assert state.grad_comm.schedule == "async"
+
+
+def test_register_parameter_operand_can_defer_grad_inference(dist_env, mesh_2d):
+    weight = torch.nn.Parameter(torch.ones(3))
+    input_spec, param_spec, output_spec = es.parse_sharding(
+        "b/dp c/sp, c [param, grad=async] -> b/dp c"
+    )
+
+    returned = register_parameter_operand(
+        weight,
+        (input_spec, param_spec),
+        output_spec,
+        1,
+        mesh_dim_names=mesh_2d.mesh_dim_names,
+        infer_grad=False,
+    )
+    state = es.get_parameter_state(weight)
+
+    assert returned is weight
+    assert state.grad_comm.pending_inference
+
+
+def test_einshard_merges_formula_grad_into_layout_only_param_spec(dist_env, mesh_2d):
+    x = torch.ones(2, 3)
+    weight = torch.nn.Parameter(torch.ones(3))
+    es.set_param_spec(weight, es.ParamSpec("c"))
+
+    es.einshard(
+        "b/dp c, c [param, grad=async] -> b/dp c",
+        x,
+        weight,
+        mesh=mesh_2d,
+    )
+    state = es.get_parameter_state(weight)
+
+    assert state.source == "ParamSpec+formula"
+    assert state.shared == ("dp", "sp")
+    assert state.tensor_state.replicated_dims == ("dp", "sp")
+    assert state.grad_comm.mesh_dims == ("dp",)
+    assert state.grad_comm.schedule == "async"
+
+
+def test_einshard_accepts_semantically_matching_param_spec_metadata(dist_env, mesh_2d):
+    x = torch.ones(2, 3)
+    weight = torch.nn.Parameter(torch.ones(3))
+    es.set_param_spec(weight, es.ParamSpec("c", shared=("dp", "sp"), reduce="sp"))
+
+    es.einshard(
+        "b/dp c, c [param, grad=sp] -> b/dp c",
+        x,
+        weight,
+        mesh=mesh_2d,
+    )
+    state = es.get_parameter_state(weight)
+
+    assert state.source == "ParamSpec+formula"
+    assert state.shared == ("dp", "sp")
+    assert state.reduce == ("sp",)
+    assert state.tensor_state.replicated_dims == ("dp", "sp")
+
+
+def test_einshard_rejects_param_spec_formula_grad_conflict(dist_env, mesh_2d):
+    x = torch.ones(2, 3)
+    weight = torch.nn.Parameter(torch.ones(3))
+    es.set_param_spec(weight, es.ParamSpec("c", reduce="sp"))
+
+    try:
+        es.einshard(
+            "b/dp c, c [param, grad=async] -> b/dp c",
+            x,
+            weight,
+            mesh=mesh_2d,
+        )
+    except ValueError as error:
+        assert "incompatible metadata" in str(error)
+    else:
+        raise AssertionError("Expected ParamSpec/formula gradient conflict to fail")
+
+    assert es.get_parameter_state(weight).source == "ParamSpec"
+    assert es.get_parameter_state(weight).reduce == ("sp",)
+
+
+def test_einshard_rejects_param_spec_formula_init_sync_none_conflict():
+    x = torch.ones(2, 3)
+    weight = torch.nn.Parameter(torch.ones(3))
+    es.set_param_spec(weight, es.ParamSpec("c", shared="sp"))
+
+    try:
+        es.einshard("b c, c [param, init_sync=none] -> b c", x, weight)
+    except ValueError as error:
+        assert "incompatible metadata" in str(error)
+    else:
+        raise AssertionError("Expected ParamSpec/formula init-sync conflict to fail")
+
+    assert es.get_parameter_state(weight).source == "ParamSpec"
+    assert es.get_parameter_state(weight).shared == ("sp",)
+
+
+def test_einshard_rejects_param_spec_formula_grad_none_conflict():
+    x = torch.ones(2, 3)
+    weight = torch.nn.Parameter(torch.ones(3))
+    es.set_param_spec(weight, es.ParamSpec("c", reduce="sp"))
+
+    try:
+        es.einshard("b c, c [param, grad=none] -> b c", x, weight)
+    except ValueError as error:
+        assert "incompatible metadata" in str(error)
+    else:
+        raise AssertionError("Expected ParamSpec/formula gradient conflict to fail")
+
+    assert es.get_parameter_state(weight).source == "ParamSpec"
+    assert es.get_parameter_state(weight).reduce == ("sp",)
+
+
+def test_einshard_fills_nonexplicit_formula_none_from_later_inference(dist_env, mesh_2d):
+    x = torch.ones(2, 3)
+    weight = torch.nn.Parameter(torch.ones(3))
+
+    es.einshard("b c, c [param] -> b c", x, weight)
+    assert es.get_parameter_state(weight).grad_comm.mode == "none"
+
+    es.einshard(
+        "b/dp c, c [param, grad=async] -> b/dp c",
+        x,
+        weight,
+        mesh=mesh_2d,
+    )
+    state = es.get_parameter_state(weight)
+
+    assert state.source == "formula"
+    assert state.shared == ("dp", "sp")
+    assert state.grad_comm.mesh_dims == ("dp",)
+    assert state.grad_comm.schedule == "async"
+
+
+def test_einshard_later_light_formula_does_not_downgrade_tensor_state(dist_env, mesh_2d):
+    x = torch.ones(2, 3)
+    weight = torch.nn.Parameter(torch.ones(3))
+
+    es.einshard(
+        "b/dp c, c [param, grad=async] -> b/dp c",
+        x,
+        weight,
+        mesh=mesh_2d,
+    )
+    es.einshard("b c, c [param] -> b c", x, weight)
+    state = es.get_parameter_state(weight)
+
+    assert state.shared == ("dp", "sp")
+    assert state.tensor_state.replicated_dims == ("dp", "sp")
+    assert state.grad_comm.mesh_dims == ("dp",)
+
+
+def test_einshard_preserves_explicit_formula_grad_none_as_conflict(dist_env, mesh_2d):
+    x = torch.ones(2, 3)
+    weight = torch.nn.Parameter(torch.ones(3))
+
+    es.einshard("b c, c [param, grad=none] -> b c", x, weight)
+
+    try:
+        es.einshard(
+            "b/dp c, c [param, grad=async] -> b/dp c",
+            x,
+            weight,
+            mesh=mesh_2d,
+        )
+    except ValueError as error:
+        assert "incompatible metadata" in str(error)
+    else:
+        raise AssertionError("Expected explicit gradient opt-out conflict to fail")
+
+    assert es.get_parameter_state(weight).grad_comm.mode == "none"
+
+
+def test_einshard_preserves_explicit_grad_none_through_intermediate_merge(dist_env, mesh_2d):
+    x = torch.ones(2, 3)
+    weight = torch.nn.Parameter(torch.ones(3))
+
+    es.einshard("b c, c [param, grad=none] -> b c", x, weight)
+    es.einshard("b c, c [param] -> b c", x, weight, mesh=mesh_2d)
+
+    try:
+        es.einshard(
+            "b/dp c, c [param, grad=async] -> b/dp c",
+            x,
+            weight,
+            mesh=mesh_2d,
+        )
+    except ValueError as error:
+        assert "incompatible metadata" in str(error)
+    else:
+        raise AssertionError("Expected explicit gradient opt-out conflict to fail")
+
+    assert es.get_parameter_state(weight).explicit_grad_comm_none
+
+
+def test_einshard_preserves_explicit_formula_init_sync_none_as_conflict(dist_env, mesh_2d):
+    x = torch.ones(2, 3)
+    weight = torch.nn.Parameter(torch.ones(3))
+
+    es.einshard("b c, c [param, init_sync=none] -> b c", x, weight)
+
+    try:
+        es.einshard(
+            "b/dp c, c [param, grad=async] -> b/dp c",
+            x,
+            weight,
+            mesh=mesh_2d,
+        )
+    except ValueError as error:
+        assert "incompatible metadata" in str(error)
+    else:
+        raise AssertionError("Expected explicit init-sync opt-out conflict to fail")
+
+    assert es.get_parameter_state(weight).init_sync.mode == "none"
+
+
+def test_einshard_preserves_explicit_init_sync_none_through_intermediate_merge(dist_env, mesh_2d):
+    x = torch.ones(2, 3)
+    weight = torch.nn.Parameter(torch.ones(3))
+
+    es.einshard("b c, c [param, init_sync=none] -> b c", x, weight)
+    es.einshard("b c, c [param, grad=sp] -> b c", x, weight)
+
+    try:
+        es.einshard(
+            "b/dp c, c [param, grad=sp] -> b/dp c",
+            x,
+            weight,
+            mesh=mesh_2d,
+        )
+    except ValueError as error:
+        assert "incompatible metadata" in str(error)
+    else:
+        raise AssertionError("Expected explicit init-sync opt-out conflict to fail")
+
+    assert es.get_parameter_state(weight).explicit_init_sync_none
+
+
+def test_einshard_reuses_matching_registered_parameter_state(dist_env, mesh_2d):
+    x = torch.ones(2, 3)
+    weight = torch.nn.Parameter(torch.ones(3))
+
+    for _ in range(2):
+        es.einshard(
+            "b/dp c, c [param, grad=async] -> b/dp c",
+            x,
+            weight,
+            mesh=mesh_2d,
+        )
+
+    assert es.get_parameter_state(weight).grad_comm.mesh_dims == ("dp",)
+
+
+def test_einshard_rejects_conflicting_registered_parameter_layout(dist_env, mesh_2d):
+    x = torch.ones(2, 3)
+    weight = torch.nn.Parameter(torch.ones(3))
+
+    es.einshard("b c, c [param] -> b c", x, weight)
+
+    try:
+        es.einshard("b c, c/sp [param] -> b c", x, weight, mesh=mesh_2d)
+    except ValueError as error:
+        assert "different layout" in str(error)
+    else:
+        raise AssertionError("Expected conflicting parameter layout to fail")
+
+
+def test_einshard_rejects_annotated_non_parameter_operand():
+    x = torch.ones(2, 3)
+    scale = torch.ones(3)
+
+    try:
+        es.einshard("b c, c [param] -> b c", x, scale)
+    except TypeError as error:
+        assert "torch.nn.Parameter" in str(error)
+    else:
+        raise AssertionError("Expected annotated non-Parameter operand to fail")
+
+
+def test_einshard_failed_dispatch_does_not_attach_parameter_state():
+    x = torch.ones(2, 4)
+    weight = torch.nn.Parameter(torch.ones(3))
+
+    try:
+        es.einshard("b c, c [param] -> b c", x, weight)
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("Expected shape mismatch to fail")
+
+    assert es.get_parameter_state(weight) is None
+
+
+def test_einshard_validates_metadata_conflict_before_dispatch(dist_env, mesh_2d):
+    x = torch.ones(2, 4)
+    weight = torch.nn.Parameter(torch.ones(3))
+    es.set_param_spec(weight, es.ParamSpec("c", reduce="sp"))
+
+    try:
+        es.einshard(
+            "b/dp c, c [param, grad=async] -> b/dp c",
+            x,
+            weight,
+            mesh=mesh_2d,
+        )
+    except ValueError as error:
+        assert "incompatible metadata" in str(error)
+    else:
+        raise AssertionError("Expected metadata conflict to fail before dispatch")
+
+    assert es.get_parameter_state(weight).source == "ParamSpec"
+
+
+def test_einshard_registration_conflict_does_not_partially_attach_state(dist_env, mesh_2d):
+    left = torch.nn.Parameter(torch.ones(2, 3))
+    right = torch.nn.Parameter(torch.ones(3))
+    es.set_param_spec(right, es.ParamSpec("c", reduce="sp"))
+
+    try:
+        es.einshard(
+            "b/dp c [param], c [param, grad=async] -> b/dp c",
+            left,
+            right,
+            mesh=mesh_2d,
+        )
+    except ValueError as error:
+        assert "incompatible metadata" in str(error)
+    else:
+        raise AssertionError("Expected conflicting parameter metadata to fail")
+
+    assert es.get_parameter_state(left) is None
+    assert es.get_parameter_state(right).source == "ParamSpec"
+
+
+def test_einshard_failed_atomic_registration_does_not_lazily_attach_legacy_state(dist_env, mesh_2d):
+    left = torch.nn.Parameter(torch.ones(2, 3))
+    right = torch.nn.Parameter(torch.ones(3))
+    setattr(right, PARAM_SPEC_ATTR, es.ParamSpec("c", reduce="sp"))
+
+    try:
+        es.einshard(
+            "b/dp c [param], c [param, grad=async] -> b/dp c",
+            left,
+            right,
+            mesh=mesh_2d,
+        )
+    except ValueError as error:
+        assert "incompatible metadata" in str(error)
+    else:
+        raise AssertionError("Expected conflicting parameter metadata to fail")
+
+    assert getattr(left, PARAM_STATE_ATTR, None) is None
+    assert getattr(right, PARAM_STATE_ATTR, None) is None
+
+
+def test_register_parameter_state_failure_does_not_lazily_attach_legacy_state():
+    param = torch.nn.Parameter(torch.ones(3))
+    setattr(param, PARAM_SPEC_ATTR, es.ParamSpec("c", reduce="sp"))
+    spec, _, _ = es.parse_sharding("c [param, grad=dp] -> c")
+    state = es.ParameterState.from_spec(spec, source="formula")
+
+    try:
+        register_parameter_state(param, state)
+    except ValueError as error:
+        assert "incompatible metadata" in str(error)
+    else:
+        raise AssertionError("Expected conflicting parameter metadata to fail")
+
+    assert getattr(param, PARAM_STATE_ATTR, None) is None
+
+
+def test_einshard_ignores_unnamed_mesh_for_unannotated_local_operation():
+    class UnnamedMesh:
+        mesh_dim_names = None
+
+    x = torch.ones(2, 3)
+
+    assert_close(es.einshard("b c -> b c", x, mesh=UnnamedMesh()), x)
 
 
 def test_param_local_slices_uses_mesh_coordinates(dist_env, mesh_2d):

@@ -6,6 +6,7 @@ from .distributed import distributed_1d
 from .families import cached_expand_axis_families
 from .halo import einhalo, einwindow
 from .mesh import CompoundDeviceMesh, wrap_mesh
+from . import params as _params
 from .params import (
     ParamShardMetadata,
     ParamSpec,
@@ -23,6 +24,9 @@ from .params import (
     reduce_grad_,
     reduce_module_grads_,
     register_grad_reduction_hook_,
+    register_parameter_operand,
+    register_parameter_state,
+    parameter_operand_state,
     set_parameter_state,
     set_param_spec,
     sync_module_params_,
@@ -90,18 +94,60 @@ def local_operation(shard):
 
         return True
 
-def einshard(shard, *xs, mesh = None, shapes = None, sizes = None, families = None, optimize = None, policy = None):
-    policy = resolve_plan_policy(optimize=optimize, policy=policy)
-    shard, sizes = cached_expand_axis_families(shard, sizes, families)
-    shard = parse_sharding(shard)
 
-    if local_operation(shard):
-        output = einsum(shard, *xs, sizes=sizes)
-        plan = ExecutionPlan()
-        plan.add("rank_local_einsum")
-        set_last_plan(plan)
-        return output
+def _mesh_dim_names(mesh):
+    return tuple(getattr(mesh, "mesh_dim_names", None) or ()) if mesh is not None else ()
 
+
+def _input_specs(shard):
+    if shard[1] is None:
+        return (shard[0],)
+    return (shard[0], shard[1])
+
+
+def _parameter_operand_registrations(shard, xs, mesh):
+    input_specs = _input_specs(shard)
+    mesh_dim_names = _mesh_dim_names(mesh)
+    infer_grad = local_operation(shard)
+    registrations = []
+    for index, spec in enumerate(input_specs):
+        annotation = getattr(spec, "annotation", None)
+        if not getattr(annotation, "is_param", False):
+            continue
+        if index >= len(xs):
+            raise ValueError("Annotated parameter operand is missing a tensor argument")
+        state = parameter_operand_state(
+            xs[index],
+            input_specs,
+            shard[2],
+            index,
+            mesh_dim_names=mesh_dim_names,
+            infer_grad=infer_grad,
+        )
+        registrations.append((xs[index], state))
+    return registrations
+
+
+def _prepare_parameter_operand_registrations(registrations):
+    merged_by_id = {}
+    params_by_id = {}
+    for param, state in registrations:
+        key = id(param)
+        if key in merged_by_id:
+            existing = merged_by_id[key]
+        else:
+            existing = _params._parameter_state_from_attached_metadata(param)
+        merged_by_id[key] = _params._merge_parameter_state(existing, state)
+        params_by_id[key] = param
+    return [(params_by_id[key], state) for key, state in merged_by_id.items()]
+
+
+def _commit_parameter_operand_registrations(registrations):
+    for param, state in registrations:
+        set_parameter_state(param, state)
+
+
+def _distributed_einshard(shard, xs, mesh, shapes, policy):
     if any(_has_groups(s) for s in shard if s is not None):
         raise NotImplementedError("Factored axes are currently supported only for local reshape operations")
 
@@ -109,3 +155,25 @@ def einshard(shard, *xs, mesh = None, shapes = None, sizes = None, families = No
         raise ValueError("Distributed einshard operations require mesh")
 
     return distributed_1d(shard, *xs, mesh = mesh, shapes = shapes, policy = policy)
+
+
+def _execute_einshard(shard, xs, mesh, shapes, sizes, policy):
+    if local_operation(shard):
+        output = einsum(shard, *xs, sizes=sizes)
+        plan = ExecutionPlan()
+        plan.add("rank_local_einsum")
+        set_last_plan(plan)
+        return output
+
+    return _distributed_einshard(shard, xs, mesh, shapes, policy)
+
+
+def einshard(shard, *xs, mesh = None, shapes = None, sizes = None, families = None, optimize = None, policy = None):
+    policy = resolve_plan_policy(optimize=optimize, policy=policy)
+    shard, sizes = cached_expand_axis_families(shard, sizes, families)
+    shard = parse_sharding(shard)
+    registrations = _parameter_operand_registrations(shard, xs, mesh)
+    registrations = _prepare_parameter_operand_registrations(registrations)
+    output = _execute_einshard(shard, xs, mesh, shapes, sizes, policy)
+    _commit_parameter_operand_registrations(registrations)
+    return output
