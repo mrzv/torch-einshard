@@ -139,6 +139,7 @@ Implemented behavior:
 - `register_grad_reduction_hook_` can optionally combine DDP averaging and a uniform extra reduction into one compound-group all-reduce for matching buckets.
 - Compound names work through `wrap_mesh`.
 - `shared` metadata is rejected when it overlaps with axis shard dimensions.
+- Concrete native/DDP gradient reductions are rejected when they overlap with parameter layout shard dimensions.
 - `param_local_slices`, `param_local_shape`, and `param_shard_metadata` derive local shard metadata from `ParamSpec` or `ParameterState` layouts.
 - Input operand annotations such as `[param]`, `[param, grad=async]`, `[param, grad=none]`, and `[param, init_sync=none]` are parsed and stored in `TensorSpec`.
 - `einshard` registers annotated `torch.nn.Parameter` operands after successful execution, merges compatible formula metadata with layout-only or semantically compatible legacy `ParamSpec` metadata, and rejects conflicting layouts or conflicting explicit opt-outs.

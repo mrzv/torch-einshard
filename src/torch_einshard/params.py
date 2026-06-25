@@ -66,6 +66,17 @@ def _validate_parameter_layout(layout_shard_dims, init_sync=None):
             raise ValueError(f"Parameter init_sync annotation overlaps with sharded axis dimensions: {dims}")
 
 
+def _validate_parameter_grad_comm(layout_shard_dims, grad_comm):
+    if grad_comm.mode == "none" or grad_comm.backend == "external" or not grad_comm.mesh_dims:
+        return
+    shard_components = _mesh_dims_components(layout_shard_dims)
+    for name in grad_comm.mesh_dims:
+        overlap = shard_components.intersection(_mesh_dim_components(name))
+        if overlap:
+            dims = ", ".join(sorted(overlap))
+            raise ValueError(f"Parameter grad annotation overlaps with sharded axis dimensions: {dims}")
+
+
 def _parse_axes(spec):
     input_spec, other, output_spec = parse_sharding(f"{spec} -> {spec}")
     if other is not None or input_spec.partials or output_spec.partials:
@@ -182,6 +193,7 @@ class ParameterState:
         )
         _validate_parameter_layout(layout_shard_dims, init_sync)
         grad_comm = ParameterGradComm.from_annotation(getattr(annotation, "grad", None), is_param=is_param)
+        _validate_parameter_grad_comm(layout_shard_dims, grad_comm)
         init_sync_annotation = getattr(annotation, "init_sync", None)
         grad_annotation = getattr(annotation, "grad", None)
         return cls(
@@ -199,12 +211,14 @@ class ParameterState:
     def from_param_spec(cls, spec, *, mesh_dim_names=()):
         init_sync = ParameterInitSync(mode="explicit" if spec.shared else "none", mesh_dims=spec.shared)
         _validate_parameter_layout(tuple(spec.axes.all_shard_dims()), init_sync)
+        grad_comm = ParameterGradComm.from_reduce_groups(spec.reduce)
+        _validate_parameter_grad_comm(tuple(spec.axes.all_shard_dims()), grad_comm)
         return cls(
             spec=spec.spec,
             tensor_state=_tensor_state_or_none(spec.spec, tuple(mesh_dim_names)),
             layout_shard_dims=tuple(spec.axes.all_shard_dims()),
             init_sync=init_sync,
-            grad_comm=ParameterGradComm.from_reduce_groups(spec.reduce),
+            grad_comm=grad_comm,
             source="ParamSpec",
         )
 
@@ -242,6 +256,7 @@ class ParamSpec:
             all_shard_dims,
             ParameterInitSync(mode="explicit" if shared else "none", mesh_dims=shared),
         )
+        _validate_parameter_grad_comm(all_shard_dims, ParameterGradComm.from_reduce_groups(reduce))
         object.__setattr__(self, "layout", layout)
         object.__setattr__(self, "axes", axes)
         object.__setattr__(self, "spec", TensorSpec(axes))
@@ -575,6 +590,7 @@ def _with_inferred_parameter_grad_comm(state, input_specs, output_spec, operand_
         grad_comm = ParameterGradComm()
     else:
         grad_comm = replace(grad_comm, mesh_dims=mesh_dims)
+    _validate_parameter_grad_comm(state.layout_shard_dims, grad_comm)
     return replace(state, grad_comm=grad_comm)
 
 

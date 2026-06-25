@@ -77,6 +77,26 @@ def test_param_spec_rejects_shared_compound_shard_overlap():
         raise AssertionError("Expected shared metadata over a compound shard component to fail")
 
 
+def test_param_spec_rejects_reduce_sharded_axis_overlap():
+    try:
+        es.ParamSpec("o/sp c", reduce="sp")
+    except ValueError as error:
+        assert "grad" in str(error)
+        assert "overlaps" in str(error)
+    else:
+        raise AssertionError("Expected gradient reduction over a parameter shard dim to fail")
+
+
+def test_param_spec_rejects_reduce_compound_sharded_axis_overlap():
+    try:
+        es.ParamSpec("o/dp-sp c", reduce="sp")
+    except ValueError as error:
+        assert "grad" in str(error)
+        assert "overlaps" in str(error)
+    else:
+        raise AssertionError("Expected gradient reduction over a compound shard component to fail")
+
+
 def test_param_shard_dims_reads_specs_from_params():
     param = torch.nn.Parameter(torch.zeros(2, 3))
     spec = es.ParamSpec("o/tp c/sp")
@@ -227,6 +247,107 @@ def test_parameter_state_rejects_init_sync_shard_overlap():
         assert "overlaps" in str(error)
     else:
         raise AssertionError("Expected overlapping init_sync and sharded metadata to fail")
+
+
+def test_parameter_state_rejects_grad_shard_overlap():
+    _, weight, _ = es.parse_sharding("b c, out/tp c [param, grad=tp] -> b out")
+
+    try:
+        es.ParameterState.from_spec(weight)
+    except ValueError as error:
+        assert "grad" in str(error)
+        assert "overlaps" in str(error)
+    else:
+        raise AssertionError("Expected overlapping grad and sharded metadata to fail")
+
+
+def test_parameter_state_rejects_ddp_grad_shard_overlap():
+    _, weight, _ = es.parse_sharding("b c, out/tp c [param, grad=tp:ddp] -> b out")
+
+    try:
+        es.ParameterState.from_spec(weight)
+    except ValueError as error:
+        assert "grad" in str(error)
+        assert "overlaps" in str(error)
+    else:
+        raise AssertionError("Expected DDP grad over a sharded parameter dimension to fail")
+
+
+def test_parameter_state_allows_external_grad_shard_overlap():
+    _, weight, _ = es.parse_sharding("b c, out/tp c [param, grad=tp:external] -> b out")
+
+    state = es.ParameterState.from_spec(weight)
+
+    assert state.grad_comm.backend == "external"
+    assert state.reduce == ()
+
+
+def test_parameter_state_allows_pending_grad_for_sharded_layout():
+    _, weight, _ = es.parse_sharding("b c, out/tp c [param, grad=async] -> b out")
+
+    state = es.ParameterState.from_spec(weight)
+
+    assert state.grad_comm.pending_inference
+
+
+def test_einshard_rejects_inferred_grad_shard_overlap(mesh_tp):
+    x = torch.ones(2, 3)
+    weight = torch.nn.Parameter(torch.ones(4, 3))
+
+    try:
+        es.einshard(
+            "b/tp c, out/tp c [param, grad=async] -> b/tp out/tp",
+            x,
+            weight,
+            mesh=mesh_tp,
+        )
+    except ValueError as error:
+        assert "grad" in str(error)
+        assert "overlaps" in str(error)
+    else:
+        raise AssertionError("Expected inferred gradient overlap with layout shard dim to fail")
+
+    assert es.get_parameter_state(weight) is None
+
+
+def test_einshard_rejects_inferred_ddp_grad_shard_overlap(mesh_tp):
+    x = torch.ones(2, 3)
+    weight = torch.nn.Parameter(torch.ones(4, 3))
+
+    try:
+        es.einshard(
+            "b/tp c, out/tp c [param, grad=ddp] -> b/tp out/tp",
+            x,
+            weight,
+            mesh=mesh_tp,
+        )
+    except ValueError as error:
+        assert "grad" in str(error)
+        assert "overlaps" in str(error)
+    else:
+        raise AssertionError("Expected inferred DDP gradient overlap with layout shard dim to fail")
+
+    assert es.get_parameter_state(weight) is None
+
+
+def test_einshard_rejects_inferred_grad_compound_shard_overlap(dist_env, mesh_2d):
+    x = torch.ones(2, 3)
+    weight = torch.nn.Parameter(torch.ones(4, 3))
+
+    try:
+        es.einshard(
+            "b/sp c, out/dp-sp c [param, grad=async] -> b/sp out/dp-sp",
+            x,
+            weight,
+            mesh=mesh_2d,
+        )
+    except ValueError as error:
+        assert "grad" in str(error)
+        assert "overlaps" in str(error)
+    else:
+        raise AssertionError("Expected inferred gradient overlap with compound shard dim to fail")
+
+    assert es.get_parameter_state(weight) is None
 
 
 def test_parameter_state_rejects_partial_parameter_specs():

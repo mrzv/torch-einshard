@@ -37,6 +37,12 @@ process groups.
 example, `ParamSpec("out/tp in", shared="tp")` is rejected because `out` is
 already sharded over `tp`.
 
+Concrete native or DDP-backed gradient reductions also cannot overlap parameter
+layout shard dimensions. For example, `ParamSpec("out/tp in", reduce="tp")` is
+rejected because the native execution paths all-reduce full local gradient
+tensors and would mix different `out` shards. External gradient backends are not
+validated by this rule because they own their execution semantics.
+
 ## Formula Annotations
 
 Input operands can be annotated as persistent parameters:
