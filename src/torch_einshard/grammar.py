@@ -2,7 +2,7 @@ from functools import lru_cache
 
 from parsley import makeGrammar
 
-from .sharding import Axis, Axes, AxisGroup, EllipsisAxis, TensorSpec
+from .sharding import Axis, Axes, AxisGroup, EllipsisAxis, TensorAnnotation, TensorSpec
 
 # TODO: add subscript-notation for parallelism
 # TODO: for now only two tensors
@@ -18,9 +18,16 @@ grammar = r"""
     axes = (ws (group | ellipsis | axis))+:axs -> Axes(axs)
     partial_many = '(' ws mesh_id:first (ws ',' ws mesh_id)*:rest ws ')' -> [first] + rest
     partial = ws '//' ws (partial_many | mesh_id:p -> [p])
-    tensor = axes:a (partial:p -> p)?:p -> TensorSpec(a, p or [])
+    annotation_value = <letterOrDigit+ ('-' letterOrDigit+)* (':' letterOrDigit+)?>
+    annotation_item = 'param' -> ('param', True)
+                    | 'grad' ws '=' ws annotation_value:v -> ('grad', v)
+                    | 'init_sync' ws '=' ws annotation_value:v -> ('init_sync', v)
+    annotation_items = annotation_item:first (ws ',' ws annotation_item)*:rest -> [first] + rest
+    annotation = ws '[' ws annotation_items:items ws ']' -> TensorAnnotation.from_items(items)
+    input_tensor = axes:a (partial:p -> p)?:p (annotation:ann -> ann)?:ann -> TensorSpec(a, p or [], ann)
+    output_tensor = axes:a (partial:p -> p)?:p -> TensorSpec(a, p or [])
 
-    map = tensor:a ws (',' tensor:x ws -> x)?:aa '->' tensor:o -> (a, aa, o)
+    map = input_tensor:a ws (',' input_tensor:x ws -> x)?:aa '->' output_tensor:o -> (a, aa, o)
 """
 
 sharding = makeGrammar(grammar, globals(), name = "Einshard")
@@ -45,7 +52,7 @@ def _copy_parse_result(result):
 def _copy_tensor_spec(spec):
     if spec is None:
         return None
-    return TensorSpec(Axes(_copy_axis(axis) for axis in spec.axes), spec.partials)
+    return TensorSpec(Axes(_copy_axis(axis) for axis in spec.axes), spec.partials, spec.annotation)
 
 
 def _copy_axis(axis):

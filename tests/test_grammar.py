@@ -83,6 +83,60 @@ def test_parse_hyphenated_mesh_dimension_in_partial_list():
     assert z.partials == ()
 
 
+def test_parse_parameter_annotation_with_async_grad():
+    x, y, z = parse_sharding("b c, out/tp c [param, grad=async] -> b out/tp")
+
+    assert not x.annotation
+    assert y.annotation.is_param
+    assert y.annotation.grad.mode == "inferred"
+    assert y.annotation.grad.mesh_dims == ()
+    assert y.annotation.grad.backend == "native"
+    assert y.annotation.grad.schedule == "async"
+    assert not z.annotation
+
+
+def test_parse_parameter_annotation_with_explicit_grad_backend():
+    _, y, _ = parse_sharding("b c, out c [param, grad=dp:ddp] -> b out")
+
+    assert y.annotation.grad.mode == "explicit"
+    assert y.annotation.grad.mesh_dims == ("dp",)
+    assert y.annotation.grad.backend == "ddp"
+    assert y.annotation.grad.schedule == "backend_default"
+
+
+def test_parse_parameter_annotation_with_external_grad_and_init_sync():
+    _, y, _ = parse_sharding("b c, out c [param, grad=external, init_sync=none] -> b out")
+
+    assert y.annotation.grad.mode == "inferred"
+    assert y.annotation.grad.backend == "external"
+    assert y.annotation.init_sync.mode == "none"
+    assert y.annotation.init_sync.mesh_dims == ()
+
+
+def test_parse_annotation_repr_round_trips_through_cache_copy():
+    parsed = parse_sharding("b c, out/tp c [param, grad=sp1-sp2:async, init_sync=tp] -> b out/tp")
+    reparsed = parse_sharding("b c, out/tp c [param, grad=sp1-sp2:async, init_sync=tp] -> b out/tp")
+
+    assert parsed is not reparsed
+    assert repr(parsed) == repr(reparsed)
+    assert repr(parsed[1]) == "out / tp × c [param, grad=sp1-sp2:async, init_sync=tp]"
+
+
+def test_parse_rejects_standalone_async_annotation():
+    with pytest.raises(ValueError, match="Invalid einshard expression"):
+        parse_sharding("a [async] -> a")
+
+
+def test_parse_rejects_output_annotation():
+    with pytest.raises(ValueError, match="Invalid einshard expression"):
+        parse_sharding("a -> a [param]")
+
+
+def test_parse_rejects_duplicate_annotation_items():
+    with pytest.raises(ValueError, match="Duplicate tensor annotation"):
+        parse_sharding("a [param, param] -> a")
+
+
 def test_parse_sharding_wraps_parse_errors():
     with pytest.raises(ValueError, match="Invalid einshard expression"):
         parse_sharding("a b ->")
@@ -114,6 +168,30 @@ def test_cached_axis_family_expansion_accepts_list_values():
 
     assert expanded == "b (h wh) (w ww) c -> b h w wh ww c"
     assert expanded_sizes == {"wh": 4, "ww": 5}
+
+
+def test_axis_family_expansion_ignores_parameter_annotations():
+    expression = "b [*spatial *window] c, out c [param, grad = async] -> b *spatial *window out"
+    families = {"spatial": ("h", "w"), "window": ("wh", "ww")}
+
+    expanded, _ = cached_expand_axis_families(expression, None, families)
+    _, weight, _ = parse_sharding(expanded)
+
+    assert expanded == "b (h wh) (w ww) c, out c [param, grad = async] -> b h w wh ww out"
+    assert weight.annotation.is_param
+    assert weight.annotation.grad.schedule == "async"
+
+
+def test_cached_axis_family_expansion_returns_copy_of_sizes():
+    expression = "b *spatial c -> b *spatial c"
+    families = {"spatial": ("h", "w")}
+    sizes = {"spatial": (4, 5)}
+
+    _, expanded_sizes = cached_expand_axis_families(expression, sizes, families)
+    expanded_sizes["h"] = 99
+    _, reparsed_sizes = cached_expand_axis_families(expression, sizes, families)
+
+    assert reparsed_sizes == {"h": 4, "w": 5}
 
 
 def test_einshard_wraps_parse_errors():
