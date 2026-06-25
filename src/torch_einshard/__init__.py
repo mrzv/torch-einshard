@@ -25,7 +25,9 @@ from .params import (
     reduce_grad_,
     reduce_module_grads_,
     register_grad_reduction_hook_,
+    register_linear_parameters_,
     register_native_grad_reduction_hooks_,
+    register_parameter_layout,
     register_parameter_operand,
     register_parameter_state,
     parameter_operand_state,
@@ -98,7 +100,7 @@ def local_operation(shard):
 
 
 def _mesh_dim_names(mesh):
-    return tuple(getattr(mesh, "mesh_dim_names", None) or ()) if mesh is not None else ()
+    return _params._mesh_dim_names_from(mesh)
 
 
 def _input_specs(shard):
@@ -109,13 +111,15 @@ def _input_specs(shard):
 
 def _parameter_operand_registrations(shard, xs, mesh):
     input_specs = _input_specs(shard)
-    mesh_dim_names = _mesh_dim_names(mesh)
+    mesh_dim_names = None
     infer_grad = local_operation(shard)
     registrations = []
     for index, spec in enumerate(input_specs):
         annotation = getattr(spec, "annotation", None)
         if not getattr(annotation, "is_param", False):
             continue
+        if mesh_dim_names is None:
+            mesh_dim_names = _mesh_dim_names(mesh)
         if index >= len(xs):
             raise ValueError("Annotated parameter operand is missing a tensor argument")
         state = parameter_operand_state(

@@ -73,6 +73,10 @@ The initial foundation is implemented.
   hooks for non-DDP training loops. This path reduces each incoming gradient
   contribution synchronously and requires identical backward participation and
   hook order across ranks.
+- Hidden linear-style parameters can be registered explicitly with
+  `ParameterState.from_layout`, `register_parameter_layout`, or
+  `register_linear_parameters_`; this covers state attachment without inferring
+  arbitrary module internals.
 
 The remaining major gap is execution-layer and planner-aware distributed
 inference work. The current implementation records obligations and preserves
@@ -470,9 +474,10 @@ The design should distinguish a truly external owner from a backend that
 ```
 
 `grad=external` means the parameter has a gradient communication obligation, but
-`torch-einshard` should not execute it. The obligation should remain visible for
-diagnostics and group validation. A scheduling suffix such as `async` does not
-apply to this case because the external owner controls scheduling.
+`torch-einshard` should not execute it. The obligation remains visible for
+diagnostics, but the external backend owns mesh-group validation and execution
+semantics. A scheduling suffix such as `async` does not apply to this case
+because the external owner controls scheduling.
 
 `grad=dp:external` is the explicit form for delegating only the `dp` obligation
 to an outside system.
@@ -591,7 +596,14 @@ Status: implemented foundation.
 
 ### Stage 4: Wrapper Coverage
 
-- Add wrappers or explicit registration helpers for linear layers.
+Status: partially implemented.
+
+- Implemented: explicit layout registration through `ParameterState.from_layout`
+  and `register_parameter_layout`.
+- Implemented: `nn.Linear`-style weight/bias registration through
+  `register_linear_parameters_`, including derived bias layout and atomic
+  conflict validation.
+
 - Add wrappers or explicit registration helpers for convolution layers.
 - Add wrappers or explicit registration helpers for normalization layers.
 - Add extension points for Transformer Engine or other fused modules.

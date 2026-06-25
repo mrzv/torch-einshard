@@ -77,6 +77,21 @@ def test_param_spec_rejects_shared_compound_shard_overlap():
         raise AssertionError("Expected shared metadata over a compound shard component to fail")
 
 
+def test_param_spec_rejects_overlapping_shared_groups():
+    cases = (
+        ("dp", "dp"),
+        ("dp", "dp-sp"),
+    )
+    for shared in cases:
+        try:
+            es.ParamSpec("o c", shared=shared)
+        except ValueError as error:
+            assert "init_sync" in str(error)
+            assert "overlap" in str(error)
+        else:
+            raise AssertionError("Expected overlapping shared groups to fail")
+
+
 def test_param_spec_rejects_reduce_sharded_axis_overlap():
     try:
         es.ParamSpec("o/sp c", reduce="sp")
@@ -95,6 +110,61 @@ def test_param_spec_rejects_reduce_compound_sharded_axis_overlap():
         assert "overlaps" in str(error)
     else:
         raise AssertionError("Expected gradient reduction over a compound shard component to fail")
+
+
+def test_param_spec_rejects_overlapping_reduce_groups():
+    cases = (
+        ("dp", "dp-sp"),
+        ("dp-sp", "sp-dp"),
+    )
+    for reduce in cases:
+        try:
+            es.ParamSpec("o c", reduce=reduce)
+        except ValueError as error:
+            assert "grad" in str(error)
+            assert "overlap" in str(error)
+        else:
+            raise AssertionError("Expected overlapping gradient reduction groups to fail")
+
+
+def test_param_spec_rejects_repeated_compound_group_components():
+    cases = (
+        {"layout": "o/dp-dp c"},
+        {"layout": "o c", "shared": "dp-dp"},
+        {"layout": "o c", "reduce": "dp-dp"},
+    )
+    for kwargs in cases:
+        try:
+            es.ParamSpec(**kwargs)
+        except ValueError as error:
+            assert "repeated mesh" in str(error)
+        else:
+            raise AssertionError("Expected repeated compound group component to fail")
+
+
+def test_param_spec_rejects_empty_compound_group_components():
+    cases = (
+        {"layout": "o c", "shared": ""},
+        {"layout": "o c", "reduce": ""},
+        {"layout": "o c", "shared": "dp-"},
+        {"layout": "o c", "reduce": "dp-"},
+    )
+    for kwargs in cases:
+        try:
+            es.ParamSpec(**kwargs)
+        except ValueError as error:
+            assert "empty mesh" in str(error)
+        else:
+            raise AssertionError("Expected empty compound group component to fail")
+
+
+def test_param_spec_rejects_non_string_layout():
+    try:
+        es.ParamSpec(None)
+    except TypeError as error:
+        assert "layout" in str(error)
+    else:
+        raise AssertionError("Expected non-string ParamSpec layout to fail")
 
 
 def test_param_shard_dims_reads_specs_from_params():
@@ -372,13 +442,555 @@ def test_parameter_state_infers_init_sync_from_compound_shard_dim_components():
     assert state.tensor_state.replicated_dims == ("tp",)
 
 
-def test_parameter_state_excludes_compound_candidate_init_sync_overlap():
+def test_parameter_state_rejects_layout_component_of_hyphenated_mesh_name():
     _, weight, _ = es.parse_sharding("b c, out/sp1 c [param] -> b out")
 
-    state = es.ParameterState.from_spec(weight, mesh_dim_names=("sp1-sp2", "tp"))
+    try:
+        es.ParameterState.from_spec(weight, mesh_dim_names=("sp1-sp2", "tp"))
+    except ValueError as error:
+        assert "unknown mesh" in str(error)
+    else:
+        raise AssertionError("Expected layout component of hyphenated mesh name to fail")
+
+
+def test_parameter_state_from_layout_infers_init_sync_without_grad_obligation():
+    state = es.ParameterState.from_layout(
+        "out/tp in",
+        mesh_dim_names=("tp", "sp"),
+        source="manual",
+    )
+
+    assert state.source == "manual"
+    assert state.layout_shard_dims == ("tp",)
+    assert state.shared == ("sp",)
+    assert state.grad_comm.mode == "none"
+    assert not state.explicit_grad_comm_none
+    assert state.tensor_state.placement_dict() == {"out": "tp", "in": None}
+    assert state.tensor_state.replicated_dims == ("sp",)
+
+
+def test_parameter_state_from_layout_accepts_string_mesh_dim_names():
+    class Mesh:
+        mesh_dim_names = "tp"
+
+    state = es.ParameterState.from_layout("out in", mesh_dim_names="tp")
+    mesh_state = es.ParameterState.from_layout("out in", mesh=Mesh())
+    param = torch.nn.Parameter(torch.ones(2, 3))
+    linear = nn.Linear(3, 2, bias=False)
+
+    es.register_parameter_layout(param, "out in", mesh_dim_names="tp")
+    es.register_linear_parameters_(linear, mesh_dim_names="tp")
 
     assert state.shared == ("tp",)
     assert state.tensor_state.replicated_dims == ("tp",)
+    assert mesh_state.shared == ("tp",)
+    assert es.get_parameter_state(param).shared == ("tp",)
+    assert es.get_parameter_state(linear.weight).shared == ("tp",)
+
+
+def test_parameter_state_from_layout_rejects_non_string_mesh_dim_names():
+    for kwargs in (
+        {"mesh_dim_names": 0},
+        {"mesh_dim_names": (1,)},
+        {"mesh_dim_names": torch.tensor([])},
+        {"mesh": type("ScalarMesh", (), {"mesh_dim_names": False})()},
+        {"mesh": type("Mesh", (), {"mesh_dim_names": (1,)})()},
+        {"mesh": type("TensorMesh", (), {"mesh_dim_names": torch.tensor([])})()},
+    ):
+        try:
+            es.ParameterState.from_layout("out in", **kwargs)
+        except TypeError as error:
+            assert "mesh_dim_names" in str(error)
+        else:
+            raise AssertionError("Expected non-string mesh dim names to fail")
+
+
+def test_parameter_state_from_layout_rejects_empty_or_duplicate_mesh_dim_names():
+    for kwargs in (
+        {"mesh_dim_names": ""},
+        {"mesh_dim_names": ("tp", "tp")},
+        {"mesh_dim_names": ("dp-dp",)},
+        {"mesh_dim_names": ("dp-",)},
+        {"mesh_dim_names": ("dp--sp",)},
+        {"mesh_dim_names": ("dp", "dp-sp")},
+        {"mesh": type("EmptyMesh", (), {"mesh_dim_names": ""})()},
+        {"mesh": type("DuplicateMesh", (), {"mesh_dim_names": ("tp", "tp")})()},
+        {"mesh": type("RepeatedComponentMesh", (), {"mesh_dim_names": ("dp-dp",)})()},
+        {"mesh": type("OverlappingComponentMesh", (), {"mesh_dim_names": ("dp", "dp-sp")})()},
+        {"mesh": type("EmptyComponentMesh", (), {"mesh_dim_names": ("dp-",)})()},
+    ):
+        try:
+            es.ParameterState.from_layout("out in", **kwargs)
+        except ValueError as error:
+            assert "mesh_dim_names" in str(error)
+        else:
+            raise AssertionError("Expected invalid mesh dim names to fail")
+
+
+def test_parameter_state_from_layout_rejects_mesh_dim_name_count_mismatch():
+    for names in (("tp",), None):
+        class Mesh:
+            mesh = torch.zeros(1, 1)
+            mesh_dim_names = names
+
+        try:
+            es.ParameterState.from_layout("out in", mesh=Mesh())
+        except ValueError as error:
+            assert "mesh_dim_names" in str(error)
+        else:
+            raise AssertionError("Expected mesh dim name count mismatch to fail")
+
+
+def test_parameter_state_from_layout_rejects_mesh_dim_names_that_disagree_with_mesh():
+    class Mesh:
+        mesh = torch.zeros(1, 1)
+        mesh_dim_names = ("dp", "sp")
+
+    try:
+        es.ParameterState.from_layout("out in", mesh=Mesh(), mesh_dim_names=("foo", "bar"))
+    except ValueError as error:
+        assert "mesh_dim_names" in str(error)
+    else:
+        raise AssertionError("Expected mesh_dim_names mismatch to fail")
+
+
+def test_parameter_state_from_layout_rejects_unknown_mesh_groups():
+    cases = (
+        {"layout": "out/tp in"},
+        {"layout": "out in", "grad": "tp"},
+        {"layout": "out in", "grad": "tp:ddp"},
+        {"layout": "out in", "init_sync": "tp"},
+    )
+    for kwargs in cases:
+        try:
+            es.ParameterState.from_layout(mesh_dim_names=("dp", "sp"), **kwargs)
+        except ValueError as error:
+            assert "unknown mesh" in str(error)
+        else:
+            raise AssertionError("Expected unknown mesh group to fail")
+
+
+def test_parameter_state_from_layout_allows_external_unknown_grad_group():
+    state = es.ParameterState.from_layout("out in", mesh_dim_names=("dp", "sp"), grad="tp:external")
+
+    assert state.grad_comm.backend == "external"
+    assert state.grad_comm.mesh_dims == ("tp",)
+
+
+def test_parameter_state_from_layout_allows_known_compound_mesh_groups():
+    state = es.ParameterState.from_layout(
+        "out in",
+        mesh_dim_names=("dp", "sp"),
+        grad="dp-sp",
+        init_sync="dp-sp",
+    )
+
+    assert state.reduce == ("dp-sp",)
+    assert state.shared == ("dp-sp",)
+
+
+def test_parameter_state_from_layout_rejects_unknown_compound_components():
+    cases = (
+        {"mesh_dim_names": ("dp-sp",), "grad": "dp"},
+    )
+    for kwargs in cases:
+        try:
+            es.ParameterState.from_layout("out in", **kwargs)
+        except ValueError as error:
+            assert "unknown mesh" in str(error)
+        else:
+            raise AssertionError("Expected unknown compound mesh group to fail")
+
+
+def test_parameter_state_from_layout_rejects_recombined_compound_candidate_components():
+    cases = (
+        {"layout": "a/sp1 b/sp2", "mesh_dim_names": ("sp1-sp2",)},
+        {"layout": "out/foo-bar", "mesh_dim_names": ("foo-baz", "bar-qux")},
+    )
+    for kwargs in cases:
+        try:
+            es.ParameterState.from_layout(**kwargs)
+        except ValueError as error:
+            assert "unknown mesh" in str(error)
+        else:
+            raise AssertionError("Expected recombined compound candidate components to fail")
+
+
+def test_parameter_state_from_layout_rejects_repeated_compound_group_components():
+    cases = (
+        {"layout": "out/dp-dp in"},
+        {"layout": "out in", "grad": "dp-dp"},
+        {"layout": "out in", "grad": "dp-dp:external"},
+        {"layout": "out in", "init_sync": "dp-dp"},
+    )
+    for kwargs in cases:
+        try:
+            es.ParameterState.from_layout(**kwargs)
+        except ValueError as error:
+            assert "repeated mesh" in str(error)
+        else:
+            raise AssertionError("Expected repeated compound group component to fail")
+
+
+def test_parameter_state_from_param_spec_rejects_unknown_mesh_groups():
+    cases = (
+        es.ParamSpec("out/tp in"),
+        es.ParamSpec("out in", shared="sp"),
+        es.ParamSpec("out in", reduce="sp"),
+    )
+    for spec in cases:
+        try:
+            es.ParameterState.from_param_spec(spec, mesh_dim_names=("dp",))
+        except ValueError as error:
+            assert "unknown mesh" in str(error)
+        else:
+            raise AssertionError("Expected unknown ParamSpec mesh group to fail")
+
+
+def test_register_parameter_layout_revalidates_attached_param_spec_with_mesh_names():
+    param = torch.nn.Parameter(torch.ones(2))
+    es.set_param_spec(param, es.ParamSpec("o", reduce="foo"))
+
+    try:
+        es.register_parameter_layout(param, "o", mesh_dim_names=("dp",))
+    except ValueError as error:
+        assert "unknown mesh" in str(error)
+    else:
+        raise AssertionError("Expected attached ParamSpec unknown group to fail")
+
+    state = es.get_parameter_state(param)
+    assert state.source == "ParamSpec"
+    assert state.reduce == ("foo",)
+    assert state.mesh_dim_names == ()
+
+
+def test_parameter_state_from_layout_rejects_array_like_mesh_dim_names():
+    try:
+        es.ParameterState.from_layout("out in", mesh_dim_names=torch.tensor([0]))
+    except TypeError as error:
+        assert "mesh_dim_names" in str(error)
+    else:
+        raise AssertionError("Expected tensor mesh dim names to fail clearly")
+
+
+def test_parameter_state_from_spec_accepts_string_mesh_dim_names():
+    _, weight, _ = es.parse_sharding("b c, out c [param] -> b out")
+
+    state = es.ParameterState.from_spec(weight, mesh_dim_names="tp")
+
+    assert state.shared == ("tp",)
+    assert state.tensor_state.replicated_dims == ("tp",)
+
+
+def test_einshard_parameter_registration_accepts_string_mesh_dim_names():
+    class Mesh:
+        mesh_dim_names = "tp"
+
+    x = torch.ones(2, 3)
+    weight = torch.nn.Parameter(torch.ones(3))
+
+    es.einshard("b c, c [param] -> b c", x, weight, mesh=Mesh())
+
+    assert es.get_parameter_state(weight).shared == ("tp",)
+
+
+def test_parameter_state_from_layout_accepts_explicit_metadata():
+    state = es.ParameterState.from_layout(
+        "out in",
+        mesh_dim_names=("dp", "sp"),
+        grad="sp:async",
+        init_sync="dp",
+    )
+
+    assert state.init_sync.mode == "explicit"
+    assert state.shared == ("dp",)
+    assert state.grad_comm.mode == "explicit"
+    assert state.grad_comm.mesh_dims == ("sp",)
+    assert state.grad_comm.backend == "native"
+    assert state.grad_comm.schedule == "async"
+
+
+def test_parameter_state_from_layout_rejects_malformed_annotation_values():
+    for kwargs in (
+        {"grad": ""},
+        {"grad": "dp,sp"},
+        {"grad": "dp:bogus"},
+        {"init_sync": ""},
+        {"init_sync": "dp:async"},
+    ):
+        try:
+            es.ParameterState.from_layout("out in", **kwargs)
+        except ValueError as error:
+            assert "Invalid" in str(error) or "suffix" in str(error)
+        else:
+            raise AssertionError("Expected malformed layout annotation value to fail")
+
+
+def test_parameter_state_from_layout_rejects_non_string_annotation_values():
+    try:
+        es.ParameterState.from_layout("out in", grad=1)
+    except TypeError as error:
+        assert "string" in str(error)
+    else:
+        raise AssertionError("Expected non-string grad annotation value to fail")
+
+
+def test_parameter_state_from_layout_rejects_non_string_layout():
+    try:
+        es.ParameterState.from_layout(None)
+    except TypeError as error:
+        assert "layout" in str(error)
+    else:
+        raise AssertionError("Expected non-string layout to fail")
+
+
+def test_parameter_state_from_layout_rejects_non_symbolic_layouts():
+    for layout in ("out ...", "out out", "(a b)"):
+        try:
+            es.ParameterState.from_layout(layout)
+        except ValueError as error:
+            assert "TensorState" in str(error) or "factored axes" in str(error)
+        else:
+            raise AssertionError("Expected non-symbolic explicit layout to fail")
+
+
+def test_register_parameter_layout_rejects_non_parameter_tensors():
+    tensor = torch.ones(2, 3)
+
+    try:
+        es.register_parameter_layout(tensor, "out in")
+    except TypeError as error:
+        assert "torch.nn.Parameter" in str(error)
+    else:
+        raise AssertionError("Expected non-Parameter layout registration to fail")
+
+
+def test_register_parameter_layout_validates_parameter_rank():
+    param = torch.nn.Parameter(torch.ones(2, 3))
+
+    try:
+        es.register_parameter_layout(param, "out")
+    except ValueError as error:
+        assert "rank" in str(error)
+    else:
+        raise AssertionError("Expected rank mismatch to fail")
+
+    assert es.get_parameter_state(param) is None
+
+
+def test_register_parameter_layout_rejects_ellipsis_layout():
+    param = torch.nn.Parameter(torch.ones(2, 3))
+
+    try:
+        es.register_parameter_layout(param, "out ...")
+    except ValueError as error:
+        assert "TensorState" in str(error)
+    else:
+        raise AssertionError("Expected ellipsis layout registration to fail")
+
+    assert es.get_parameter_state(param) is None
+
+
+def test_register_parameter_layout_merges_with_later_formula_grad(dist_env, mesh_2d):
+    x = torch.ones(2, 3)
+    weight = torch.nn.Parameter(torch.ones(3))
+
+    es.register_parameter_layout(weight, "c", mesh=mesh_2d)
+    state = es.get_parameter_state(weight)
+    assert state.source == "layout"
+    assert state.shared == ("dp", "sp")
+    assert state.grad_comm.mode == "none"
+
+    es.einshard(
+        "b/dp c, c [param, grad=async] -> b/dp c",
+        x,
+        weight,
+        mesh=mesh_2d,
+    )
+
+    state = es.get_parameter_state(weight)
+    assert state.source == "layout"
+    assert state.shared == ("dp", "sp")
+    assert state.grad_comm.mesh_dims == ("dp",)
+    assert state.grad_comm.schedule == "async"
+
+
+def test_register_parameter_layout_source_reflects_param_spec_merge():
+    weight = torch.nn.Parameter(torch.ones(3))
+    es.set_param_spec(weight, es.ParamSpec("c"))
+
+    es.register_parameter_layout(weight, "c", grad="dp")
+
+    state = es.get_parameter_state(weight)
+    assert state.source == "ParamSpec+layout"
+    assert state.reduce == ("dp",)
+
+
+def test_register_linear_parameters_registers_weight_and_bias():
+    module = nn.Linear(3, 2)
+
+    assert es.register_linear_parameters_(
+        module,
+        weight_layout="out/tp in",
+        mesh_dim_names=("tp", "sp"),
+        weight_grad="sp",
+        bias_grad="sp",
+    ) is module
+
+    weight_state = es.get_parameter_state(module.weight)
+    bias_state = es.get_parameter_state(module.bias)
+    assert weight_state.source == "linear"
+    assert weight_state.layout_shard_dims == ("tp",)
+    assert weight_state.shared == ("sp",)
+    assert weight_state.reduce == ("sp",)
+    assert bias_state.source == "linear"
+    assert bias_state.layout_shard_dims == ("tp",)
+    assert bias_state.shared == ("sp",)
+    assert bias_state.reduce == ("sp",)
+    assert repr(bias_state.spec.axes) == "out / tp"
+
+
+def test_register_linear_parameters_supports_modules_without_bias():
+    module = nn.Linear(3, 2, bias=False)
+
+    es.register_linear_parameters_(module, weight_layout="out in", weight_grad="dp")
+
+    assert es.get_parameter_state(module.weight).reduce == ("dp",)
+
+
+def test_register_linear_parameters_rejects_bias_metadata_without_bias():
+    module = nn.Linear(3, 2, bias=False)
+
+    try:
+        es.register_linear_parameters_(module, weight_layout="out in", bias_grad="dp")
+    except ValueError as error:
+        assert "bias" in str(error)
+    else:
+        raise AssertionError("Expected bias metadata on a biasless module to fail")
+
+    assert es.get_parameter_state(module.weight) is None
+
+
+def test_register_linear_parameters_rejects_explicit_bias_layout_mismatch():
+    module = nn.Linear(3, 2)
+
+    try:
+        es.register_linear_parameters_(module, weight_layout="out/tp in", bias_layout="in")
+    except ValueError as error:
+        assert "bias layout" in str(error)
+    else:
+        raise AssertionError("Expected mismatched linear bias layout to fail")
+
+    assert es.get_parameter_state(module.weight) is None
+    assert es.get_parameter_state(module.bias) is None
+
+
+def test_register_linear_parameters_rejects_bias_shape_mismatch():
+    module = nn.Module()
+    module.weight = torch.nn.Parameter(torch.ones(2, 3))
+    module.bias = torch.nn.Parameter(torch.ones(3))
+
+    try:
+        es.register_linear_parameters_(module)
+    except ValueError as error:
+        assert "bias shape" in str(error)
+    else:
+        raise AssertionError("Expected linear bias shape mismatch to fail")
+
+    assert es.get_parameter_state(module.weight) is None
+    assert es.get_parameter_state(module.bias) is None
+
+
+def test_register_linear_parameters_rejects_non_linear_weight_rank():
+    module = nn.Module()
+    module.weight = torch.nn.Parameter(torch.ones(2))
+    module.bias = None
+
+    try:
+        es.register_linear_parameters_(module, weight_layout="out")
+    except ValueError as error:
+        assert "weight" in str(error)
+        assert "rank 2" in str(error)
+    else:
+        raise AssertionError("Expected non-2D linear weight to fail")
+
+    assert es.get_parameter_state(module.weight) is None
+
+
+def test_register_linear_parameters_rejects_non_linear_bias_rank():
+    module = nn.Module()
+    module.weight = torch.nn.Parameter(torch.ones(2, 3))
+    module.bias = torch.nn.Parameter(torch.ones(2, 1))
+
+    try:
+        es.register_linear_parameters_(module)
+    except ValueError as error:
+        assert "bias" in str(error)
+        assert "rank 1" in str(error)
+    else:
+        raise AssertionError("Expected non-1D linear bias to fail")
+
+    assert es.get_parameter_state(module.weight) is None
+    assert es.get_parameter_state(module.bias) is None
+
+
+def test_register_linear_parameters_is_atomic_on_metadata_conflict():
+    module = nn.Linear(3, 2)
+    es.set_param_spec(module.bias, es.ParamSpec("other"))
+
+    try:
+        es.register_linear_parameters_(module, weight_layout="out in")
+    except ValueError as error:
+        assert "different layout" in str(error)
+    else:
+        raise AssertionError("Expected bias metadata conflict to fail")
+
+    assert es.get_parameter_state(module.weight) is None
+    assert es.get_parameter_state(module.bias).source == "ParamSpec"
+
+
+def test_register_linear_parameters_rejects_aliased_parameters_atomically():
+    module = nn.Module()
+    shared = torch.nn.Parameter(torch.ones(2, 3))
+    module.weight = shared
+    module.bias = shared
+
+    try:
+        es.register_linear_parameters_(
+            module,
+            weight_layout="out in",
+            bias_layout="out",
+            weight_grad="dp",
+            bias_grad="sp",
+        )
+    except ValueError as error:
+        assert "bias" in str(error)
+    else:
+        raise AssertionError("Expected aliased linear parameters to fail")
+
+    assert es.get_parameter_state(shared) is None
+
+
+def test_register_linear_parameters_rejects_missing_weight_parameter():
+    module = nn.Module()
+
+    try:
+        es.register_linear_parameters_(module)
+    except ValueError as error:
+        assert "weight" in str(error)
+    else:
+        raise AssertionError("Expected missing weight parameter to fail")
+
+
+def test_register_linear_parameters_rejects_non_string_layouts():
+    module = nn.Linear(3, 2)
+
+    try:
+        es.register_linear_parameters_(module, weight_layout=None)
+    except TypeError as error:
+        assert "layout" in str(error)
+    else:
+        raise AssertionError("Expected non-string weight layout to fail")
 
 
 def test_iter_parameter_states_yields_attached_states():
@@ -431,6 +1043,23 @@ def test_einshard_infers_parameter_grad_dims_from_visible_sharded_axes(dist_env,
     assert not state.grad_comm.pending_inference
 
 
+def test_einshard_rejects_unknown_inferred_parameter_grad_mesh_dim():
+    class Mesh:
+        mesh_dim_names = ("dp",)
+
+    x = torch.ones(2, 3)
+    weight = torch.nn.Parameter(torch.ones(3))
+
+    try:
+        es.einshard("b/foo c, c [param, grad=async] -> b/foo c", x, weight, mesh=Mesh())
+    except ValueError as error:
+        assert "unknown mesh" in str(error)
+    else:
+        raise AssertionError("Expected unknown inferred grad mesh dim to fail")
+
+    assert es.get_parameter_state(weight) is None
+
+
 def test_einshard_preserves_explicit_parameter_grad_override(dist_env, mesh_2d):
     x = torch.ones(2, 3)
     weight = torch.nn.Parameter(torch.ones(3))
@@ -480,6 +1109,27 @@ def test_einshard_infers_parameter_grad_dims_from_output_partials(dist_env, mesh
     )
 
     assert state.grad_comm.mesh_dims == ("dp", "sp")
+
+
+def test_parameter_operand_state_rejects_overlapping_inferred_grad_groups():
+    weight = torch.nn.Parameter(torch.ones(3))
+    input_spec, param_spec, output_spec = es.parse_sharding(
+        "b/dp-sp c, c [param, grad=async] -> b/sp-dp c"
+    )
+
+    try:
+        parameter_operand_state(
+            weight,
+            (input_spec, param_spec),
+            output_spec,
+            1,
+            mesh_dim_names=("dp", "sp"),
+        )
+    except ValueError as error:
+        assert "grad" in str(error)
+        assert "overlap" in str(error)
+    else:
+        raise AssertionError("Expected overlapping inferred gradient groups to fail")
 
 
 def test_einshard_public_path_defers_output_partial_grad_dims(dist_env, mesh_2d):
@@ -1081,6 +1731,30 @@ def test_einshard_ignores_unnamed_mesh_for_unannotated_local_operation():
     assert_close(es.einshard("b c -> b c", x, mesh=UnnamedMesh()), x)
 
 
+def test_einshard_ignores_bad_mesh_dim_names_without_parameter_annotations():
+    class BadMesh:
+        mesh_dim_names = (1,)
+
+    x = torch.ones(2, 3)
+
+    assert_close(es.einshard("b c -> b c", x, mesh=BadMesh()), x)
+
+
+def test_einshard_validates_bad_mesh_dim_names_with_parameter_annotations():
+    class BadMesh:
+        mesh_dim_names = (1,)
+
+    x = torch.ones(2, 3)
+    weight = torch.nn.Parameter(torch.ones(3))
+
+    try:
+        es.einshard("b c, c [param] -> b c", x, weight, mesh=BadMesh())
+    except TypeError as error:
+        assert "mesh_dim_names" in str(error)
+    else:
+        raise AssertionError("Expected invalid parameter metadata mesh names to fail")
+
+
 def test_param_local_slices_uses_mesh_coordinates(dist_env, mesh_2d):
     spec = es.ParamSpec("o/dp c/sp")
     global_shape = (5, 7)
@@ -1635,3 +2309,94 @@ def test_ddp_grad_reduction_hook_validates_combined_reduce_args(mesh_2d):
         assert "combined_reduce" in str(error)
     else:
         raise AssertionError("Expected missing combined_reduce to fail")
+
+    try:
+        es.register_grad_reduction_hook_(ddp, mesh_2d, combined_reduce="sp")
+    except ValueError as error:
+        assert "combined_reduce_group" in str(error)
+    else:
+        raise AssertionError("Expected missing combined_reduce_group to fail")
+
+
+def test_ddp_grad_reduction_hook_validates_parameter_reduce_groups(dist_env, mesh_2d):
+    model = nn.Linear(1, 1, bias=False)
+    es.set_param_spec(model.weight, es.ParamSpec("o c", reduce="foo"))
+    ddp = DistributedDataParallel(model, process_group=mesh_2d["dp"].get_group())
+
+    try:
+        es.register_grad_reduction_hook_(ddp, mesh_2d, ddp_group="dp")
+    except ValueError as error:
+        assert "foo" in str(error)
+    else:
+        raise AssertionError("Expected unknown parameter reduction group to fail at registration")
+
+
+def test_ddp_grad_reduction_hook_rejects_reduce_group_overlapping_ddp(dist_env, mesh_2d):
+    model = nn.Linear(1, 1, bias=False)
+    es.set_param_spec(model.weight, es.ParamSpec("o c", reduce="dp"))
+    ddp = DistributedDataParallel(model, process_group=mesh_2d["dp"].get_group())
+
+    try:
+        es.register_grad_reduction_hook_(ddp, mesh_2d, ddp_group="dp")
+    except ValueError as error:
+        assert "ddp_group" in str(error)
+    else:
+        raise AssertionError("Expected reduction group overlapping DDP group to fail")
+
+
+def test_ddp_grad_reduction_hook_validates_combined_groups(dist_env, mesh_2d):
+    model = nn.Linear(1, 1, bias=False)
+    es.set_param_spec(model.weight, es.ParamSpec("o c", reduce="sp"))
+    ddp = DistributedDataParallel(model, process_group=mesh_2d["dp"].get_group())
+
+    try:
+        es.register_grad_reduction_hook_(
+            ddp,
+            mesh_2d,
+            ddp_group="dp",
+            combined_reduce_group="sp-dp",
+            combined_reduce="sp",
+        )
+    except ValueError as error:
+        assert "sp-dp" in str(error)
+    else:
+        raise AssertionError("Expected unknown combined reduction group to fail at registration")
+
+
+def test_ddp_grad_reduction_hook_rejects_mismatched_combined_group(dist_env, mesh_2d):
+    model = nn.Linear(1, 1, bias=False)
+    es.set_param_spec(model.weight, es.ParamSpec("o c", reduce="sp"))
+    ddp = DistributedDataParallel(model, process_group=mesh_2d["dp"].get_group())
+
+    try:
+        es.register_grad_reduction_hook_(
+            ddp,
+            mesh_2d,
+            ddp_group="dp",
+            combined_reduce_group="sp",
+            combined_reduce="sp",
+        )
+    except ValueError as error:
+        assert "combined_reduce_group" in str(error)
+    else:
+        raise AssertionError("Expected mismatched combined reduction group to fail")
+
+
+def test_ddp_grad_reduction_hook_rejects_combined_reduce_overlap(dist_env, mesh_2d):
+    model = nn.Linear(1, 1, bias=False)
+    es.set_param_spec(model.weight, es.ParamSpec("o c", reduce="sp"))
+    ddp = DistributedDataParallel(model, process_group=mesh_2d["dp"].get_group())
+
+    try:
+        es.register_grad_reduction_hook_(
+            ddp,
+            mesh_2d,
+            ddp_group="dp",
+            combined_reduce_group="dp",
+            combined_reduce="dp",
+        )
+    except ValueError as error:
+        assert "combined_reduce" in str(error)
+        assert "overlap" in str(error)
+    else:
+        raise AssertionError("Expected combined reduction overlapping DDP group to fail")

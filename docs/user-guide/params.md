@@ -40,8 +40,11 @@ already sharded over `tp`.
 Concrete native or DDP-backed gradient reductions also cannot overlap parameter
 layout shard dimensions. For example, `ParamSpec("out/tp in", reduce="tp")` is
 rejected because the native execution paths all-reduce full local gradient
-tensors and would mix different `out` shards. External gradient backends are not
-validated by this rule because they own their execution semantics.
+tensors and would mix different `out` shards. Multiple concrete native or
+DDP-backed gradient groups must also be disjoint; reducing over both `dp-sp` and
+`sp-dp` would reduce the same gradient contribution twice. External gradient
+backends are not validated by these rules because they own their execution
+semantics.
 
 ## Formula Annotations
 
@@ -106,6 +109,50 @@ Initialization sync is inferred from managed mesh dimension names when a mesh is
 available: dimensions used by the parameter layout are excluded, and remaining
 managed dimensions become `state.shared`. Use `init_sync=none`,
 `init_sync=external`, or an explicit mesh group to override this inference.
+
+## Explicit Layout Registration
+
+Formula annotations only work when the parameter is an `einshard` operand. Hidden
+parameters inside `nn.Linear`, `torch.nn.functional.linear`, or fused kernels can
+be registered explicitly without constructing a legacy `ParamSpec`:
+
+```python
+state = es.ParameterState.from_layout(
+    "out/tp in",
+    mesh=mesh,
+    grad="sp1-sp2",
+)
+es.register_parameter_layout(weight, "out/tp in", mesh=mesh, grad="sp1-sp2")
+```
+
+`from_layout` and `register_parameter_layout` infer init sync from `mesh` or
+`mesh_dim_names`. They default to no gradient obligation, matching layout-only
+`ParamSpec` behavior. Pass `grad=...` to record a concrete, pending, external, or
+DDP-backed gradient policy. Pass `grad="none"` only when the no-gradient policy is
+an explicit opt-out that should conflict with later non-none metadata.
+Registration validates that the layout rank matches the parameter rank.
+
+For `nn.Linear`-style modules, register weight and optional bias metadata in one
+atomic step:
+
+```python
+linear = torch.nn.Linear(in_features, out_features)
+
+es.register_linear_parameters_(
+    linear,
+    weight_layout="out/tp in",
+    mesh=mesh,
+    weight_grad="sp1-sp2",
+    bias_grad="sp1-sp2",
+)
+```
+
+If `bias_layout` is omitted, it is derived from the first weight axis, so
+`"out/tp in"` gives bias layout `"out/tp"`. An explicit `bias_layout` must match
+that first weight axis. The helper expects `nn.Linear`-style shapes: a rank-2
+weight and, when present, a rank-1 bias whose length matches the weight output
+dimension. It validates both parameters before attaching either state; shape,
+rank, or metadata conflicts do not partially update the module.
 
 ## Module Helpers
 
