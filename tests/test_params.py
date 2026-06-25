@@ -12,6 +12,7 @@ def test_param_spec_parses_layout_and_metadata():
     spec = es.ParamSpec("o/tp c", shared="sp1-sp2", reduce=("sp1-sp2",))
 
     assert spec.layout == "o/tp c"
+    assert spec.spec.axes is spec.axes
     assert spec.axes[0].name == "o"
     assert spec.axes[0].shard_dim == "tp"
     assert spec.axes[1].name == "c"
@@ -23,6 +24,14 @@ def test_param_spec_repr_includes_nondefault_metadata():
     spec = es.ParamSpec("o/tp c", shared="sp", reduce="sp")
 
     assert repr(spec) == "ParamSpec('o/tp c', shared=('sp',), reduce=('sp',))"
+
+
+def test_param_spec_equality_ignores_cached_tensor_spec_identity():
+    assert es.ParamSpec("o c", shared="sp", reduce="sp") == es.ParamSpec(
+        "o c",
+        shared="sp",
+        reduce="sp",
+    )
 
 
 def test_param_spec_rejects_shared_sharded_axis_overlap():
@@ -41,6 +50,24 @@ def test_param_spec_rejects_duplicate_shard_dims():
         assert "same mesh dimension" in str(error)
     else:
         raise AssertionError("Expected duplicate parameter shard dimensions to fail")
+
+
+def test_param_spec_rejects_overlapping_compound_shard_dims():
+    try:
+        es.ParamSpec("o/dp-sp c/dp")
+    except ValueError as error:
+        assert "same mesh dimension" in str(error)
+    else:
+        raise AssertionError("Expected overlapping compound shard dimensions to fail")
+
+
+def test_param_spec_rejects_shared_compound_shard_overlap():
+    try:
+        es.ParamSpec("o/dp-sp c", shared="dp")
+    except ValueError as error:
+        assert "overlaps" in str(error)
+    else:
+        raise AssertionError("Expected shared metadata over a compound shard component to fail")
 
 
 def test_param_shard_dims_reads_specs_from_params():
@@ -74,6 +101,161 @@ def test_iter_param_specs_yields_only_attached_specs():
     assert name == "0.weight"
     assert param is module[0].weight
     assert actual_spec is spec
+
+
+def test_set_param_spec_attaches_compatible_parameter_state():
+    param = torch.nn.Parameter(torch.zeros(2, 3))
+    spec = es.ParamSpec("o/tp c", shared="sp1-sp2", reduce="sp1-sp2")
+
+    es.set_param_spec(param, spec)
+    state = es.get_parameter_state(param)
+
+    assert state.source == "ParamSpec"
+    assert state.spec is spec.spec
+    assert state.axes is spec.axes
+    assert state.layout_shard_dims == ("tp",)
+    assert state.init_sync.mode == "explicit"
+    assert state.shared == ("sp1-sp2",)
+    assert state.grad_comm.mode == "explicit"
+    assert state.grad_comm.backend == "native"
+    assert state.grad_comm.schedule == "synchronous"
+    assert state.reduce == ("sp1-sp2",)
+
+
+def test_parameter_state_infers_init_sync_from_mesh_dims_and_annotation():
+    _, weight, _ = es.parse_sharding("b c, out/tp c [param, grad=async] -> b out/tp")
+
+    state = es.ParameterState.from_spec(
+        weight,
+        mesh_dim_names=("tp", "sp1", "sp2"),
+        source="formula",
+    )
+
+    assert state.source == "formula"
+    assert state.layout_shard_dims == ("tp",)
+    assert state.init_sync.mode == "inferred"
+    assert state.shared == ("sp1", "sp2")
+    assert state.grad_comm.mode == "inferred"
+    assert state.grad_comm.mesh_dims == ()
+    assert state.grad_comm.backend == "native"
+    assert state.grad_comm.schedule == "async"
+    assert state.grad_comm.pending_inference
+    assert state.tensor_state.placement_dict() == {"out": "tp", "c": None}
+    assert state.tensor_state.replicated_dims == ("sp1", "sp2")
+
+
+def test_parameter_state_uses_explicit_annotation_overrides():
+    _, weight, _ = es.parse_sharding(
+        "b c, out c [param, grad=dp:external, init_sync=none] -> b out"
+    )
+
+    state = es.ParameterState.from_spec(weight, mesh_dim_names=("dp", "tp"))
+
+    assert state.layout_shard_dims == ()
+    assert state.init_sync.mode == "none"
+    assert state.shared == ()
+    assert state.grad_comm.mode == "explicit"
+    assert state.grad_comm.mesh_dims == ("dp",)
+    assert state.grad_comm.backend == "external"
+    assert state.reduce == ()
+
+
+def test_parameter_state_defaults_param_grad_to_pending_inference():
+    _, weight, _ = es.parse_sharding("b c, out c [param] -> b out")
+
+    state = es.ParameterState.from_spec(weight)
+
+    assert state.grad_comm.mode == "inferred"
+    assert state.grad_comm.backend == "native"
+    assert state.grad_comm.pending_inference
+
+
+def test_parameter_state_preserves_explicit_grad_none():
+    _, weight, _ = es.parse_sharding("b c, out c [param, grad=none] -> b out")
+
+    state = es.ParameterState.from_spec(weight)
+
+    assert state.grad_comm.mode == "none"
+    assert state.grad_comm.backend == "none"
+    assert not state.grad_comm.pending_inference
+
+
+def test_parameter_state_rejects_duplicate_layout_shard_dims():
+    _, weight, _ = es.parse_sharding("b c, out/tp c/tp [param] -> b out")
+
+    try:
+        es.ParameterState.from_spec(weight)
+    except ValueError as error:
+        assert "same mesh dimension" in str(error)
+    else:
+        raise AssertionError("Expected duplicate parameter shard dimensions to fail")
+
+
+def test_parameter_state_rejects_overlapping_compound_layout_shard_dims():
+    _, weight, _ = es.parse_sharding("b c, out/dp-sp c/sp-dp [param] -> b out")
+
+    try:
+        es.ParameterState.from_spec(weight)
+    except ValueError as error:
+        assert "same mesh dimension" in str(error)
+    else:
+        raise AssertionError("Expected overlapping compound shard dimensions to fail")
+
+
+def test_parameter_state_rejects_init_sync_shard_overlap():
+    _, weight, _ = es.parse_sharding("b c, out/tp c [param, init_sync=tp] -> b out")
+
+    try:
+        es.ParameterState.from_spec(weight)
+    except ValueError as error:
+        assert "overlaps" in str(error)
+    else:
+        raise AssertionError("Expected overlapping init_sync and sharded metadata to fail")
+
+
+def test_parameter_state_rejects_partial_parameter_specs():
+    weight, _, _ = es.parse_sharding("w // dp [param] -> w")
+
+    try:
+        es.ParameterState.from_spec(weight, mesh_dim_names=("dp", "tp"))
+    except ValueError as error:
+        assert "axis layout" in str(error)
+    else:
+        raise AssertionError("Expected partial parameter state to fail")
+
+
+def test_parameter_state_infers_init_sync_from_compound_shard_dim_components():
+    _, weight, _ = es.parse_sharding("b c, out/dp-sp c [param] -> b out")
+
+    state = es.ParameterState.from_spec(weight, mesh_dim_names=("dp", "sp", "tp"))
+
+    assert state.layout_shard_dims == ("dp-sp",)
+    assert state.init_sync.mode == "inferred"
+    assert state.shared == ("tp",)
+    assert state.tensor_state.replicated_dims == ("tp",)
+
+
+def test_parameter_state_excludes_compound_candidate_init_sync_overlap():
+    _, weight, _ = es.parse_sharding("b c, out/sp1 c [param] -> b out")
+
+    state = es.ParameterState.from_spec(weight, mesh_dim_names=("sp1-sp2", "tp"))
+
+    assert state.shared == ("tp",)
+    assert state.tensor_state.replicated_dims == ("tp",)
+
+
+def test_iter_parameter_states_yields_attached_states():
+    module = nn.Sequential(nn.Linear(3, 2), nn.Linear(2, 1))
+    state = es.ParameterState.from_spec(es.parse_sharding("o c [param] -> o c")[0])
+    es.set_parameter_state(module[1].weight, state)
+
+    entries = list(es.iter_parameter_states(module))
+
+    assert len(entries) == 1
+    name, param, actual_state = entries[0]
+    assert name == "1.weight"
+    assert param is module[1].weight
+    assert actual_state is state
 
 
 def test_param_local_slices_uses_mesh_coordinates(dist_env, mesh_2d):

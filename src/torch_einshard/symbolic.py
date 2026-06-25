@@ -18,6 +18,17 @@ def partials_of(spec):
     return tuple(getattr(spec, "partials", ()))
 
 
+def mesh_dim_components(name):
+    return {name, *name.split("-")}
+
+
+def mesh_dims_components(names):
+    result = set()
+    for name in names:
+        result.update(mesh_dim_components(name))
+    return result
+
+
 def require_expanded_axes(spec):
     axes = flat_axes_of(spec)
     if any(isinstance(axis, EllipsisAxis) for axis in axes):
@@ -61,12 +72,17 @@ class TensorState:
         names = [axis.name for axis in axes]
         if len(set(names)) != len(names):
             raise ValueError("Symbolic TensorState requires unique axis names")
-        used_dims = {axis.shard_dim for axis in axes if axis.shard_dim} | set(partials_of(spec))
+        used_dims = mesh_dims_components(
+            [axis.shard_dim for axis in axes if axis.shard_dim] + list(partials_of(spec))
+        )
         return cls(
             axes=axes,
             placements=tuple((axis.name, axis.shard_dim or None) for axis in axes),
             partials=partials_of(spec),
-            replicated_dims=tuple(dim for dim in mesh_dim_names if dim not in used_dims),
+            replicated_dims=tuple(
+                dim for dim in mesh_dim_names
+                if not mesh_dim_components(dim).intersection(used_dims)
+            ),
         )
 
     def placement(self, name):

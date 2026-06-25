@@ -5,10 +5,12 @@ import torch
 
 from .grammar import parse_sharding
 from .helpers import all_reduce, compute_split_shapes_for_factors
-from .sharding import AxisGroup, EllipsisAxis
+from .sharding import AxisGroup, EllipsisAxis, TensorSpec
+from .symbolic import TensorState
 
 
 PARAM_SPEC_ATTR = "einshard_spec"
+PARAM_STATE_ATTR = "einshard_state"
 
 
 def _tuple(value):
@@ -32,6 +34,38 @@ def _duplicates(values):
     return result
 
 
+def _mesh_dim_components(name):
+    return {name, *name.split("-")}
+
+
+def _mesh_dims_components(names):
+    result = set()
+    for name in names:
+        result.update(_mesh_dim_components(name))
+    return result
+
+
+def _validate_parameter_layout(layout_shard_dims, init_sync=None):
+    seen_components = set()
+    for shard_dim in layout_shard_dims:
+        components = _mesh_dim_components(shard_dim)
+        overlap = seen_components.intersection(components)
+        if overlap:
+            dims = ", ".join(sorted(overlap))
+            raise ValueError(f"Parameter specs cannot shard multiple axes over the same mesh dimension: {dims}")
+        seen_components.update(components)
+
+    if init_sync is None or init_sync.mode != "explicit":
+        return
+
+    shard_components = _mesh_dims_components(layout_shard_dims)
+    for name in init_sync.mesh_dims:
+        overlap = shard_components.intersection(_mesh_dim_components(name))
+        if overlap:
+            dims = ", ".join(sorted(overlap))
+            raise ValueError(f"Parameter init_sync annotation overlaps with sharded axis dimensions: {dims}")
+
+
 def _parse_axes(spec):
     input_spec, other, output_spec = parse_sharding(f"{spec} -> {spec}")
     if other is not None or input_spec.partials or output_spec.partials:
@@ -39,11 +73,136 @@ def _parse_axes(spec):
     return input_spec.axes
 
 
+def _tensor_state_or_none(spec, mesh_dim_names):
+    try:
+        return TensorState.from_spec(spec, mesh_dim_names=mesh_dim_names)
+    except ValueError:
+        return None
+
+
+@dataclass(frozen=True)
+class ParameterInitSync:
+    mode: str = "none"
+    mesh_dims: tuple[str, ...] = ()
+
+    @classmethod
+    def from_annotation(cls, annotation, layout_shard_dims, mesh_dim_names):
+        if annotation is not None:
+            if annotation.mode in {"none", "external"}:
+                return cls(mode=annotation.mode)
+            if annotation.mode == "explicit":
+                return cls(mode="explicit", mesh_dims=annotation.mesh_dims)
+
+        if not mesh_dim_names:
+            return cls(mode="none")
+        shard_dims = _mesh_dims_components(layout_shard_dims)
+        mesh_dims = tuple(
+            dim for dim in mesh_dim_names
+            if not _mesh_dim_components(dim).intersection(shard_dims)
+        )
+        return cls(mode="inferred", mesh_dims=mesh_dims)
+
+
+@dataclass(frozen=True)
+class ParameterGradComm:
+    mode: str = "none"
+    mesh_dims: tuple[str, ...] = ()
+    backend: str = "none"
+    schedule: str = "backend_default"
+
+    @classmethod
+    def from_annotation(cls, annotation, *, is_param=False):
+        if annotation is None:
+            if is_param:
+                return cls(mode="inferred", backend="native")
+            return cls()
+        return cls(
+            mode=annotation.mode,
+            mesh_dims=annotation.mesh_dims,
+            backend=annotation.backend,
+            schedule=annotation.schedule,
+        )
+
+    @classmethod
+    def from_reduce_groups(cls, reduce):
+        reduce = _tuple(reduce)
+        if not reduce:
+            return cls()
+        return cls(mode="explicit", mesh_dims=reduce, backend="native", schedule="synchronous")
+
+    @property
+    def pending_inference(self):
+        return self.mode == "inferred" and not self.mesh_dims
+
+
+@dataclass(frozen=True)
+class ParameterState:
+    spec: TensorSpec
+    tensor_state: TensorState | None = None
+    layout_shard_dims: tuple[str, ...] = ()
+    init_sync: ParameterInitSync = field(default_factory=ParameterInitSync)
+    grad_comm: ParameterGradComm = field(default_factory=ParameterGradComm)
+    source: str = "inferred"
+
+    @classmethod
+    def from_spec(cls, spec, *, mesh_dim_names=(), source="inferred"):
+        if getattr(spec, "partials", ()):
+            raise ValueError("Parameter states must contain only axis layout notation")
+        layout_shard_dims = tuple(spec.axes.all_shard_dims())
+        annotation = getattr(spec, "annotation", None)
+        is_param = bool(getattr(annotation, "is_param", False))
+        init_sync = ParameterInitSync.from_annotation(
+            getattr(annotation, "init_sync", None),
+            layout_shard_dims,
+            tuple(mesh_dim_names),
+        )
+        _validate_parameter_layout(layout_shard_dims, init_sync)
+        grad_comm = ParameterGradComm.from_annotation(getattr(annotation, "grad", None), is_param=is_param)
+        return cls(
+            spec=spec,
+            tensor_state=_tensor_state_or_none(spec, tuple(mesh_dim_names)),
+            layout_shard_dims=layout_shard_dims,
+            init_sync=init_sync,
+            grad_comm=grad_comm,
+            source=source,
+        )
+
+    @classmethod
+    def from_param_spec(cls, spec, *, mesh_dim_names=()):
+        init_sync = ParameterInitSync(mode="explicit" if spec.shared else "none", mesh_dims=spec.shared)
+        _validate_parameter_layout(tuple(spec.axes.all_shard_dims()), init_sync)
+        return cls(
+            spec=spec.spec,
+            tensor_state=_tensor_state_or_none(spec.spec, tuple(mesh_dim_names)),
+            layout_shard_dims=tuple(spec.axes.all_shard_dims()),
+            init_sync=init_sync,
+            grad_comm=ParameterGradComm.from_reduce_groups(spec.reduce),
+            source="ParamSpec",
+        )
+
+    @property
+    def axes(self):
+        return self.spec.axes
+
+    @property
+    def shared(self):
+        if self.init_sync.mode in {"none", "external"}:
+            return ()
+        return self.init_sync.mesh_dims
+
+    @property
+    def reduce(self):
+        if self.grad_comm.mode == "none" or self.grad_comm.backend == "external":
+            return ()
+        return self.grad_comm.mesh_dims
+
+
 @dataclass(frozen=True)
 class ParamSpec:
     layout: str
     shared: tuple[str, ...] = ()
     reduce: tuple[str, ...] = ()
+    spec: TensorSpec = field(init=False, compare=False)
     axes: object = field(init=False)
 
     def __init__(self, layout, *, shared=(), reduce=()):
@@ -51,18 +210,13 @@ class ParamSpec:
         shared = _tuple(shared)
         reduce = _tuple(reduce)
         all_shard_dims = axes.all_shard_dims()
-        duplicate_shard_dims = _duplicates(all_shard_dims)
-        if duplicate_shard_dims:
-            dims = ", ".join(sorted(duplicate_shard_dims))
-            raise ValueError(f"Parameter specs cannot shard multiple axes over the same mesh dimension: {dims}")
-        shard_dims = set(all_shard_dims)
-        for name in shared:
-            overlap = shard_dims.intersection(name.split("-"))
-            if overlap:
-                dims = ", ".join(sorted(overlap))
-                raise ValueError(f"Shared parameter metadata overlaps with sharded axis dimensions: {dims}")
+        _validate_parameter_layout(
+            all_shard_dims,
+            ParameterInitSync(mode="explicit" if shared else "none", mesh_dims=shared),
+        )
         object.__setattr__(self, "layout", layout)
         object.__setattr__(self, "axes", axes)
+        object.__setattr__(self, "spec", TensorSpec(axes))
         object.__setattr__(self, "shared", shared)
         object.__setattr__(self, "reduce", reduce)
 
@@ -113,11 +267,36 @@ def reduce_grad_(param, spec, mesh):
 
 def set_param_spec(param, spec):
     setattr(param, PARAM_SPEC_ATTR, spec)
+    setattr(param, PARAM_STATE_ATTR, ParameterState.from_param_spec(spec))
     return param
 
 
 def get_param_spec(param):
     return getattr(param, PARAM_SPEC_ATTR, None)
+
+
+def set_parameter_state(param, state):
+    setattr(param, PARAM_STATE_ATTR, state)
+    return param
+
+
+def get_parameter_state(param):
+    state = getattr(param, PARAM_STATE_ATTR, None)
+    if state is not None:
+        return state
+    spec = get_param_spec(param)
+    if spec is None:
+        return None
+    state = ParameterState.from_param_spec(spec)
+    setattr(param, PARAM_STATE_ATTR, state)
+    return state
+
+
+def iter_parameter_states(module):
+    for name, param in module.named_parameters():
+        state = get_parameter_state(param)
+        if state is not None:
+            yield name, param, state
 
 
 def iter_param_specs(module):
