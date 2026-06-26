@@ -3040,6 +3040,40 @@ def test_ddp_grad_reduction_hook_uses_parameter_states(dist_env, mesh_2d):
     assert_close(model.weight.grad, torch.full_like(model.weight.grad, expected))
 
 
+def test_ddp_grad_reduction_hook_executes_ddp_backed_parameter_states(dist_env, mesh_2d):
+    model = nn.Linear(1, 1, bias=False)
+    model.weight.data.fill_(1.0)
+    state = es.ParameterState.from_spec(es.parse_sharding("o c [param, grad=sp:ddp] -> o c")[0])
+    es.set_parameter_state(model.weight, state)
+    ddp = DistributedDataParallel(model, process_group=mesh_2d["dp"].get_group())
+    es.register_grad_reduction_hook_(ddp, mesh_2d, ddp_group="dp")
+
+    x = torch.tensor([[float(dist.get_rank() + 1)]])
+    ddp(x).sum().backward()
+
+    dp_size = dist.get_world_size(mesh_2d["dp"].get_group())
+    sp_size = dist.get_world_size(mesh_2d["sp"].get_group())
+    expected = 0.0
+    for peer_sp_rank in range(sp_size):
+        expected += 1.0 + peer_sp_rank + sp_size * (dp_size - 1) / 2
+
+    assert_close(model.weight.grad, torch.full_like(model.weight.grad, expected))
+
+
+def test_ddp_grad_reduction_hook_rejects_pending_ddp_parameter_states(dist_env, mesh_2d):
+    model = nn.Linear(1, 1, bias=False)
+    state = es.ParameterState.from_layout("o c", grad="ddp")
+    es.set_parameter_state(model.weight, state)
+    ddp = DistributedDataParallel(model, process_group=mesh_2d["dp"].get_group())
+
+    try:
+        es.register_grad_reduction_hook_(ddp, mesh_2d, ddp_group="dp")
+    except ValueError as error:
+        assert "pending inference" in str(error)
+    else:
+        raise AssertionError("Expected pending DDP gradient obligation to fail")
+
+
 def test_ddp_grad_reduction_hook_combines_uniform_reduce_specs(dist_env, mesh_2d):
     mesh = es.wrap_mesh(mesh_2d)
     model = nn.Linear(1, 1, bias=False)

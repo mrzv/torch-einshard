@@ -639,6 +639,18 @@ def _native_reduce_groups(state):
     return state.grad_comm.mesh_dims
 
 
+def _ddp_hook_reduce_groups(state):
+    if state is None:
+        return ()
+    if state.grad_comm.pending_inference:
+        if state.grad_comm.backend in {"native", "ddp"}:
+            raise ValueError("Parameter gradient communication is still pending inference")
+        return ()
+    if state.grad_comm.mode == "none" or state.grad_comm.backend not in {"native", "ddp"}:
+        return ()
+    return state.grad_comm.mesh_dims
+
+
 def _validation_grad_groups(state, *, allow_pending):
     if state.grad_comm.pending_inference:
         if state.grad_comm.backend in {"native", "ddp"} and not allow_pending:
@@ -1667,7 +1679,7 @@ def register_grad_reduction_hook_(
     for param in ddp_model.parameters():
         state = _parameter_state_from_attached_metadata(param)
         if state is not None:
-            reduce_groups = _native_reduce_groups(state)
+            reduce_groups = _ddp_hook_reduce_groups(state)
             _validate_no_ddp_group_overlap(ddp_group, reduce_groups)
             _validate_mesh_groups_exist(mesh, reduce_groups)
 
@@ -1688,7 +1700,7 @@ def register_grad_reduction_hook_(
             return False
         expected = set(combined_reduce)
         for _, _, state in views:
-            if state is None or set(_native_reduce_groups(state)) != expected:
+            if state is None or set(_ddp_hook_reduce_groups(state)) != expected:
                 return False
         return True
 
@@ -1696,13 +1708,13 @@ def register_grad_reduction_hook_(
         groups = sorted({
             name
             for _, _, state in views
-            for name in _native_reduce_groups(state)
+            for name in _ddp_hook_reduce_groups(state)
         })
         for name in groups:
             grad_views = [
                 view
                 for _, view, state in views
-                if name in _native_reduce_groups(state)
+                if name in _ddp_hook_reduce_groups(state)
             ]
             if not grad_views:
                 continue

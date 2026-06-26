@@ -308,10 +308,11 @@ es.register_grad_reduction_hook_(ddp, mesh, ddp_group="dp")
 ```
 
 The hook performs DDP-style averaging over `ddp_group`, then applies sum
-all-reduces for concrete native attached gradient obligations. Legacy
-`ParamSpec.reduce` groups are represented as native `ParameterState.grad_comm`
-metadata. Pending inferred obligations, DDP-backed obligations, and external
-obligations are not executed by the native extra-reduction path.
+all-reduces for concrete native or DDP-backed attached gradient obligations.
+Legacy `ParamSpec.reduce` groups are represented as native
+`ParameterState.grad_comm` metadata. Concrete `grad=sp1-sp2:ddp` obligations are
+executed by this hook, while bare pending `grad=ddp` obligations are rejected
+until finalized. External obligations are not executed by this path.
 
 For buckets where every parameter has the same extra reduction metadata, the
 hook can combine DDP averaging and the extra reduction into one all-reduce over a
@@ -330,8 +331,8 @@ es.register_grad_reduction_hook_(
 This is equivalent to summing the bucket over `dp-sp1-sp2` and then dividing by
 the `dp` group size. It avoids a separate `dp` all-reduce followed by an
 `sp1-sp2` all-reduce. The fast path is used only when all parameters in a bucket
-have compatible native reductions such as `reduce=("sp1-sp2",)` or an equivalent
-`ParameterState.grad_comm`. Mixed buckets fall back to per-parameter native
+have compatible native or DDP-backed reductions such as `reduce=("sp1-sp2",)` or
+an equivalent `ParameterState.grad_comm`. Mixed buckets fall back to per-parameter
 reductions.
 
 ## Shard Metadata

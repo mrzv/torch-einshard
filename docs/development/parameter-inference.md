@@ -89,8 +89,9 @@ The initial foundation is implemented.
 The remaining major gap is execution-layer and planner-aware distributed
 inference work. The current implementation records obligations and preserves
 unsafe cases as pending metadata until they are explicitly finalized; it does not
-yet launch native async gradient communication or execute DDP-backed obligations
-from formula annotations.
+yet launch native async gradient communication or automatically finalize
+distributed obligations from formula annotations. Explicitly finalized DDP-backed
+obligations are executed by the DDP communication hook.
 
 ## Current `ParamSpec` Responsibilities
 
@@ -585,6 +586,8 @@ Status: partially implemented.
   overrides, and explicit scheduling/backend suffixes at the metadata layer.
 - Implemented: explicit finalization helpers for resolving pending obligations
   when the caller supplies the concrete mesh group and backend policy.
+- Implemented: concrete DDP-backed obligations can execute through the DDP
+  communication hook after explicit finalization.
 - Remaining: planner-aware symbolic backward analysis for distributed `[param]`
   operands, including subtracting communication already handled by autograd
   mappings.
@@ -598,7 +601,8 @@ Status: implemented foundation.
 - Reimplement parameter shard metadata helpers on `ParameterState`.
 - Reimplement module init sync on inferred init-sync obligations.
 - Reimplement gradient reduction helpers on inferred grad obligations.
-- Migrate the DDP communication hook to `ParameterState.grad_comm`.
+- Migrate the DDP communication hook to `ParameterState.grad_comm`, including
+  concrete native and DDP-backed obligations.
 - Preserve the combined DDP reduction optimization for compatible buckets.
 - Add a concrete-native per-parameter autograd hook path for simple non-DDP
   training loops.
