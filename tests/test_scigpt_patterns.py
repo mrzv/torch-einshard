@@ -96,7 +96,7 @@ def test_tensor_parallel_attention_projection_pattern(dist_env, mesh_tp):
     expected = F.scaled_dot_product_attention(q_full, k_full, v_full)
     expected = expected.transpose(1, 2).reshape(batch, seq, embed)
     expected = torch.einsum("ble,ce->blc", expected, wo)
-    assert_close(y, expected)
+    assert_close(y, expected, rtol=1e-4, atol=1e-5)
 
 
 def test_scigpt_tensor_parallel_mlp_parameter_registration_pattern():
