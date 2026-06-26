@@ -135,6 +135,7 @@ Implemented behavior:
 - `iter_param_specs` yields attached `(name, param, spec)` triples for diagnostics and checkpoint/test helpers.
 - `iter_parameter_states` yields attached `(name, param, state)` triples for state-aware helpers.
 - `validate_module_parameter_states_` preflights attached parameter metadata, including rank consistency, concrete mesh-group existence, and pending native/DDP gradient obligations.
+- `finalize_parameter_grad_comm_` and `finalize_module_parameter_grad_comm_` resolve pending parameter-gradient obligations with explicit concrete mesh-group policies.
 - `register_native_grad_reduction_hooks_` executes concrete native gradient obligations with per-parameter autograd hooks for non-DDP training loops.
 - `register_grad_reduction_hook_` adds DDP-style averaging plus extra concrete native reductions as a DDP communication hook.
 - `register_grad_reduction_hook_` can optionally combine DDP averaging and a uniform extra reduction into one compound-group all-reduce for matching buckets.
@@ -158,7 +159,7 @@ Deferred string notation:
 
 Remaining work:
 
-- Add planner-aware distributed backward inference for pending annotated parameter obligations.
+- Add planner-aware distributed backward inference so pending annotated parameter obligations can be finalized automatically when the operation plan proves the required communication.
 - Add execution backends for native async parameter-gradient reductions and DDP-backed obligations.
 - Add bucketed/native scheduling for unused-parameter or rank-dependent-control-flow cases; the current native hook path requires identical backward participation and hook order across ranks.
 - Extend higher-level module/layer wrappers beyond the current generic and linear/conv/norm registration foundation where specialized validation is useful.

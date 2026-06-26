@@ -250,6 +250,18 @@ es.reduce_module_grads_(module, mesh)
 compatible `ParamSpec` metadata and reject incompatible layouts, conflicting
 explicit opt-outs, or conflicting gradient/init-sync obligations.
 
+`finalize_parameter_grad_comm_` and `finalize_module_parameter_grad_comm_` resolve
+pending formula-inferred gradient obligations with explicit policies. Use concrete
+mesh groups such as `"sp1-sp2"`, `"sp1-sp2:ddp"`, or `"sp1-sp2:external"`;
+bare inferred policies such as `"async"`, `"ddp"`, and `"external"` remain
+ambiguous and are rejected by finalization. Module finalization takes a mapping
+from parameter names to policies and validates all entries before attaching any
+updated state.
+
+```python
+es.finalize_module_parameter_grad_comm_(module, {"weight": "sp1-sp2"})
+```
+
 `validate_module_parameter_states_` preflights attached metadata before training
 or checkpoint work. It checks rank and metadata consistency, validates concrete
 mesh groups when `mesh` is supplied, and rejects pending native/DDP gradient

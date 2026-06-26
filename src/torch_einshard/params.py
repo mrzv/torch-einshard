@@ -868,6 +868,61 @@ def validate_module_parameter_states_(module, mesh=None, *, allow_pending=False)
     return module
 
 
+def _finalized_grad_comm_from_value(value):
+    _validate_annotation_value("grad", value)
+    annotation = TensorAnnotation.from_items((("grad", value),)).grad
+    grad_comm = ParameterGradComm.from_annotation(annotation)
+    if grad_comm.pending_inference or grad_comm.mode == "none":
+        raise ValueError("Finalized grad communication must use an explicit mesh group")
+    return grad_comm
+
+
+def _finalized_parameter_grad_state(state, grad, mesh_dim_names):
+    if not state.grad_comm.pending_inference:
+        raise ValueError("Parameter gradient communication is not pending inference")
+    grad_comm = _finalized_grad_comm_from_value(grad)
+    mesh_dim_names = mesh_dim_names or state.mesh_dim_names
+    _validate_parameter_grad_comm(state.layout_shard_dims, grad_comm)
+    _validate_parameter_mesh_groups(mesh_dim_names, state.layout_shard_dims, state.init_sync, grad_comm)
+    return replace(
+        state,
+        mesh_dim_names=mesh_dim_names,
+        grad_comm=grad_comm,
+        explicit_grad_comm_none=False,
+    )
+
+
+def finalize_parameter_grad_comm_(param, grad, *, mesh=None, mesh_dim_names=()):
+    if not isinstance(param, torch.nn.Parameter):
+        raise TypeError("Parameter grad finalization requires a torch.nn.Parameter")
+    state = _parameter_state_from_attached_metadata(param)
+    if state is None:
+        raise ValueError("Parameter does not have an attached ParameterState or ParamSpec")
+    mesh_dim_names = _mesh_dim_names_from(mesh, mesh_dim_names)
+    finalized = _finalized_parameter_grad_state(state, grad, mesh_dim_names)
+    return register_parameter_state(param, finalized)
+
+
+def finalize_module_parameter_grad_comm_(module, grad, *, mesh=None, mesh_dim_names=()):
+    if not isinstance(grad, Mapping):
+        raise TypeError("grad finalization must be a mapping from parameter names to grad policies")
+    if not grad:
+        raise ValueError("grad finalization mapping must not be empty")
+    mesh_dim_names = _mesh_dim_names_from(mesh, mesh_dim_names)
+    updates = []
+    for name, value in grad.items():
+        param = _module_parameter(module, name)
+        state = _parameter_state_from_attached_metadata(param)
+        if state is None:
+            raise ValueError(f"module parameter {name!r} does not have attached ParameterState or ParamSpec")
+        updates.append((param, _finalized_parameter_grad_state(state, value, mesh_dim_names)))
+
+    prepared = _prepare_parameter_state_updates(updates)
+    for param, state in prepared:
+        set_parameter_state(param, state)
+    return module
+
+
 def _compatible_init_sync(existing, state):
     if existing == state:
         return True

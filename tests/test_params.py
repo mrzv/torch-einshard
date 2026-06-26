@@ -1468,6 +1468,107 @@ def test_validate_module_parameter_states_rejects_pending_ddp_grad():
     assert es.validate_module_parameter_states_(module, allow_pending=True) is module
 
 
+def test_finalize_parameter_grad_comm_resolves_pending_native_grad():
+    module = nn.Module()
+    module.weight = torch.nn.Parameter(torch.ones(3))
+    es.set_parameter_state(module.weight, es.ParameterState.from_layout("c", grad="async"))
+
+    assert es.finalize_parameter_grad_comm_(module.weight, "dp", mesh_dim_names=("dp", "sp")) is module.weight
+
+    state = es.get_parameter_state(module.weight)
+    assert state.reduce == ("dp",)
+    assert state.grad_comm.backend == "native"
+    assert state.grad_comm.schedule == "async"
+    assert state.mesh_dim_names == ("dp", "sp")
+    assert es.validate_module_parameter_states_(module) is module
+
+
+def test_finalize_module_parameter_grad_comm_resolves_pending_ddp_grad():
+    module = nn.Linear(3, 2, bias=False)
+    es.set_parameter_state(module.weight, es.ParameterState.from_layout("o c", grad="ddp"))
+
+    assert es.finalize_module_parameter_grad_comm_(module, {"weight": "dp:ddp"}) is module
+
+    state = es.get_parameter_state(module.weight)
+    assert state.grad_comm.backend == "ddp"
+    assert state.grad_comm.mesh_dims == ("dp",)
+    assert es.validate_module_parameter_states_(module) is module
+
+
+def test_finalize_module_parameter_grad_comm_resolves_pending_external_grad():
+    module = nn.Module()
+    module.weight = torch.nn.Parameter(torch.ones(3))
+    es.set_parameter_state(module.weight, es.ParameterState.from_layout("c", grad="external"))
+
+    es.finalize_module_parameter_grad_comm_(module, {"weight": "dp:external"})
+
+    state = es.get_parameter_state(module.weight)
+    assert state.grad_comm.backend == "external"
+    assert state.grad_comm.mesh_dims == ("dp",)
+    assert state.reduce == ()
+
+
+def test_finalize_parameter_grad_comm_rejects_inferred_policy_values():
+    weight = torch.nn.Parameter(torch.ones(3))
+    es.set_parameter_state(weight, es.ParameterState.from_layout("c", grad="async"))
+
+    for value in ("async", "ddp", "external"):
+        try:
+            es.finalize_parameter_grad_comm_(weight, value)
+        except ValueError as error:
+            assert "explicit mesh group" in str(error)
+        else:
+            raise AssertionError(f"Expected {value!r} to fail grad finalization")
+
+    assert es.get_parameter_state(weight).grad_comm.pending_inference
+
+
+def test_finalize_parameter_grad_comm_rejects_nonpending_grad():
+    weight = torch.nn.Parameter(torch.ones(3))
+    es.set_parameter_state(weight, es.ParameterState.from_layout("c", grad="dp"))
+
+    try:
+        es.finalize_parameter_grad_comm_(weight, "dp")
+    except ValueError as error:
+        assert "not pending" in str(error)
+    else:
+        raise AssertionError("Expected non-pending grad finalization to fail")
+
+
+def test_finalize_parameter_grad_comm_rejects_layout_shard_overlap():
+    weight = torch.nn.Parameter(torch.ones(3))
+    es.set_parameter_state(weight, es.ParameterState.from_layout("c/tp", grad="async"))
+
+    try:
+        es.finalize_parameter_grad_comm_(weight, "tp")
+    except ValueError as error:
+        assert "overlaps" in str(error)
+    else:
+        raise AssertionError("Expected finalization over a sharded layout dim to fail")
+
+    assert es.get_parameter_state(weight).grad_comm.pending_inference
+
+
+def test_finalize_module_parameter_grad_comm_is_atomic_on_failure():
+    module = nn.Linear(3, 2)
+    es.set_parameter_state(module.weight, es.ParameterState.from_layout("o c", grad="async"))
+    es.set_parameter_state(module.bias, es.ParameterState.from_layout("o", grad="async"))
+
+    try:
+        es.finalize_module_parameter_grad_comm_(
+            module,
+            {"weight": "dp", "bias": "missing"},
+            mesh_dim_names=("dp",),
+        )
+    except ValueError as error:
+        assert "missing" in str(error)
+    else:
+        raise AssertionError("Expected atomic grad finalization failure")
+
+    assert es.get_parameter_state(module.weight).grad_comm.pending_inference
+    assert es.get_parameter_state(module.bias).grad_comm.pending_inference
+
+
 def test_validate_module_parameter_states_checks_mesh_groups(mesh_2d):
     module = nn.Module()
     module.weight = torch.nn.Parameter(torch.ones(3))

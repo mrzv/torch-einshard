@@ -14,6 +14,8 @@ from .params import (
     ParameterGradComm,
     ParameterInitSync,
     ParameterState,
+    finalize_module_parameter_grad_comm_,
+    finalize_parameter_grad_comm_,
     get_param_spec,
     get_parameter_state,
     iter_param_specs,

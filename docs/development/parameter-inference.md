@@ -76,6 +76,9 @@ The initial foundation is implemented.
 - Attached metadata can be preflighted with `validate_module_parameter_states_`
   before training or checkpoint work; pending native/DDP obligations are rejected
   unless explicitly allowed.
+- Pending parameter-gradient obligations can be finalized explicitly with
+  `finalize_parameter_grad_comm_` or `finalize_module_parameter_grad_comm_` when
+  the caller knows the concrete mesh group and backend policy.
 - Hidden linear-, conv-, norm-, fused-, and custom-module parameters can be
   registered explicitly with `ParameterState.from_layout`,
   `register_parameter_layout`, `register_module_parameter_layouts_`,
@@ -85,8 +88,9 @@ The initial foundation is implemented.
 
 The remaining major gap is execution-layer and planner-aware distributed
 inference work. The current implementation records obligations and preserves
-unsafe cases as pending metadata; it does not yet launch native async gradient
-communication or execute DDP-backed obligations from formula annotations.
+unsafe cases as pending metadata until they are explicitly finalized; it does not
+yet launch native async gradient communication or execute DDP-backed obligations
+from formula annotations.
 
 ## Current `ParamSpec` Responsibilities
 
@@ -579,11 +583,13 @@ Status: partially implemented.
   parameter-gradient reductions.
 - Implemented: `grad=none`, `grad=external`, `grad=ddp`, explicit mesh-dim
   overrides, and explicit scheduling/backend suffixes at the metadata layer.
+- Implemented: explicit finalization helpers for resolving pending obligations
+  when the caller supplies the concrete mesh group and backend policy.
 - Remaining: planner-aware symbolic backward analysis for distributed `[param]`
   operands, including subtracting communication already handled by autograd
   mappings.
-- Remaining: finalization of pending inferred obligations before gradient
-  execution helpers run.
+- Remaining: automatic finalization of pending inferred obligations from the
+  symbolic distributed backward plan before gradient execution helpers run.
 
 ### Stage 3: Helper Migration
 
