@@ -1,20 +1,22 @@
 # Parameter Metadata
 
 Parameter metadata describes persistent parameter layout plus synchronization and
-gradient-reduction obligations. `ParamSpec` is the compatibility API for writing
-that metadata explicitly. Annotated `einshard(...)` operands can also register
-`ParameterState` metadata from the formula itself.
+gradient-reduction obligations. `ParameterState` is the attached metadata object;
+it can be inferred from annotated `einshard(...)` operands or registered
+explicitly for parameters hidden inside modules.
 
 ```python
 mesh = es.wrap_mesh(mesh)
-weight_spec = es.ParamSpec(
+weight_state = es.ParameterState.from_layout(
     "out/tp in",
-    shared=("sp1-sp2",),
-    reduce=("sp1-sp2",),
+    mesh=mesh,
+    init_sync="sp1-sp2",
+    grad="sp1-sp2",
 )
 
 weight = torch.nn.Parameter(local_weight)
-es.sync_param_(weight, weight_spec, mesh)
+es.set_parameter_state(weight, weight_state)
+es.sync_param_(weight, weight_state, mesh)
 
 y = es.einshard(
     "batch in, out/tp in -> batch out/tp",
@@ -25,26 +27,26 @@ y = es.einshard(
 )
 loss = y.sum()
 loss.backward()
-es.reduce_grad_(weight, weight_spec, mesh)
+es.reduce_grad_(weight, weight_state, mesh)
 ```
 
-`shared` uses broadcast from group rank 0 to make replicated parameter values
-identical. `reduce` uses sum all-reduce on `param.grad`. Compound names such as
-`sp1-sp2` work with `wrap_mesh` and reuse the wrapped mesh's cached compound
-process groups.
+`init_sync` uses broadcast from group rank 0 to make replicated parameter values
+identical. Concrete native `grad` obligations use sum all-reduce on `param.grad`.
+Compound names such as `sp1-sp2` work with `wrap_mesh` and reuse the wrapped
+mesh's cached compound process groups.
 
-`shared` dimensions cannot overlap with axis shard dimensions in the layout. For
-example, `ParamSpec("out/tp in", shared="tp")` is rejected because `out` is
-already sharded over `tp`.
+Initialization-sync dimensions cannot overlap with axis shard dimensions in the
+layout. For example, `ParameterState.from_layout("out/tp in", init_sync="tp")`
+is rejected because `out` is already sharded over `tp`.
 
 Concrete native or DDP-backed gradient reductions also cannot overlap parameter
-layout shard dimensions. For example, `ParamSpec("out/tp in", reduce="tp")` is
-rejected because the native execution paths all-reduce full local gradient
-tensors and would mix different `out` shards. Multiple concrete native or
-DDP-backed gradient groups must also be disjoint; reducing over both `dp-sp` and
-`sp-dp` would reduce the same gradient contribution twice. External gradient
-backends are not validated by these rules because they own their execution
-semantics.
+layout shard dimensions. For example,
+`ParameterState.from_layout("out/tp in", grad="tp")` is rejected because the
+native execution paths all-reduce full local gradient tensors and would mix
+different `out` shards. Multiple concrete native or DDP-backed gradient groups
+must also be disjoint; reducing over both `dp-sp` and `sp-dp` would reduce the
+same gradient contribution twice. External gradient backends are not validated by
+these rules because they own their execution semantics.
 
 ## Formula Annotations
 
@@ -97,9 +99,8 @@ obligation raises an error until a later planner-aware inference step or an
 explicit override resolves it.
 
 Explicit mesh-dim annotations such as `grad=sp1-sp2`, `grad=dp:ddp`, and
-`grad=dp:external` are concrete. Legacy `ParamSpec.reduce` metadata is also
-concrete native metadata. Bare forms such as `grad=async`, `grad=ddp`, and
-`grad=external` request inference; distributed formulas can leave those
+`grad=dp:external` are concrete. Bare forms such as `grad=async`, `grad=ddp`,
+and `grad=external` request inference; distributed formulas can leave those
 obligations pending until planner-aware inference resolves them. `grad=external`
 records that another system owns the obligation, and native reduction helpers
 skip it. `grad=none` is an explicit opt-out and conflicts with later non-none
@@ -115,8 +116,7 @@ managed dimensions become `state.shared`. Use `init_sync=none`,
 Formula annotations only work when the parameter is an `einshard` operand. Hidden
 parameters inside `nn.Linear`, `nn.Conv1d`/`nn.Conv2d`/`nn.Conv3d`,
 LayerNorm/RMSNorm-style affine parameters, `torch.nn.functional.linear`, or
-fused kernels can be registered explicitly without constructing a legacy
-`ParamSpec`:
+fused kernels can be registered explicitly:
 
 ```python
 state = es.ParameterState.from_layout(
@@ -129,9 +129,9 @@ es.register_parameter_layout(weight, "out/tp in", mesh=mesh, grad="sp1-sp2")
 
 `from_layout` and `register_parameter_layout` infer init sync from `mesh` or
 `mesh_dim_names`. They default to no gradient obligation, matching layout-only
-`ParamSpec` behavior. Pass `grad=...` to record a concrete, pending, external, or
-DDP-backed gradient policy. Pass `grad="none"` only when the no-gradient policy is
-an explicit opt-out that should conflict with later non-none metadata.
+registration behavior. Pass `grad=...` to record a concrete, pending, external,
+or DDP-backed gradient policy. Pass `grad="none"` only when the no-gradient policy
+is an explicit opt-out that should conflict with later non-none metadata.
 Registration validates that the layout rank matches the parameter rank.
 
 For fused or custom modules, register several named parameters atomically:
@@ -227,17 +227,12 @@ It does not synchronize running-stat buffers.
 
 ## Module Helpers
 
-For modules, attach specs or states to parameters and use the module-level
-helpers:
+For modules, attach states to parameters and use the module-level helpers:
 
 ```python
-es.set_param_spec(weight, weight_spec)
-
-state = es.ParameterState.from_param_spec(weight_spec)
+state = es.ParameterState.from_layout("out/tp in", mesh=mesh, grad="sp1-sp2")
 es.set_parameter_state(weight, state)
 
-for name, param, spec in es.iter_param_specs(module):
-    print(name, spec.layout)
 for name, param, state in es.iter_parameter_states(module):
     print(name, state.layout_shard_dims)
 es.validate_module_parameter_states_(module, mesh)
@@ -245,10 +240,9 @@ es.sync_module_params_(module, mesh)
 es.reduce_module_grads_(module, mesh)
 ```
 
-`set_param_spec` attaches both the legacy spec and the equivalent
-`ParameterState`. Formula annotations merge with layout-only or semantically
-compatible `ParamSpec` metadata and reject incompatible layouts, conflicting
-explicit opt-outs, or conflicting gradient/init-sync obligations.
+Formula annotations merge with layout-only or semantically compatible
+`ParameterState` metadata and reject incompatible layouts, conflicting explicit
+opt-outs, or conflicting gradient/init-sync obligations.
 
 `finalize_parameter_grad_comm_` and `finalize_module_parameter_grad_comm_` resolve
 pending formula-inferred gradient obligations with explicit policies. Use concrete
@@ -282,10 +276,9 @@ optimizer.step()
 handle.remove()
 ```
 
-The hook path executes concrete native obligations such as `ParamSpec.reduce` or
-`grad=sp1-sp2`. It skips external and DDP-backed obligations, and it rejects
-pending native obligations because the correct mesh dimensions have not been
-finalized yet.
+The hook path executes concrete native obligations such as `grad=sp1-sp2`. It
+skips external and DDP-backed obligations, and it rejects pending native
+obligations because the correct mesh dimensions have not been finalized yet.
 
 Today these hooks reduce each incoming gradient contribution synchronously, which
 keeps repeated `backward()` gradient accumulation correct. The returned handle is
@@ -309,10 +302,9 @@ es.register_grad_reduction_hook_(ddp, mesh, ddp_group="dp")
 
 The hook performs DDP-style averaging over `ddp_group`, then applies sum
 all-reduces for concrete native or DDP-backed attached gradient obligations.
-Legacy `ParamSpec.reduce` groups are represented as native
-`ParameterState.grad_comm` metadata. Concrete `grad=sp1-sp2:ddp` obligations are
-executed by this hook, while bare pending `grad=ddp` obligations are rejected
-until finalized. External obligations are not executed by this path.
+Concrete `grad=sp1-sp2:ddp` obligations are executed by this hook, while bare
+pending `grad=ddp` obligations are rejected until finalized. External obligations
+are not executed by this path.
 
 For buckets where every parameter has the same extra reduction metadata, the
 hook can combine DDP averaging and the extra reduction into one all-reduce over a
@@ -331,16 +323,14 @@ es.register_grad_reduction_hook_(
 This is equivalent to summing the bucket over `dp-sp1-sp2` and then dividing by
 the `dp` group size. It avoids a separate `dp` all-reduce followed by an
 `sp1-sp2` all-reduce. The fast path is used only when all parameters in a bucket
-have compatible native or DDP-backed reductions such as `reduce=("sp1-sp2",)` or
-an equivalent `ParameterState.grad_comm`. Mixed buckets fall back to per-parameter
-reductions.
+have compatible native or DDP-backed `ParameterState.grad_comm` reductions. Mixed
+buckets fall back to per-parameter reductions.
 
 ## Shard Metadata
 
-Parameter specs and states can derive checkpoint/test-copy shard metadata:
+Parameter states can derive checkpoint/test-copy shard metadata:
 
 ```python
-metadata = es.param_shard_metadata(weight_spec, global_shape=(1024, 2048), mesh=mesh)
 metadata = es.param_shard_metadata(state, global_shape=(1024, 2048), mesh=mesh)
 local_slices = metadata.local_slices
 local_shape = metadata.local_shape
@@ -353,7 +343,7 @@ helpers support single mesh dimensions and compound names such as `dp-sp` via
 
 ```python
 local_slices = es.param_local_slices(
-    es.ParamSpec("height/sp1 width/sp2"),
+    es.ParameterState.from_layout("height/sp1 width/sp2"),
     global_shape=(721, 1440),
     mesh=mesh,
     factors={"height": 4, "width": 4},

@@ -10,7 +10,6 @@ from .sharding import AxisGroup, EllipsisAxis, TensorAnnotation, TensorSpec
 from .symbolic import TensorState
 
 
-PARAM_SPEC_ATTR = "einshard_spec"
 PARAM_STATE_ATTR = "einshard_state"
 
 
@@ -457,13 +456,6 @@ class ParameterGradComm:
             schedule=annotation.schedule,
         )
 
-    @classmethod
-    def from_reduce_groups(cls, reduce):
-        reduce = _tuple(reduce)
-        if not reduce:
-            return cls()
-        return cls(mode="explicit", mesh_dims=reduce, backend="native", schedule="synchronous")
-
     @property
     def pending_inference(self):
         return self.mode == "inferred" and not self.mesh_dims
@@ -513,24 +505,6 @@ class ParameterState:
         )
 
     @classmethod
-    def from_param_spec(cls, spec, *, mesh_dim_names=()):
-        mesh_dim_names = _mesh_dim_names_from(mesh_dim_names=mesh_dim_names)
-        init_sync = ParameterInitSync(mode="explicit" if spec.shared else "none", mesh_dims=spec.shared)
-        _validate_parameter_layout(tuple(spec.axes.all_shard_dims()), init_sync)
-        grad_comm = ParameterGradComm.from_reduce_groups(spec.reduce)
-        _validate_parameter_grad_comm(tuple(spec.axes.all_shard_dims()), grad_comm)
-        _validate_parameter_mesh_groups(mesh_dim_names, tuple(spec.axes.all_shard_dims()), init_sync, grad_comm)
-        return cls(
-            spec=spec.spec,
-            tensor_state=_tensor_state_or_none(spec.spec, mesh_dim_names),
-            layout_shard_dims=tuple(spec.axes.all_shard_dims()),
-            mesh_dim_names=mesh_dim_names,
-            init_sync=init_sync,
-            grad_comm=grad_comm,
-            source="ParamSpec",
-        )
-
-    @classmethod
     def from_layout(
         cls,
         layout,
@@ -569,40 +543,6 @@ class ParameterState:
 
 
 @dataclass(frozen=True)
-class ParamSpec:
-    layout: str
-    shared: tuple[str, ...] = ()
-    reduce: tuple[str, ...] = ()
-    spec: TensorSpec = field(init=False, compare=False)
-    axes: object = field(init=False)
-
-    def __init__(self, layout, *, shared=(), reduce=()):
-        _validate_layout_value(layout)
-        axes = _parse_axes(layout)
-        shared = _tuple(shared)
-        reduce = _tuple(reduce)
-        all_shard_dims = axes.all_shard_dims()
-        _validate_parameter_layout(
-            all_shard_dims,
-            ParameterInitSync(mode="explicit" if shared else "none", mesh_dims=shared),
-        )
-        _validate_parameter_grad_comm(all_shard_dims, ParameterGradComm.from_reduce_groups(reduce))
-        object.__setattr__(self, "layout", layout)
-        object.__setattr__(self, "axes", axes)
-        object.__setattr__(self, "spec", TensorSpec(axes))
-        object.__setattr__(self, "shared", shared)
-        object.__setattr__(self, "reduce", reduce)
-
-    def __repr__(self):
-        args = [repr(self.layout)]
-        if self.shared:
-            args.append(f"shared={self.shared!r}")
-        if self.reduce:
-            args.append(f"reduce={self.reduce!r}")
-        return f"ParamSpec({', '.join(args)})"
-
-
-@dataclass(frozen=True)
 class ParamShardMetadata:
     global_shape: tuple[int, ...]
     local_slices: tuple[slice, ...]
@@ -613,17 +553,15 @@ class ParamShardMetadata:
 def _state_from_metadata(metadata):
     if isinstance(metadata, ParameterState):
         return metadata
-    if isinstance(metadata, ParamSpec):
-        return ParameterState.from_param_spec(metadata)
-    raise TypeError("Parameter metadata must be a ParameterState or ParamSpec")
+    raise TypeError("Parameter metadata must be a ParameterState")
 
 
 def _require_state(param_or_metadata):
-    if isinstance(param_or_metadata, (ParameterState, ParamSpec)):
+    if isinstance(param_or_metadata, ParameterState):
         return _state_from_metadata(param_or_metadata)
     state = get_parameter_state(param_or_metadata)
     if state is None:
-        raise ValueError("Parameter does not have an attached ParameterState or ParamSpec")
+        raise ValueError("Parameter does not have an attached ParameterState")
     return state
 
 
@@ -811,8 +749,8 @@ def _validate_combined_reduce_config(ddp_group, combined_reduce_group, combined_
         raise ValueError("combined_reduce_group must cover ddp_group and combined_reduce")
 
 
-def sync_param_(param, spec, mesh):
-    state = _state_from_metadata(spec)
+def sync_param_(param, state, mesh):
+    state = _state_from_metadata(state)
     for name in state.shared:
         group = _group(mesh, name)
         if dist.get_world_size(group) == 1:
@@ -821,23 +759,13 @@ def sync_param_(param, spec, mesh):
     return param
 
 
-def reduce_grad_(param, spec, mesh):
+def reduce_grad_(param, state, mesh):
     if param.grad is None:
         return param
-    state = _state_from_metadata(spec)
+    state = _state_from_metadata(state)
     for name in _native_reduce_groups(state):
         param.grad = all_reduce(param.grad, _group(mesh, name))
     return param
-
-
-def set_param_spec(param, spec):
-    setattr(param, PARAM_SPEC_ATTR, spec)
-    setattr(param, PARAM_STATE_ATTR, ParameterState.from_param_spec(spec))
-    return param
-
-
-def get_param_spec(param):
-    return getattr(param, PARAM_SPEC_ATTR, None)
 
 
 def set_parameter_state(param, state):
@@ -846,12 +774,7 @@ def set_parameter_state(param, state):
 
 
 def get_parameter_state(param):
-    state = _parameter_state_from_attached_metadata(param)
-    if state is None:
-        return None
-    if getattr(param, PARAM_STATE_ATTR, None) is None:
-        setattr(param, PARAM_STATE_ATTR, state)
-    return state
+    return _parameter_state_from_attached_metadata(param)
 
 
 def iter_parameter_states(module):
@@ -922,7 +845,7 @@ def finalize_parameter_grad_comm_(param, grad, *, mesh=None, mesh_dim_names=()):
         raise TypeError("Parameter grad finalization requires a torch.nn.Parameter")
     state = _parameter_state_from_attached_metadata(param)
     if state is None:
-        raise ValueError("Parameter does not have an attached ParameterState or ParamSpec")
+        raise ValueError("Parameter does not have an attached ParameterState")
     mesh_dim_names = _mesh_dim_names_from(mesh, mesh_dim_names)
     finalized = _finalized_parameter_grad_state(state, grad, mesh_dim_names)
     _validate_finalized_grad_groups_exist(mesh, finalized)
@@ -940,7 +863,7 @@ def finalize_module_parameter_grad_comm_(module, grad, *, mesh=None, mesh_dim_na
         param = _module_parameter(module, name)
         state = _parameter_state_from_attached_metadata(param)
         if state is None:
-            raise ValueError(f"module parameter {name!r} does not have attached ParameterState or ParamSpec")
+            raise ValueError(f"module parameter {name!r} does not have attached ParameterState")
         finalized = _finalized_parameter_grad_state(state, value, mesh_dim_names)
         _validate_finalized_grad_groups_exist(mesh, finalized)
         updates.append((param, finalized))
@@ -987,13 +910,7 @@ def _merge_non_none_grad_comm(existing, new):
 
 
 def _parameter_state_from_attached_metadata(param):
-    state = getattr(param, PARAM_STATE_ATTR, None)
-    if state is not None:
-        return state
-    spec = get_param_spec(param)
-    if spec is None:
-        return None
-    return ParameterState.from_param_spec(spec)
+    return getattr(param, PARAM_STATE_ATTR, None)
 
 
 def _explicit_init_sync_none(state):
@@ -1047,8 +964,6 @@ def _merge_grad_comm(existing_state, state):
 
 
 def _merged_source(existing, state):
-    if existing.source == "ParamSpec" and state.source != "ParamSpec":
-        return f"ParamSpec+{state.source}"
     return existing.source
 
 
@@ -1491,24 +1406,8 @@ def register_parameter_operand(
     return register_parameter_state(param, state)
 
 
-def iter_param_specs(module):
-    for name, param in module.named_parameters():
-        spec = get_param_spec(param)
-        if spec is not None:
-            yield name, param, spec
-
-
-def _require_spec(param_or_spec):
-    if isinstance(param_or_spec, ParamSpec):
-        return param_or_spec
-    spec = get_param_spec(param_or_spec)
-    if spec is None:
-        raise ValueError("Parameter does not have an attached ParamSpec")
-    return spec
-
-
-def param_shard_dims(param_or_spec):
-    state = _require_state(param_or_spec)
+def param_shard_dims(param_or_state):
+    state = _require_state(param_or_state)
     return state.layout_shard_dims
 
 
@@ -1561,8 +1460,8 @@ def _factor_for(axis, factors):
     return int(factors.get(name, 1))
 
 
-def param_local_slices(param_or_spec, global_shape, mesh, factors=None):
-    state = _require_state(param_or_spec)
+def param_local_slices(param_or_state, global_shape, mesh, factors=None):
+    state = _require_state(param_or_state)
     axes = state.axes
     global_shape = tuple(int(size) for size in global_shape)
     if len(global_shape) != len(axes):
@@ -1584,8 +1483,8 @@ def param_local_slices(param_or_spec, global_shape, mesh, factors=None):
     return tuple(slices)
 
 
-def param_local_shape(param_or_spec, global_shape, mesh, factors=None):
-    slices = param_local_slices(param_or_spec, global_shape, mesh, factors=factors)
+def param_local_shape(param_or_state, global_shape, mesh, factors=None):
+    slices = param_local_slices(param_or_state, global_shape, mesh, factors=factors)
     return _shape_from_slices(global_shape, slices)
 
 
@@ -1598,8 +1497,8 @@ def _shape_from_slices(global_shape, slices):
     return tuple(shape)
 
 
-def param_shard_metadata(param_or_spec, global_shape, mesh, factors=None):
-    state = _require_state(param_or_spec)
+def param_shard_metadata(param_or_state, global_shape, mesh, factors=None):
+    state = _require_state(param_or_state)
     global_shape = tuple(int(size) for size in global_shape)
     local_slices = param_local_slices(state, global_shape, mesh, factors=factors)
     return ParamShardMetadata(

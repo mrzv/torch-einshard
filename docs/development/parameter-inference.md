@@ -1,14 +1,14 @@
 # Parameter Inference Plan
 
-This document describes a planned extension of the symbolic engine that makes
-`ParamSpec` unnecessary as a user-facing API. The goal is not to remove
-parameter metadata. The goal is to infer and store that metadata from symbolic
-parameter uses instead of asking users to spell it out separately.
+This document describes the symbolic parameter metadata model. The goal is not
+to remove parameter metadata. The goal is to infer and store that metadata from
+symbolic parameter uses, or register it explicitly for hidden parameters, instead
+of asking users to maintain a separate parameter-spec wrapper.
 
 The intended end state is:
 
 ```text
-ParamSpec(layout, shared=..., reduce=...)
+legacy_spec(layout, shared=..., reduce=...)
 ```
 
 is replaced by an internal state derived from annotated formulas, symbolic
@@ -18,13 +18,14 @@ backward analysis, and module wrappers:
 ParameterState(layout, init_sync, grad_comm, shard_metadata)
 ```
 
-`ParamSpec` can then become a temporary compatibility wrapper and eventually be
-removed once all supported parameter cases have migrated.
+That legacy wrapper has been removed from the public API; supported parameter
+cases now use annotated formulas, `ParameterState.from_layout`, or explicit
+registration helpers.
 
 ## Summary
 
-This design can eliminate `ParamSpec` from the primary API if the symbolic
-engine becomes parameter-aware.
+This design eliminates the former explicit spec wrapper from the primary API by
+making the symbolic engine parameter-aware.
 
 The symbolic engine must learn three things that are outside the current
 operation-local `TensorState` model:
@@ -55,12 +56,10 @@ The initial foundation is implemented.
 - Input operand annotations are parsed and stored on `TensorSpec`; output
   annotations and standalone scheduling annotations such as `[async]` are
   rejected.
-- `ParameterState`, `ParameterInitSync`, and `ParameterGradComm` exist, and
-  legacy `ParamSpec` metadata is mirrored into compatible `ParameterState`
-  objects.
+- `ParameterState`, `ParameterInitSync`, and `ParameterGradComm` are the
+  canonical metadata objects.
 - Parameter helpers, module sync/reduce helpers, shard metadata helpers, and the
-  DDP communication hook consume `ParameterState` while preserving `ParamSpec`
-  compatibility.
+  DDP communication hook consume `ParameterState`.
 - `einshard` registers annotated `torch.nn.Parameter` operands after successful
   operation execution and validates metadata conflicts before dispatch.
 - Local formula uses can infer visible native gradient obligations from sharded
@@ -93,16 +92,16 @@ yet launch native async gradient communication or automatically finalize
 distributed obligations from formula annotations. Explicitly finalized DDP-backed
 obligations are executed by the DDP communication hook.
 
-## Current `ParamSpec` Responsibilities
+## Former Explicit Spec Responsibilities
 
-`ParamSpec` currently combines four responsibilities.
+The former explicit spec wrapper combined four responsibilities.
 
 First, it stores persistent parameter layout:
 
 ```python
-es.ParamSpec("out/tp in")
-es.ParamSpec("out in/tp")
-es.ParamSpec("h/sp1 w/sp2 c")
+es.ParameterState.from_layout("out/tp in")
+es.ParameterState.from_layout("out in/tp")
+es.ParameterState.from_layout("h/sp1 w/sp2 c")
 ```
 
 This responsibility is already close to `TensorSpec` and `TensorState`.
@@ -125,7 +124,7 @@ package and in downstream integrations:
 - Tests that materialize full reference weights or reconstruct distributed
   gradients.
 
-A replacement for `ParamSpec` must cover all four responsibilities.
+The `ParameterState` replacement must cover all four responsibilities.
 
 ## Design Goals
 
@@ -149,7 +148,7 @@ A replacement for `ParamSpec` must cover all four responsibilities.
   require different gradient reductions in different formulas.
 - Do not use `[async]` as a standalone annotation.
 - Do not remove the need for internal parameter metadata. Only remove the need
-  for users to write `ParamSpec` in supported cases.
+  for users to maintain a separate parameter-spec wrapper in supported cases.
 
 ## Formula Annotations
 
@@ -366,8 +365,7 @@ in the backward formula differ.
 
 ## Shard Metadata Inference
 
-Local shard metadata should be derived from `ParameterState.spec` and the mesh,
-not from `ParamSpec.axes`.
+Local shard metadata should be derived from `ParameterState.spec` and the mesh.
 
 The replacement helpers should preserve the current behavior of:
 
@@ -505,10 +503,9 @@ possible.
 
 `grad=none` means no communication obligation exists for that parameter use.
 
-The existing DDP communication hook can be migrated from `ParamSpec.reduce` to
-`ParameterState.grad_comm`. The combined-reduction fast path can remain an
-execution optimization when all parameters in a bucket have compatible inferred
-or explicit gradient obligations.
+The DDP communication hook consumes `ParameterState.grad_comm`. The
+combined-reduction fast path remains an execution optimization when all
+parameters in a bucket have compatible inferred or explicit gradient obligations.
 
 ### Replacing DDP Under The Hood
 
@@ -535,9 +532,9 @@ The potential gains are a unified symbolic gradient planner, better fusion acros
 obligations, future reduce-scatter or sharded-optimizer support, and better
 diagnostics that explain why each parameter needs each reduction.
 
-The cost is rebuilding mature DDP behavior. The migration should therefore treat
-native DDP replacement as a backend added after the symbolic obligations are
-correct, not as a prerequisite for removing `ParamSpec`.
+The cost is rebuilding mature DDP behavior. Native DDP replacement should remain
+a backend added after the symbolic obligations are correct, not a prerequisite
+for the state metadata model.
 
 ## Diagnostics
 
@@ -572,7 +569,7 @@ Status: implemented foundation.
   conflict checks during each `einshard` registration pass.
 - Convert annotated parameter operands into attached parameter metadata during
   `einshard`.
-- Mirror `ParamSpec` into compatible `ParameterState` metadata during this stage.
+- Attach `ParameterState` metadata directly to `torch.nn.Parameter` objects.
 
 ### Stage 2: Inference
 
@@ -637,29 +634,35 @@ Status: partially implemented.
 
 ### Stage 5: Compatibility And Removal
 
-- Make `ParamSpec` a compatibility wrapper that populates `ParameterState`.
-- Update docs and examples to prefer annotations and wrappers.
-- Emit deprecation warnings after feature parity is established.
-- Remove `ParamSpec` only after tests and downstream users no longer require it.
+Status: implemented for this repository.
 
-## Removal Criteria For `ParamSpec`
+- Tests and benchmarks use `ParameterState` registration instead of the former
+  explicit spec wrapper.
+- Docs and examples prefer annotations and registration helpers.
+- The public compatibility wrapper and legacy attach/iterate helpers have been
+  removed from the package API.
 
-`ParamSpec` can be removed from the primary API when all of these are true:
+## Removal Criteria
+
+The explicit spec wrapper can stay out of the primary API because all of these
+are true in this repository:
 
 - Parameter layout can be inferred or registered for supported parameter uses.
 - Init sync can be inferred or overridden.
 - Gradient communication can be inferred or overridden.
-- DDP hook behavior has parity with current `ParamSpec.reduce` behavior.
+- DDP hook behavior has parity with explicit concrete `ParameterState.grad_comm`
+  behavior.
 - Local shard metadata helpers work from `ParameterState`.
 - Downstream group validation and global norm accounting can be implemented from
   `ParameterState`.
 - Hidden-parameter cases have wrappers or explicit registration APIs.
-- Documentation no longer teaches `ParamSpec` as the normal path.
-- A compatibility period has allowed downstream users to migrate.
+- Documentation no longer teaches the former wrapper as the normal path.
+- Downstream users can migrate to explicit registration helpers or formula
+  annotations.
 
-The answer is therefore yes: this design allows `ParamSpec` to go away as a
-user-facing concept. It does not allow the underlying metadata to disappear.
-That metadata becomes inferred symbolic parameter state.
+The answer is therefore yes: the former wrapper can go away as a user-facing
+concept. It does not allow the underlying metadata to disappear. That metadata is
+now inferred or registered symbolic parameter state.
 
 ## Open Questions
 
