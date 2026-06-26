@@ -38,6 +38,7 @@ from .params import (
     set_param_spec,
     sync_module_params_,
     sync_param_,
+    validate_module_parameter_states_,
 )
 from .roll import einroll
 from .sharding import AxisGroup

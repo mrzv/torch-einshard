@@ -1,3 +1,5 @@
+from dataclasses import replace
+
 import torch
 import torch.distributed as dist
 from torch import nn
@@ -1419,6 +1421,263 @@ def test_iter_parameter_states_yields_attached_states():
     assert name == "1.weight"
     assert param is module[1].weight
     assert actual_state is state
+
+
+def test_validate_module_parameter_states_accepts_valid_states():
+    module = nn.Linear(3, 2)
+    es.register_linear_parameters_(module, weight_grad="dp", bias_grad="dp")
+
+    assert es.validate_module_parameter_states_(module) is module
+
+
+def test_validate_module_parameter_states_rejects_pending_native_grad():
+    module = nn.Module()
+    module.weight = torch.nn.Parameter(torch.ones(3))
+    es.set_parameter_state(
+        module.weight,
+        es.ParameterState.from_layout("c", grad="async"),
+    )
+
+    try:
+        es.validate_module_parameter_states_(module)
+    except ValueError as error:
+        assert "weight" in str(error)
+        assert "pending inference" in str(error)
+    else:
+        raise AssertionError("Expected pending native grad metadata to fail validation")
+
+    assert es.validate_module_parameter_states_(module, allow_pending=True) is module
+
+
+def test_validate_module_parameter_states_rejects_pending_ddp_grad():
+    module = nn.Module()
+    module.weight = torch.nn.Parameter(torch.ones(3))
+    es.set_parameter_state(
+        module.weight,
+        es.ParameterState.from_layout("c", grad="ddp"),
+    )
+
+    try:
+        es.validate_module_parameter_states_(module)
+    except ValueError as error:
+        assert "weight" in str(error)
+        assert "pending inference" in str(error)
+    else:
+        raise AssertionError("Expected pending DDP grad metadata to fail validation")
+
+    assert es.validate_module_parameter_states_(module, allow_pending=True) is module
+
+
+def test_validate_module_parameter_states_checks_mesh_groups(mesh_2d):
+    module = nn.Module()
+    module.weight = torch.nn.Parameter(torch.ones(3))
+    es.set_parameter_state(
+        module.weight,
+        es.ParameterState.from_layout("c", grad="missing"),
+    )
+
+    try:
+        es.validate_module_parameter_states_(module, mesh_2d)
+    except ValueError as error:
+        assert "weight" in str(error)
+        assert "missing" in str(error)
+    else:
+        raise AssertionError("Expected unknown mesh group to fail validation")
+
+
+def test_validate_module_parameter_states_checks_layout_mesh_groups(mesh_2d):
+    module = nn.Module()
+    module.weight = torch.nn.Parameter(torch.ones(3))
+    es.set_parameter_state(
+        module.weight,
+        es.ParameterState.from_layout("c/missing"),
+    )
+
+    try:
+        es.validate_module_parameter_states_(module, mesh_2d)
+    except ValueError as error:
+        assert "weight" in str(error)
+        assert "missing" in str(error)
+    else:
+        raise AssertionError("Expected unknown layout mesh group to fail validation")
+
+
+def test_validate_module_parameter_states_requires_wrapped_compound_layout_groups(mesh_2d):
+    module = nn.Module()
+    module.weight = torch.nn.Parameter(torch.ones(3))
+    es.set_parameter_state(
+        module.weight,
+        es.ParameterState.from_layout("c/dp-sp"),
+    )
+
+    try:
+        es.validate_module_parameter_states_(module, mesh_2d)
+    except ValueError as error:
+        assert "weight" in str(error)
+        assert "wrap_mesh" in str(error)
+    else:
+        raise AssertionError("Expected unwrapped compound layout group to fail validation")
+
+    assert es.validate_module_parameter_states_(module, es.wrap_mesh(mesh_2d)) is module
+
+
+def test_validate_module_parameter_states_detects_raw_rank_mismatch():
+    module = nn.Linear(3, 2)
+    es.set_parameter_state(module.weight, es.ParameterState.from_layout("c"))
+
+    try:
+        es.validate_module_parameter_states_(module)
+    except ValueError as error:
+        assert "weight" in str(error)
+        assert "rank" in str(error)
+    else:
+        raise AssertionError("Expected rank-mismatched raw state to fail validation")
+
+
+def test_validate_module_parameter_states_rejects_non_state_metadata():
+    module = nn.Module()
+    module.weight = torch.nn.Parameter(torch.ones(3))
+    es.set_parameter_state(module.weight, object())
+
+    try:
+        es.validate_module_parameter_states_(module)
+    except ValueError as error:
+        assert "weight" in str(error)
+        assert "ParameterState" in str(error)
+    else:
+        raise AssertionError("Expected non-ParameterState metadata to fail validation")
+
+
+def test_validate_module_parameter_states_rejects_stale_layout_shard_dims():
+    module = nn.Module()
+    module.weight = torch.nn.Parameter(torch.ones(3))
+    state = replace(es.ParameterState.from_layout("c"), layout_shard_dims=("missing",))
+    es.set_parameter_state(module.weight, state)
+
+    try:
+        es.validate_module_parameter_states_(module)
+    except ValueError as error:
+        assert "weight" in str(error)
+        assert "layout_shard_dims" in str(error)
+    else:
+        raise AssertionError("Expected stale cached layout shard dims to fail validation")
+
+
+def test_validate_module_parameter_states_rejects_malformed_init_sync():
+    module = nn.Module()
+    module.weight = torch.nn.Parameter(torch.ones(3))
+    state = replace(
+        es.ParameterState.from_layout("c"),
+        init_sync=es.ParameterInitSync(mode="bogus", mesh_dims=("dp",)),
+    )
+    es.set_parameter_state(module.weight, state)
+
+    try:
+        es.validate_module_parameter_states_(module)
+    except ValueError as error:
+        assert "weight" in str(error)
+        assert "ParameterInitSync" in str(error)
+    else:
+        raise AssertionError("Expected malformed init-sync metadata to fail validation")
+
+
+def test_validate_module_parameter_states_rejects_inferred_init_sync_overlap():
+    module = nn.Module()
+    module.weight = torch.nn.Parameter(torch.ones(3))
+    state = replace(
+        es.ParameterState.from_layout("c/tp", mesh_dim_names=("tp", "sp")),
+        init_sync=es.ParameterInitSync(mode="inferred", mesh_dims=("tp",)),
+    )
+    es.set_parameter_state(module.weight, state)
+
+    try:
+        es.validate_module_parameter_states_(module)
+    except ValueError as error:
+        assert "weight" in str(error)
+        assert "init_sync" in str(error)
+        assert "tp" in str(error)
+    else:
+        raise AssertionError("Expected inferred init-sync layout overlap to fail validation")
+
+
+def test_validate_module_parameter_states_rejects_unknown_inferred_init_sync():
+    module = nn.Module()
+    module.weight = torch.nn.Parameter(torch.ones(3))
+    state = replace(
+        es.ParameterState.from_layout("c", mesh_dim_names=("dp",)),
+        init_sync=es.ParameterInitSync(mode="inferred", mesh_dims=("missing",)),
+    )
+    es.set_parameter_state(module.weight, state)
+
+    try:
+        es.validate_module_parameter_states_(module)
+    except ValueError as error:
+        assert "weight" in str(error)
+        assert "missing" in str(error)
+    else:
+        raise AssertionError("Expected unknown inferred init-sync group to fail validation")
+
+
+def test_validate_module_parameter_states_rejects_incomplete_inferred_init_sync():
+    module = nn.Module()
+    module.weight = torch.nn.Parameter(torch.ones(3))
+    state = replace(
+        es.ParameterState.from_layout("c", mesh_dim_names=("dp", "sp")),
+        init_sync=es.ParameterInitSync(mode="inferred", mesh_dims=("dp",)),
+    )
+    es.set_parameter_state(module.weight, state)
+
+    try:
+        es.validate_module_parameter_states_(module)
+    except ValueError as error:
+        assert "weight" in str(error)
+        assert "inferred init_sync" in str(error)
+    else:
+        raise AssertionError("Expected incomplete inferred init-sync metadata to fail validation")
+
+
+def test_validate_module_parameter_states_allows_explicit_init_sync_subset():
+    module = nn.Module()
+    module.weight = torch.nn.Parameter(torch.ones(3))
+    es.set_parameter_state(
+        module.weight,
+        es.ParameterState.from_layout("c", mesh_dim_names=("dp", "sp"), init_sync="dp"),
+    )
+
+    assert es.validate_module_parameter_states_(module) is module
+
+
+def test_validate_module_parameter_states_rejects_malformed_grad_comm():
+    module = nn.Module()
+    module.weight = torch.nn.Parameter(torch.ones(3))
+    state = replace(
+        es.ParameterState.from_layout("c"),
+        grad_comm=es.ParameterGradComm(mode="explicit", mesh_dims=("dp",), backend="bogus"),
+    )
+    es.set_parameter_state(module.weight, state)
+
+    try:
+        es.validate_module_parameter_states_(module)
+    except ValueError as error:
+        assert "weight" in str(error)
+        assert "ParameterGradComm" in str(error)
+    else:
+        raise AssertionError("Expected malformed grad metadata to fail validation")
+
+
+def test_validate_module_parameter_states_rejects_partial_specs():
+    module = nn.Module()
+    module.weight = torch.nn.Parameter(torch.ones(3))
+    spec = es.parse_sharding("c // dp -> c // dp")[0]
+    es.set_parameter_state(module.weight, es.ParameterState(spec=spec))
+
+    try:
+        es.validate_module_parameter_states_(module)
+    except ValueError as error:
+        assert "weight" in str(error)
+        assert "axis layout" in str(error)
+    else:
+        raise AssertionError("Expected partial-bearing parameter state to fail validation")
 
 
 def test_einshard_registers_annotated_parameter_operands():

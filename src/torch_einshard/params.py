@@ -88,7 +88,7 @@ def _validate_parameter_layout(layout_shard_dims, init_sync=None):
             raise ValueError(f"Parameter specs cannot shard multiple axes over the same mesh dimension: {dims}")
         seen_components.update(components)
 
-    if init_sync is None or init_sync.mode != "explicit":
+    if init_sync is None or init_sync.mode in {"none", "external"} or not init_sync.mesh_dims:
         return
 
     shard_components = _mesh_dims_components(layout_shard_dims)
@@ -241,7 +241,7 @@ def _validate_known_layout_mesh_groups(mesh_dim_names, groups):
 
 def _validate_parameter_mesh_groups(mesh_dim_names, layout_shard_dims, init_sync, grad_comm):
     _validate_known_layout_mesh_groups(mesh_dim_names, layout_shard_dims)
-    if init_sync.mode == "explicit":
+    if init_sync.mesh_dims:
         _validate_known_mesh_groups(mesh_dim_names, init_sync.mesh_dims, "init_sync")
     if grad_comm.mode != "none" and grad_comm.backend != "external":
         _validate_known_mesh_groups(mesh_dim_names, grad_comm.mesh_dims, "grad")
@@ -639,6 +639,82 @@ def _native_reduce_groups(state):
     return state.grad_comm.mesh_dims
 
 
+def _validation_grad_groups(state, *, allow_pending):
+    if state.grad_comm.pending_inference:
+        if state.grad_comm.backend in {"native", "ddp"} and not allow_pending:
+            raise ValueError("Parameter gradient communication is still pending inference")
+        return ()
+    if state.grad_comm.mode == "none" or state.grad_comm.backend == "external":
+        return ()
+    if state.grad_comm.backend in {"native", "ddp"}:
+        return state.grad_comm.mesh_dims
+    return ()
+
+
+def _validate_metadata_tuple(value, label):
+    if not isinstance(value, tuple):
+        raise TypeError(f"{label} must be a tuple of strings")
+    if any(not isinstance(item, str) for item in value):
+        raise TypeError(f"{label} entries must be strings")
+
+
+def _validate_parameter_init_sync_object(init_sync):
+    if not isinstance(init_sync, ParameterInitSync):
+        raise TypeError("ParameterState init_sync must be a ParameterInitSync")
+    _validate_metadata_tuple(init_sync.mesh_dims, "ParameterInitSync mesh_dims")
+    if init_sync.mode not in {"none", "external", "explicit", "inferred"}:
+        raise ValueError(f"Unknown ParameterInitSync mode {init_sync.mode!r}")
+    if init_sync.mode in {"none", "external"} and init_sync.mesh_dims:
+        raise ValueError("ParameterInitSync none/external modes cannot carry mesh_dims")
+    if init_sync.mode == "explicit" and not init_sync.mesh_dims:
+        raise ValueError("ParameterInitSync explicit mode requires mesh_dims")
+
+
+def _validate_parameter_grad_comm_object(grad_comm):
+    if not isinstance(grad_comm, ParameterGradComm):
+        raise TypeError("ParameterState grad_comm must be a ParameterGradComm")
+    _validate_metadata_tuple(grad_comm.mesh_dims, "ParameterGradComm mesh_dims")
+    if grad_comm.mode not in {"none", "inferred", "explicit"}:
+        raise ValueError(f"Unknown ParameterGradComm mode {grad_comm.mode!r}")
+    if grad_comm.backend not in {"none", "native", "ddp", "external"}:
+        raise ValueError(f"Unknown ParameterGradComm backend {grad_comm.backend!r}")
+    if grad_comm.schedule not in {"backend_default", "synchronous", "async"}:
+        raise ValueError(f"Unknown ParameterGradComm schedule {grad_comm.schedule!r}")
+    if grad_comm.mode == "none":
+        if grad_comm.backend != "none" or grad_comm.mesh_dims:
+            raise ValueError("ParameterGradComm none mode cannot carry backend or mesh_dims")
+    elif grad_comm.backend == "none":
+        raise ValueError("ParameterGradComm non-none modes require a backend")
+    if grad_comm.mode == "explicit" and not grad_comm.mesh_dims:
+        raise ValueError("ParameterGradComm explicit mode requires mesh_dims")
+    if grad_comm.backend != "native" and grad_comm.schedule != "backend_default":
+        raise ValueError("ParameterGradComm schedules other than backend_default require native backend")
+
+
+def _validate_parameter_state_object(state):
+    if not isinstance(state, ParameterState):
+        raise TypeError("Attached parameter metadata must be a ParameterState")
+    _validate_parameter_init_sync_object(state.init_sync)
+    _validate_parameter_grad_comm_object(state.grad_comm)
+    if getattr(state.spec, "partials", ()):
+        raise ValueError("Parameter states must contain only axis layout notation")
+    layout_shard_dims = tuple(state.spec.axes.all_shard_dims())
+    if tuple(state.layout_shard_dims) != layout_shard_dims:
+        raise ValueError("ParameterState layout_shard_dims do not match spec axes")
+    mesh_dim_names = _normalize_mesh_dim_names(state.mesh_dim_names)
+    if tuple(state.mesh_dim_names) != mesh_dim_names:
+        raise ValueError("ParameterState mesh_dim_names are malformed")
+    if state.init_sync.mode == "inferred":
+        expected = ParameterInitSync.from_annotation(None, layout_shard_dims, mesh_dim_names).mesh_dims
+        if state.init_sync.mesh_dims != expected:
+            actual = ", ".join(state.init_sync.mesh_dims) or "<none>"
+            expected_text = ", ".join(expected) or "<none>"
+            raise ValueError(
+                "ParameterState inferred init_sync mesh_dims "
+                f"{actual} do not match layout-derived mesh dims {expected_text}"
+            )
+
+
 class NativeGradReductionHandle:
     def __init__(self):
         self._hooks = []
@@ -764,6 +840,32 @@ def iter_parameter_states(module):
         state = get_parameter_state(param)
         if state is not None:
             yield name, param, state
+
+
+def validate_module_parameter_states_(module, mesh=None, *, allow_pending=False):
+    for name, param in module.named_parameters():
+        state = _parameter_state_from_attached_metadata(param)
+        if state is None:
+            continue
+        try:
+            _validate_parameter_state_object(state)
+            _validate_parameter_state_rank(param, state)
+            _validate_parameter_layout(state.layout_shard_dims, state.init_sync)
+            _validate_parameter_grad_comm(state.layout_shard_dims, state.grad_comm)
+            _validate_parameter_mesh_groups(
+                state.mesh_dim_names,
+                state.layout_shard_dims,
+                state.init_sync,
+                state.grad_comm,
+            )
+            grad_groups = _validation_grad_groups(state, allow_pending=allow_pending)
+            if mesh is not None:
+                if state.mesh_dim_names:
+                    _validate_mesh_dim_names_match_mesh(mesh, state.mesh_dim_names)
+                _validate_mesh_groups_exist(mesh, (*state.layout_shard_dims, *state.shared, *grad_groups))
+        except (AttributeError, TypeError, ValueError) as error:
+            raise ValueError(f"Invalid parameter metadata for {name!r}: {error}") from error
+    return module
 
 
 def _compatible_init_sync(existing, state):

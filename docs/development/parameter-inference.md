@@ -73,6 +73,9 @@ The initial foundation is implemented.
   hooks for non-DDP training loops. This path reduces each incoming gradient
   contribution synchronously and requires identical backward participation and
   hook order across ranks.
+- Attached metadata can be preflighted with `validate_module_parameter_states_`
+  before training or checkpoint work; pending native/DDP obligations are rejected
+  unless explicitly allowed.
 - Hidden linear-, conv-, norm-, fused-, and custom-module parameters can be
   registered explicitly with `ParameterState.from_layout`,
   `register_parameter_layout`, `register_module_parameter_layouts_`,
