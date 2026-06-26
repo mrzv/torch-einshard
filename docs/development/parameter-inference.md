@@ -627,10 +627,13 @@ Status: partially implemented.
 - Implemented: normalization-style weight/bias registration through
   `register_norm_parameters_`, including shared layout defaults, same-shape bias
   validation, and atomic conflict validation.
+- Implemented: SciGPT-style MLP, normalization, and spatial-position parameter
+  metadata patterns are covered by registration-helper tests.
 
 - Add specialized validation helpers for Transformer Engine or other fused modules
   when generic named-parameter registration is not enough.
-- Cover SciGPT-style MLP, attention, Swin, positional embedding, and head cases.
+- Extend downstream pattern coverage for additional Swin/head or Transformer
+  Engine cases when concrete module shapes are available.
 
 ### Stage 5: Compatibility And Removal
 

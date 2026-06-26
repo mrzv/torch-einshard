@@ -147,7 +147,7 @@ Implemented behavior:
 - `einshard` registers annotated `torch.nn.Parameter` operands after successful execution, merges compatible formula metadata with layout-only or semantically compatible legacy `ParamSpec` metadata, and rejects conflicting layouts or conflicting explicit opt-outs.
 - Local formula uses infer visible native gradient obligations; distributed inferred obligations remain pending until planner-aware inference can prove the correct execution behavior.
 - `ParameterState.from_layout`, `register_parameter_layout`, `register_module_parameter_layouts_`, `register_linear_parameters_`, `register_conv_parameters_`, and `register_norm_parameters_` provide explicit state registration for hidden parameters, fused/custom modules, and common linear/conv/norm-style modules that cannot expose parameters as formula operands.
-- SciGPT-style tensor-parallel MLP and attention projection patterns are covered by tests using explicit `einshard` calls.
+- SciGPT-style tensor-parallel MLP and attention projection patterns are covered by tests using explicit `einshard` calls, and MLP/norm/spatial-position parameter metadata patterns are covered by registration-helper tests.
 
 Deferred string notation:
 
