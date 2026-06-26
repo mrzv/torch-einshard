@@ -112,3 +112,15 @@ def test_wrap_mesh_caches_compound_groups(dist_env, mesh_2d):
 
     assert mesh["dp-sp"].get_group() is mesh["dp-sp"].get_group()
     assert mesh["dp-sp"].get_group() is mesh["sp-dp"].get_group()
+
+
+def test_all_reduce_supports_async_work(dist_env, mesh_2d):
+    mesh = es.wrap_mesh(mesh_2d)
+    group = mesh["dp-sp"].get_group()
+    world_rank = dist.get_rank()
+    world_size = dist.get_world_size()
+
+    output, work = es.helpers.all_reduce(torch.tensor(float(world_rank + 1)), group, async_op=True)
+    work.wait()
+
+    assert_close(output, torch.tensor(float(world_size * (world_size + 1) // 2)))
