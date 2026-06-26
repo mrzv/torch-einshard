@@ -1,3 +1,4 @@
+from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 
 import torch.distributed as dist
@@ -333,6 +334,32 @@ def _parameter_attr(module, name):
     if not isinstance(param, torch.nn.Parameter):
         raise TypeError(f"module.{name} must be a torch.nn.Parameter")
     return param
+
+
+def _module_parameter(module, name):
+    if not isinstance(name, str):
+        raise TypeError("Parameter names must be strings")
+    if not name:
+        raise ValueError("Parameter names must be non-empty")
+    try:
+        return module.get_parameter(name)
+    except AttributeError as error:
+        raise ValueError(f"module does not define parameter {name!r}") from error
+
+
+def _metadata_for_parameter(value, name):
+    if isinstance(value, Mapping):
+        return value.get(name)
+    return value
+
+
+def _validate_metadata_keys(value, names, label):
+    if not isinstance(value, Mapping):
+        return
+    unknown = sorted(set(value) - set(names), key=repr)
+    if unknown:
+        formatted = ", ".join(repr(name) for name in unknown)
+        raise ValueError(f"{label} metadata contains unknown parameter names: {formatted}")
 
 
 def _validate_parameter_state_rank(param, state):
@@ -939,6 +966,46 @@ def _prepare_parameter_state_updates(updates):
         merged_by_id[key] = _merge_parameter_state(existing, state)
         params_by_id[key] = param
     return [(params_by_id[key], state) for key, state in merged_by_id.items()]
+
+
+def register_module_parameter_layouts_(
+    module,
+    layouts,
+    *,
+    mesh=None,
+    mesh_dim_names=(),
+    grad=None,
+    init_sync=None,
+    source="module",
+):
+    if not isinstance(layouts, Mapping):
+        raise TypeError("Parameter layouts must be a mapping from parameter name to layout")
+    if not layouts:
+        raise ValueError("Parameter layouts mapping must not be empty")
+
+    names = tuple(layouts)
+    _validate_metadata_keys(grad, names, "grad")
+    _validate_metadata_keys(init_sync, names, "init_sync")
+    mesh_dim_names = _mesh_dim_names_from(mesh, mesh_dim_names)
+
+    updates = []
+    for name, layout in layouts.items():
+        param = _module_parameter(module, name)
+        updates.append((
+            param,
+            ParameterState.from_layout(
+                layout,
+                mesh_dim_names=mesh_dim_names,
+                grad=_metadata_for_parameter(grad, name),
+                init_sync=_metadata_for_parameter(init_sync, name),
+                source=source,
+            ),
+        ))
+
+    prepared = _prepare_parameter_state_updates(updates)
+    for param, state in prepared:
+        set_parameter_state(param, state)
+    return module
 
 
 def register_linear_parameters_(

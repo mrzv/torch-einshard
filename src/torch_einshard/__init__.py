@@ -27,6 +27,7 @@ from .params import (
     register_conv_parameters_,
     register_grad_reduction_hook_,
     register_linear_parameters_,
+    register_module_parameter_layouts_,
     register_native_grad_reduction_hooks_,
     register_norm_parameters_,
     register_parameter_layout,

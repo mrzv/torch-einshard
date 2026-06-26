@@ -1304,6 +1304,109 @@ def test_register_norm_parameters_rejects_missing_weight_parameter():
         raise AssertionError("Expected missing norm weight parameter to fail")
 
 
+def test_register_module_parameter_layouts_registers_named_parameters():
+    module = nn.Module()
+    module.qkv_weight = torch.nn.Parameter(torch.ones(6, 3))
+    module.qkv_bias = torch.nn.Parameter(torch.ones(6))
+
+    es.register_module_parameter_layouts_(
+        module,
+        {"qkv_weight": "out/tp in", "qkv_bias": "out/tp"},
+        mesh_dim_names=("tp", "sp"),
+        grad={"qkv_weight": "sp", "qkv_bias": "sp"},
+        init_sync="sp",
+    )
+
+    weight_state = es.get_parameter_state(module.qkv_weight)
+    bias_state = es.get_parameter_state(module.qkv_bias)
+    assert weight_state.source == "module"
+    assert bias_state.source == "module"
+    assert weight_state.shared == ("sp",)
+    assert bias_state.shared == ("sp",)
+    assert weight_state.reduce == ("sp",)
+    assert bias_state.reduce == ("sp",)
+    assert repr(weight_state.spec.axes) == "out / tp × in"
+    assert repr(bias_state.spec.axes) == "out / tp"
+
+
+def test_register_module_parameter_layouts_supports_nested_names():
+    module = nn.Module()
+    module.proj = nn.Linear(3, 2)
+
+    es.register_module_parameter_layouts_(module, {"proj.weight": "out in"}, grad="dp")
+
+    state = es.get_parameter_state(module.proj.weight)
+    assert state.source == "module"
+    assert state.reduce == ("dp",)
+
+
+def test_register_module_parameter_layouts_rejects_unknown_metadata_keys():
+    module = nn.Module()
+    module.weight = torch.nn.Parameter(torch.ones(3))
+
+    try:
+        es.register_module_parameter_layouts_(
+            module,
+            {"weight": "c"},
+            grad={"weight": "dp", "missing": "sp"},
+        )
+    except ValueError as error:
+        assert "unknown parameter names" in str(error)
+        assert "missing" in str(error)
+    else:
+        raise AssertionError("Expected unknown grad metadata key to fail")
+
+    assert es.get_parameter_state(module.weight) is None
+
+
+def test_register_module_parameter_layouts_is_atomic_on_missing_parameter():
+    module = nn.Module()
+    module.weight = torch.nn.Parameter(torch.ones(3))
+
+    try:
+        es.register_module_parameter_layouts_(module, {"weight": "c", "missing": "c"})
+    except ValueError as error:
+        assert "missing" in str(error)
+    else:
+        raise AssertionError("Expected missing named parameter to fail")
+
+    assert es.get_parameter_state(module.weight) is None
+
+
+def test_register_module_parameter_layouts_merges_aliased_parameters_atomically():
+    module = nn.Module()
+    shared = torch.nn.Parameter(torch.ones(3))
+    module.weight = shared
+    module.bias = shared
+
+    try:
+        es.register_module_parameter_layouts_(module, {"weight": "c", "bias": "d"})
+    except ValueError as error:
+        assert "different layout" in str(error)
+    else:
+        raise AssertionError("Expected aliased parameter layout conflict to fail")
+
+    assert es.get_parameter_state(shared) is None
+
+
+def test_register_module_parameter_layouts_rejects_empty_or_non_mapping_layouts():
+    module = nn.Module()
+
+    try:
+        es.register_module_parameter_layouts_(module, [])
+    except TypeError as error:
+        assert "mapping" in str(error)
+    else:
+        raise AssertionError("Expected non-mapping layouts to fail")
+
+    try:
+        es.register_module_parameter_layouts_(module, {})
+    except ValueError as error:
+        assert "must not be empty" in str(error)
+    else:
+        raise AssertionError("Expected empty layouts mapping to fail")
+
+
 def test_iter_parameter_states_yields_attached_states():
     module = nn.Sequential(nn.Linear(3, 2), nn.Linear(2, 1))
     state = es.ParameterState.from_spec(es.parse_sharding("o c [param] -> o c")[0])

@@ -134,6 +134,31 @@ DDP-backed gradient policy. Pass `grad="none"` only when the no-gradient policy 
 an explicit opt-out that should conflict with later non-none metadata.
 Registration validates that the layout rank matches the parameter rank.
 
+For fused or custom modules, register several named parameters atomically:
+
+```python
+es.register_module_parameter_layouts_(
+    fused,
+    {
+        "qkv_weight": "out/tp in",
+        "qkv_bias": "out/tp",
+        "proj.weight": "out in/tp",
+    },
+    mesh=mesh,
+    grad={
+        "qkv_weight": "sp1-sp2",
+        "qkv_bias": "sp1-sp2",
+        "proj.weight": "sp1-sp2",
+    },
+)
+```
+
+Parameter names follow PyTorch `Module.get_parameter`, so dotted child-module
+paths are supported. `grad=` and `init_sync=` can be either one value for all
+listed parameters or mappings keyed by parameter name. Unknown metadata keys,
+missing parameters, rank mismatches, or metadata conflicts fail before any listed
+state is attached.
+
 For `nn.Linear`-style modules, register weight and optional bias metadata in one
 atomic step:
 

@@ -73,8 +73,9 @@ The initial foundation is implemented.
   hooks for non-DDP training loops. This path reduces each incoming gradient
   contribution synchronously and requires identical backward participation and
   hook order across ranks.
-- Hidden linear-, conv-, and norm-style parameters can be registered explicitly with
-  `ParameterState.from_layout`, `register_parameter_layout`,
+- Hidden linear-, conv-, norm-, fused-, and custom-module parameters can be
+  registered explicitly with `ParameterState.from_layout`,
+  `register_parameter_layout`, `register_module_parameter_layouts_`,
   `register_linear_parameters_`, `register_conv_parameters_`, or
   `register_norm_parameters_`; this covers state attachment without inferring
   arbitrary module internals.
@@ -601,6 +602,8 @@ Status: partially implemented.
 
 - Implemented: explicit layout registration through `ParameterState.from_layout`
   and `register_parameter_layout`.
+- Implemented: atomic named-parameter registration through
+  `register_module_parameter_layouts_` for fused or custom modules.
 - Implemented: `nn.Linear`-style weight/bias registration through
   `register_linear_parameters_`, including derived bias layout and atomic
   conflict validation.
@@ -612,7 +615,8 @@ Status: partially implemented.
   `register_norm_parameters_`, including shared layout defaults, same-shape bias
   validation, and atomic conflict validation.
 
-- Add extension points for Transformer Engine or other fused modules.
+- Add specialized validation helpers for Transformer Engine or other fused modules
+  when generic named-parameter registration is not enough.
 - Cover SciGPT-style MLP, attention, Swin, positional embedding, and head cases.
 
 ### Stage 5: Compatibility And Removal
