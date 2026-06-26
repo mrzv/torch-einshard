@@ -48,6 +48,22 @@ def test_tensor_state_tracks_replicated_mesh_dims():
     assert state.replicated_dims == ("sp",)
 
 
+def test_tensor_state_treats_compound_mesh_dim_components_as_used():
+    x, _, _ = parse_sharding("a/dp-sp b // tp-sp -> a b")
+
+    state = TensorState.from_spec(x, mesh_dim_names=("dp", "sp", "tp", "pp"))
+
+    assert state.replicated_dims == ("pp",)
+
+
+def test_tensor_state_excludes_compound_candidate_mesh_dims_with_used_components():
+    x, _, _ = parse_sharding("a/sp1 b -> a b")
+
+    state = TensorState.from_spec(x, mesh_dim_names=("sp1-sp2", "tp"))
+
+    assert state.replicated_dims == ("tp",)
+
+
 def test_tensor_state_flattens_axis_groups():
     x, _, _ = parse_sharding("a (b/tp c) -> a b/tp c")
 

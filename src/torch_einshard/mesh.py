@@ -16,7 +16,9 @@ class CompoundDeviceMesh:
     def __init__(self, device_mesh):
         self.device_mesh = device_mesh
         self.mesh = device_mesh.mesh
-        self.mesh_dim_names = tuple(device_mesh.mesh_dim_names)
+        self.mesh_dim_names = _mesh_dim_names(device_mesh.mesh_dim_names)
+        if len(self.mesh_dim_names) != self.mesh.dim():
+            raise ValueError("mesh_dim_names length must match mesh rank")
         self._name_to_dim = {name: i for i, name in enumerate(self.mesh_dim_names)}
         self._compound_groups = {}
 
@@ -27,6 +29,10 @@ class CompoundDeviceMesh:
             return self.device_mesh[name]
 
         dim_names = tuple(name.split("-"))
+        if any(not dim_name for dim_name in dim_names):
+            raise ValueError("Compound mesh groups cannot contain empty mesh dimensions")
+        if len(set(dim_names)) != len(dim_names):
+            raise ValueError("Compound mesh groups cannot repeat mesh dimensions")
         if any(dim_name not in self._name_to_dim for dim_name in dim_names):
             return self.device_mesh[name]
         return _MeshDim(self._compound_group(dim_names))
@@ -62,3 +68,36 @@ def wrap_mesh(device_mesh):
     if isinstance(device_mesh, CompoundDeviceMesh):
         return device_mesh
     return CompoundDeviceMesh(device_mesh)
+
+
+def _mesh_dim_names(names):
+    if names is None:
+        return ()
+    if isinstance(names, str):
+        result = (names,)
+    elif isinstance(names, torch.Tensor) or (hasattr(names, "shape") and hasattr(names, "dtype")):
+        raise TypeError("mesh_dim_names must be an iterable of strings")
+    else:
+        try:
+            result = tuple(names)
+        except TypeError as error:
+            raise TypeError("mesh_dim_names must be an iterable of strings") from error
+    if any(not isinstance(name, str) for name in result):
+        raise TypeError("mesh_dim_names entries must be strings")
+    if any(not name for name in result):
+        raise ValueError("mesh_dim_names entries must be non-empty strings")
+    for name in result:
+        components = tuple(name.split("-"))
+        if any(not component for component in components):
+            raise ValueError("mesh_dim_names entries cannot contain empty compound components")
+        if len(set(components)) != len(components):
+            raise ValueError("mesh_dim_names entries cannot repeat compound components")
+    seen_components = set()
+    for name in result:
+        components = set(name.split("-"))
+        if seen_components.intersection(components):
+            raise ValueError("mesh_dim_names entries cannot overlap compound components")
+        seen_components.update(components)
+    if len(set(result)) != len(result):
+        raise ValueError("mesh_dim_names entries must be unique")
+    return result

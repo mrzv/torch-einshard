@@ -1,22 +1,17 @@
 # Parameter Metadata
 
-`ParamSpec` describes persistent parameter layout plus synchronization and
-gradient-reduction metadata. It does not replace `einshard`; tensor computations
-still use explicit `einshard(...)` expressions.
+Parameter metadata describes persistent parameter layout plus synchronization and
+gradient-reduction obligations. `ParameterState` is the attached metadata object;
+it can be inferred from annotated `einshard(...)` operands or registered
+explicitly for parameters hidden inside modules.
 
 ```python
 mesh = es.wrap_mesh(mesh)
-weight_spec = es.ParamSpec(
-    "out/tp in",
-    shared=("sp1-sp2",),
-    reduce=("sp1-sp2",),
-)
-
 weight = torch.nn.Parameter(local_weight)
-es.sync_param_(weight, weight_spec, mesh)
+es.init_param_(weight, mesh, sync="sp1-sp2")
 
 y = es.einshard(
-    "batch in, out/tp in -> batch out/tp",
+    "batch in, out/tp in [param, grad=sp1-sp2] -> batch out/tp",
     x,
     weight,
     mesh=mesh,
@@ -24,29 +19,308 @@ y = es.einshard(
 )
 loss = y.sum()
 loss.backward()
-es.reduce_grad_(weight, weight_spec, mesh)
+es.reduce_grad_(weight, es.get_parameter_state(weight), mesh)
 ```
 
-`shared` uses broadcast from group rank 0 to make replicated parameter values
-identical. `reduce` uses sum all-reduce on `param.grad`. Compound names such as
-`sp1-sp2` work with `wrap_mesh` and reuse the wrapped mesh's cached compound
-process groups.
+Initialization sync uses broadcast from group rank 0 to make replicated parameter
+values identical. Concrete native `grad` obligations use sum all-reduce on
+`param.grad`.
+Compound names such as `sp1-sp2` work with `wrap_mesh` and reuse the wrapped
+mesh's cached compound process groups.
 
-`shared` dimensions cannot overlap with axis shard dimensions in the layout. For
-example, `ParamSpec("out/tp in", shared="tp")` is rejected because `out` is
-already sharded over `tp`.
+Initialization-sync dimensions cannot overlap with axis shard dimensions in the
+layout. For example, `ParameterState.from_layout("out/tp in", init_sync="tp")`
+is rejected because `out` is already sharded over `tp`.
+
+Concrete native or DDP-backed gradient reductions also cannot overlap parameter
+layout shard dimensions. For example,
+`ParameterState.from_layout("out/tp in", grad="tp")` is rejected because the
+native execution paths all-reduce full local gradient tensors and would mix
+different `out` shards. Multiple concrete native or DDP-backed gradient groups
+must also be disjoint; reducing over both `dp-sp` and `sp-dp` would reduce the
+same gradient contribution twice. External gradient backends are not validated by
+these rules because they own their execution semantics.
+
+## Formula Annotations
+
+Input operands can be annotated as persistent parameters:
+
+```python
+weight = torch.nn.Parameter(torch.ones(3))
+
+y = es.einshard(
+    "batch/dp channel, channel [param, grad=async] -> batch/dp channel",
+    x,
+    weight,
+    mesh=mesh,
+)
+state = es.get_parameter_state(weight)
+```
+
+The annotated tensor argument must be a `torch.nn.Parameter`. `einshard` validates
+parameter metadata before dispatch, executes the tensor operation, and attaches
+the resulting `ParameterState` only after the operation succeeds. Failed shape,
+mesh, or metadata checks do not leave partial formula state attached.
+
+Supported annotation forms include:
+
+```text
+[param]
+[param, grad=async]
+[param, grad=sp1-sp2]
+[param, grad=sp1-sp2:async]
+[param, grad=ddp]
+[param, grad=external]
+[param, grad=dp:ddp]
+[param, grad=dp:external]
+[param, grad=none]
+```
+
+For local formulas, inferred native gradient obligations are recorded in
+`state.grad_comm`. In the example above, the parameter gradient is reduced over
+`batch`, and `batch` is sharded over `dp`, so the state records a native async
+gradient obligation over `dp`.
+
+Distributed formulas are more conservative. If the operation plan may already
+perform backward communication for the annotated operand, `grad=async` remains a
+pending inferred obligation instead of guessing an extra reduction. Calling
+`reduce_grad_`, `reduce_module_grads_`, or the DDP hook with a pending native/DDP
+obligation raises an error until a later planner-aware inference step or an
+explicit override resolves it.
+
+Explicit mesh-dim annotations such as `grad=sp1-sp2`, `grad=dp:ddp`, and
+`grad=dp:external` are concrete. Bare forms such as `grad=async`, `grad=ddp`,
+and `grad=external` request inference; distributed formulas can leave those
+obligations pending until planner-aware inference resolves them. `grad=external`
+records that another system owns the obligation, and native reduction helpers
+skip it. `grad=none` is an explicit opt-out and conflicts with later non-none
+formula metadata for the same parameter.
+
+Ordinary forward formulas should not repeat initialization policy. Use
+`init_param_` or `init_params_` to record and execute initial synchronization;
+later formulas preserve that metadata while filling in layout and gradient
+information.
+
+## Parameter Initialization
+
+Use `init_param_` to attach initialization metadata and immediately perform the
+initial broadcast:
+
+```python
+es.init_param_(weight, mesh, sync="sp1-sp2")
+es.init_param_(bias, mesh)                 # infer sync over all managed mesh dims
+es.init_param_(tp_weight, mesh, sharded="tp")
+es.init_param_(external_weight, mesh, sync="external")
+```
+
+Inside this API the argument is named `sync` because the function is already
+scoped to initialization. Internally it populates `ParameterState.init_sync`.
+
+`sync="sp1-sp2"` records and executes a broadcast over `sp1-sp2`. `sync="none"`
+records that no initial synchronization is needed. `sync="external"` records that
+another system, such as checkpoint loading or a training framework, owns initial
+value consistency, so `torch-einshard` does not broadcast.
+
+If `sync` is omitted, the broadcast groups are inferred from the managed mesh
+dimension names minus the optional `sharded` footprint. For example,
+`sharded="tp"` means the parameter's local value differs across `tp`, so
+initialization sync is inferred over the remaining mesh dimensions.
+
+Use `init_params_` for a whole module. `sync` and `sharded` can be single values
+or mappings keyed by parameter name:
+
+```python
+es.init_params_(
+    module,
+    mesh,
+    sync={"weight": "sp1-sp2", "bias": "sp1-sp2"},
+    sharded={"weight": "tp", "bias": "tp"},
+)
+```
+
+The initialization state may be layout-free. A later `[param]` formula installs
+the concrete parameter layout and gradient metadata. If that formula proves the
+initialization sync overlaps a sharded parameter dimension, or contradicts the
+declared `sharded` footprint, registration fails.
+
+## Explicit Layout Registration
+
+Formula annotations only work when the parameter is an `einshard` operand. Hidden
+parameters inside `nn.Linear`, `nn.Conv1d`/`nn.Conv2d`/`nn.Conv3d`,
+LayerNorm/RMSNorm-style affine parameters, `torch.nn.functional.linear`, or
+fused kernels can be registered explicitly:
+
+```python
+state = es.ParameterState.from_layout(
+    "out/tp in",
+    mesh=mesh,
+    grad="sp1-sp2",
+)
+es.register_parameter_layout(weight, "out/tp in", mesh=mesh, grad="sp1-sp2")
+```
+
+`from_layout` and `register_parameter_layout` infer init sync from `mesh` or
+`mesh_dim_names`. They default to no gradient obligation, matching layout-only
+registration behavior. Pass `grad=...` to record a concrete, pending, external,
+or DDP-backed gradient policy. Pass `grad="none"` only when the no-gradient policy
+is an explicit opt-out that should conflict with later non-none metadata.
+Registration validates that the layout rank matches the parameter rank.
+
+For fused or custom modules, register several named parameters atomically:
+
+```python
+es.register_module_parameter_layouts_(
+    fused,
+    {
+        "qkv_weight": "out/tp in",
+        "qkv_bias": "out/tp",
+        "proj.weight": "out in/tp",
+    },
+    mesh=mesh,
+    grad={
+        "qkv_weight": "sp1-sp2",
+        "qkv_bias": "sp1-sp2",
+        "proj.weight": "sp1-sp2",
+    },
+)
+```
+
+Parameter names follow PyTorch `Module.get_parameter`, so dotted child-module
+paths are supported. `grad=` and `init_sync=` can be either one value for all
+listed parameters or mappings keyed by parameter name. Unknown metadata keys,
+missing parameters, rank mismatches, or metadata conflicts fail before any listed
+state is attached.
+
+For `nn.Linear`-style modules, register weight and optional bias metadata in one
+atomic step:
+
+```python
+linear = torch.nn.Linear(in_features, out_features)
+
+es.register_linear_parameters_(
+    linear,
+    weight_layout="out/tp in",
+    mesh=mesh,
+    weight_grad="sp1-sp2",
+    bias_grad="sp1-sp2",
+)
+```
+
+If `bias_layout` is omitted, it is derived from the first weight axis, so
+`"out/tp in"` gives bias layout `"out/tp"`. An explicit `bias_layout` must match
+that first weight axis. The helper expects `nn.Linear`-style shapes: a rank-2
+weight and, when present, a rank-1 bias whose length matches the weight output
+dimension. It validates both parameters before attaching either state; shape,
+rank, or metadata conflicts do not partially update the module.
+
+For `nn.Conv1d`/`nn.Conv2d`/`nn.Conv3d`-style modules, register weight and
+optional bias metadata similarly:
+
+```python
+conv = torch.nn.Conv2d(in_channels, out_channels, kernel_size=3)
+
+es.register_conv_parameters_(
+    conv,
+    weight_layout="out/tp in kh kw",
+    mesh=mesh,
+    weight_grad="sp1-sp2",
+    bias_grad="sp1-sp2",
+)
+```
+
+If `weight_layout` is omitted, it is derived from the weight rank:
+`"out in k"`, `"out in kh kw"`, or `"out in kd kh kw"`. If `bias_layout` is
+omitted, it is derived from the first weight axis. The helper supports only
+ungrouped ConvNd-style parameters, not grouped convolutions or ConvTranspose
+modules, and validates rank-3/4/5 weight shapes plus optional rank-1 bias shape
+before attaching either state.
+
+For LayerNorm/RMSNorm-style affine parameters whose weight and bias have the same
+layout and shape, use `register_norm_parameters_`:
+
+```python
+norm = torch.nn.LayerNorm(hidden)
+
+es.register_norm_parameters_(
+    norm,
+    layout="c",
+    mesh=mesh,
+    grad="sp1-sp2",
+)
+```
+
+If `layout` is omitted, it defaults to `"c"`. If `bias_layout` is omitted, it
+matches the weight layout. `weight_layout` can be used instead of `layout`; if
+both are supplied, they must describe the same layout. Shared `grad=` and
+`init_sync=` defaults apply to both weight and bias unless `weight_*` or
+`bias_*` overrides are provided. The helper requires a weight parameter and
+validates that an optional bias has the same shape before attaching either state.
+It does not synchronize running-stat buffers.
 
 ## Module Helpers
 
-For modules, attach specs to parameters and use the module-level helpers:
+For modules, attach states to parameters and use the module-level helpers:
 
 ```python
-es.set_param_spec(weight, weight_spec)
-for name, param, spec in es.iter_param_specs(module):
-    print(name, spec.layout)
+state = es.ParameterState.from_layout("out/tp in", mesh=mesh, grad="sp1-sp2")
+es.set_parameter_state(weight, state)
+
+for name, param, state in es.iter_parameter_states(module):
+    print(name, state.layout_shard_dims)
+es.validate_module_parameter_states_(module, mesh)
 es.sync_module_params_(module, mesh)
 es.reduce_module_grads_(module, mesh)
 ```
+
+Formula annotations merge with layout-only or semantically compatible
+`ParameterState` metadata and reject incompatible layouts, conflicting explicit
+opt-outs, or conflicting gradient/init-sync obligations.
+
+`finalize_parameter_grad_comm_` and `finalize_module_parameter_grad_comm_` resolve
+pending formula-inferred gradient obligations with explicit policies. Use concrete
+mesh groups such as `"sp1-sp2"`, `"sp1-sp2:ddp"`, or `"sp1-sp2:external"`;
+bare inferred policies such as `"async"`, `"ddp"`, and `"external"` remain
+ambiguous and are rejected by finalization. Module finalization takes a mapping
+from parameter names to policies and validates all entries before attaching any
+updated state.
+
+```python
+es.finalize_module_parameter_grad_comm_(module, {"weight": "sp1-sp2"})
+```
+
+`validate_module_parameter_states_` preflights attached metadata before training
+or checkpoint work. It checks rank and metadata consistency, validates concrete
+mesh groups when `mesh` is supplied, and rejects pending native/DDP gradient
+obligations by default. Pass `allow_pending=True` only when unresolved obligations
+are expected and will be handled later by another planner or backend.
+
+## Native Gradient Hooks
+
+For non-DDP training loops, concrete native gradient obligations can be executed
+with per-parameter autograd hooks:
+
+```python
+handle = es.register_native_grad_reduction_hooks_(module, mesh)
+
+loss.backward()
+handle.wait()
+optimizer.step()
+handle.remove()
+```
+
+The hook path executes concrete native obligations such as `grad=sp1-sp2`. It
+skips external and DDP-backed obligations, and it rejects pending native
+obligations because the correct mesh dimensions have not been finalized yet.
+
+Today these hooks reduce each incoming gradient contribution synchronously, which
+keeps repeated `backward()` gradient accumulation correct. The returned handle is
+used to remove hooks and is reserved for future asynchronous work; `wait()` is a
+safe no-op when no async work has been launched.
+
+All registered parameters must participate in backward in the same order on every
+rank. Use PyTorch DDP, the DDP communication hook below, or `grad=external` for
+models with rank-dependent control flow, unused parameters, or more complex
+bucket scheduling requirements.
 
 ## DDP Communication Hook
 
@@ -59,7 +333,10 @@ es.register_grad_reduction_hook_(ddp, mesh, ddp_group="dp")
 ```
 
 The hook performs DDP-style averaging over `ddp_group`, then applies sum
-all-reduces for attached `ParamSpec.reduce` groups.
+all-reduces for concrete native or DDP-backed attached gradient obligations.
+Concrete `grad=sp1-sp2:ddp` obligations are executed by this hook, while bare
+pending `grad=ddp` obligations are rejected until finalized. External obligations
+are not executed by this path.
 
 For buckets where every parameter has the same extra reduction metadata, the
 hook can combine DDP averaging and the extra reduction into one all-reduce over a
@@ -78,15 +355,15 @@ es.register_grad_reduction_hook_(
 This is equivalent to summing the bucket over `dp-sp1-sp2` and then dividing by
 the `dp` group size. It avoids a separate `dp` all-reduce followed by an
 `sp1-sp2` all-reduce. The fast path is used only when all parameters in a bucket
-have exactly `reduce=("sp1-sp2",)`. Mixed buckets fall back to the
-per-parameter-spec reductions.
+have compatible native or DDP-backed `ParameterState.grad_comm` reductions. Mixed
+buckets fall back to per-parameter reductions.
 
 ## Shard Metadata
 
-Parameter specs can derive checkpoint/test-copy shard metadata:
+Parameter states can derive checkpoint/test-copy shard metadata:
 
 ```python
-metadata = es.param_shard_metadata(weight_spec, global_shape=(1024, 2048), mesh=mesh)
+metadata = es.param_shard_metadata(state, global_shape=(1024, 2048), mesh=mesh)
 local_slices = metadata.local_slices
 local_shape = metadata.local_shape
 ```
@@ -98,7 +375,7 @@ helpers support single mesh dimensions and compound names such as `dp-sp` via
 
 ```python
 local_slices = es.param_local_slices(
-    es.ParamSpec("height/sp1 width/sp2"),
+    es.ParameterState.from_layout("height/sp1 width/sp2"),
     global_shape=(721, 1440),
     mesh=mesh,
     factors={"height": 4, "width": 4},

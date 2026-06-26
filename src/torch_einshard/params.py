@@ -1,14 +1,16 @@
-from dataclasses import dataclass, field
+from collections.abc import Mapping
+from dataclasses import dataclass, field, replace
 
 import torch.distributed as dist
 import torch
 
 from .grammar import parse_sharding
 from .helpers import all_reduce, compute_split_shapes_for_factors
-from .sharding import AxisGroup, EllipsisAxis
+from .sharding import AxisGroup, EllipsisAxis, TensorAnnotation, TensorSpec
+from .symbolic import TensorState
 
 
-PARAM_SPEC_ATTR = "einshard_spec"
+PARAM_STATE_ATTR = "einshard_state"
 
 
 def _tuple(value):
@@ -32,6 +34,87 @@ def _duplicates(values):
     return result
 
 
+def _mesh_dim_components(name):
+    return {name, *name.split("-")}
+
+
+def _mesh_dims_components(names):
+    result = set()
+    for name in names:
+        result.update(_mesh_dim_components(name))
+    return result
+
+
+def _validate_mesh_group_components_unique(names, label):
+    for name in names:
+        components = tuple(name.split("-"))
+        if any(not component for component in components):
+            raise ValueError(f"Parameter {label} contains empty mesh dimensions: {name}")
+        if len(set(components)) != len(components):
+            raise ValueError(f"Parameter {label} contains repeated mesh dimensions: {name}")
+
+
+def _validate_mesh_groups_disjoint(names, label):
+    seen_components = set()
+    for name in names:
+        components = set(name.split("-"))
+        overlap = seen_components.intersection(components)
+        if overlap:
+            dims = ", ".join(sorted(overlap))
+            raise ValueError(f"Parameter {label} groups overlap on mesh dimensions: {dims}")
+        seen_components.update(components)
+
+
+def _mesh_group_components_only(name):
+    return set(name.split("-"))
+
+
+def _mesh_groups_components_only(names):
+    result = set()
+    for name in names:
+        result.update(_mesh_group_components_only(name))
+    return result
+
+
+def _validate_parameter_layout(layout_shard_dims, init_sync=None):
+    _validate_mesh_group_components_unique(layout_shard_dims, "layout")
+    seen_components = set()
+    for shard_dim in layout_shard_dims:
+        components = _mesh_dim_components(shard_dim)
+        overlap = seen_components.intersection(components)
+        if overlap:
+            dims = ", ".join(sorted(overlap))
+            raise ValueError(f"Parameter specs cannot shard multiple axes over the same mesh dimension: {dims}")
+        seen_components.update(components)
+
+    if init_sync is None or init_sync.mode in {"none", "external"} or not init_sync.mesh_dims:
+        return
+
+    shard_components = _mesh_dims_components(layout_shard_dims)
+    _validate_mesh_group_components_unique(init_sync.mesh_dims, "init_sync")
+    _validate_mesh_groups_disjoint(init_sync.mesh_dims, "init_sync")
+    for name in init_sync.mesh_dims:
+        overlap = shard_components.intersection(_mesh_dim_components(name))
+        if overlap:
+            dims = ", ".join(sorted(overlap))
+            raise ValueError(f"Parameter init_sync annotation overlaps with sharded axis dimensions: {dims}")
+
+
+def _validate_parameter_grad_comm(layout_shard_dims, grad_comm):
+    if grad_comm.mode == "none" or not grad_comm.mesh_dims:
+        return
+    _validate_mesh_group_components_unique(grad_comm.mesh_dims, "grad")
+    if grad_comm.backend == "external":
+        return
+    _validate_mesh_groups_disjoint(grad_comm.mesh_dims, "grad")
+    shard_components = _mesh_dims_components(layout_shard_dims)
+    for name in grad_comm.mesh_dims:
+        overlap = shard_components.intersection(_mesh_dim_components(name))
+        if overlap:
+            dims = ", ".join(sorted(overlap))
+            raise ValueError(f"Parameter grad annotation overlaps with sharded axis dimensions: {dims}")
+
+
 def _parse_axes(spec):
     input_spec, other, output_spec = parse_sharding(f"{spec} -> {spec}")
     if other is not None or input_spec.partials or output_spec.partials:
@@ -39,40 +122,428 @@ def _parse_axes(spec):
     return input_spec.axes
 
 
-@dataclass(frozen=True)
-class ParamSpec:
-    layout: str
-    shared: tuple[str, ...] = ()
-    reduce: tuple[str, ...] = ()
-    axes: object = field(init=False)
+def _tensor_state_or_none(spec, mesh_dim_names):
+    try:
+        return TensorState.from_spec(spec, mesh_dim_names=mesh_dim_names)
+    except ValueError:
+        return None
 
-    def __init__(self, layout, *, shared=(), reduce=()):
-        axes = _parse_axes(layout)
-        shared = _tuple(shared)
-        reduce = _tuple(reduce)
-        all_shard_dims = axes.all_shard_dims()
-        duplicate_shard_dims = _duplicates(all_shard_dims)
-        if duplicate_shard_dims:
-            dims = ", ".join(sorted(duplicate_shard_dims))
-            raise ValueError(f"Parameter specs cannot shard multiple axes over the same mesh dimension: {dims}")
-        shard_dims = set(all_shard_dims)
-        for name in shared:
-            overlap = shard_dims.intersection(name.split("-"))
-            if overlap:
-                dims = ", ".join(sorted(overlap))
-                raise ValueError(f"Shared parameter metadata overlaps with sharded axis dimensions: {dims}")
-        object.__setattr__(self, "layout", layout)
-        object.__setattr__(self, "axes", axes)
-        object.__setattr__(self, "shared", shared)
-        object.__setattr__(self, "reduce", reduce)
 
+def _flat_axes(spec):
+    axes = spec.axes if hasattr(spec, "axes") else spec
+    return axes.flat() if hasattr(axes, "flat") else axes
+
+
+def _axis_signature(axis):
+    if isinstance(axis, EllipsisAxis):
+        return ("ellipsis",)
+    if isinstance(axis, AxisGroup):
+        return ("group", tuple(_axis_signature(inner) for inner in axis.axes))
+    return ("axis", axis.name, axis.shard_dim)
+
+
+def _spec_layout_signature(spec):
+    return tuple(_axis_signature(axis) for axis in spec.axes)
+
+
+def _add_unique_mesh_dim(mesh_dims, name):
+    if name and name not in mesh_dims:
+        mesh_dims.append(name)
+
+
+def _mesh_dim_names_from(mesh=None, mesh_dim_names=()):
+    if mesh_dim_names is not None and not (isinstance(mesh_dim_names, tuple) and not mesh_dim_names):
+        names = _normalize_mesh_dim_names(mesh_dim_names)
+        _validate_mesh_dim_name_count(mesh, names)
+        _validate_mesh_dim_names_match_mesh(mesh, names)
+        return names
+    if mesh is None:
+        return ()
+    names = _normalize_mesh_dim_names(getattr(mesh, "mesh_dim_names", None))
+    _validate_mesh_dim_name_count(mesh, names)
+    return names
+
+
+def _normalize_mesh_dim_names(names):
+    if names is None:
+        return ()
+    if isinstance(names, str):
+        names = (names,)
+    elif isinstance(names, torch.Tensor) or (hasattr(names, "shape") and hasattr(names, "dtype")):
+        raise TypeError("mesh_dim_names must be an iterable of strings")
+    else:
+        try:
+            names = tuple(names)
+        except TypeError as error:
+            raise TypeError("mesh_dim_names must be an iterable of strings") from error
+    if any(not isinstance(name, str) for name in names):
+        raise TypeError("mesh_dim_names entries must be strings")
+    if any(not name for name in names):
+        raise ValueError("mesh_dim_names entries must be non-empty strings")
+    _validate_mesh_group_components_unique(names, "mesh_dim_names")
+    _validate_mesh_groups_disjoint(names, "mesh_dim_names")
+    duplicates = _duplicates(names)
+    if duplicates:
+        dims = ", ".join(duplicates)
+        raise ValueError(f"mesh_dim_names entries must be unique: {dims}")
+    return names
+
+
+def _validate_mesh_dim_name_count(mesh, names):
+    mesh_tensor = getattr(mesh, "mesh", None)
+    if mesh_tensor is None or not hasattr(mesh_tensor, "dim"):
+        return
+    if len(names) != mesh_tensor.dim():
+        raise ValueError("mesh_dim_names length must match mesh rank")
+
+
+def _validate_mesh_dim_names_match_mesh(mesh, names):
+    mesh_names = getattr(mesh, "mesh_dim_names", None)
+    if mesh_names is None:
+        return
+    mesh_names = _normalize_mesh_dim_names(mesh_names)
+    if names != mesh_names:
+        raise ValueError("mesh_dim_names must match mesh.mesh_dim_names")
+
+
+def _mesh_group_known(name, mesh_dim_names):
+    if name in mesh_dim_names:
+        return True
+    components = tuple(name.split("-"))
+    if len(set(components)) != len(components):
+        return False
+    if len(components) > 1 and all(component in mesh_dim_names for component in components):
+        return True
+    return False
+
+
+def _validate_known_mesh_groups(mesh_dim_names, groups, label):
+    if not mesh_dim_names or not groups:
+        return
+    missing = [
+        name for name in groups
+        if not _mesh_group_known(name, mesh_dim_names)
+    ]
+    if missing:
+        dims = ", ".join(missing)
+        raise ValueError(f"Parameter {label} references unknown mesh dimensions: {dims}")
+
+
+def _validate_known_layout_mesh_groups(mesh_dim_names, groups):
+    if not mesh_dim_names or not groups:
+        return
+    missing = [name for name in groups if not _mesh_group_known(name, mesh_dim_names)]
+    if missing:
+        dims = ", ".join(missing)
+        raise ValueError(f"Parameter layout references unknown mesh dimensions: {dims}")
+
+
+def _validate_parameter_mesh_groups(mesh_dim_names, layout_shard_dims, init_sync, grad_comm):
+    _validate_known_layout_mesh_groups(mesh_dim_names, layout_shard_dims)
+    if init_sync.mesh_dims:
+        _validate_known_mesh_groups(mesh_dim_names, init_sync.mesh_dims, "init_sync")
+    if grad_comm.mode != "none" and grad_comm.backend != "external":
+        _validate_known_mesh_groups(mesh_dim_names, grad_comm.mesh_dims, "grad")
+
+
+def _parameter_spec_from_layout(layout, *, grad=None, init_sync=None):
+    _validate_layout_value(layout)
+    items = []
+    if grad is not None:
+        _validate_annotation_value("grad", grad)
+        items.append(("grad", grad))
+    if init_sync is not None:
+        _validate_annotation_value("init_sync", init_sync)
+        items.append(("init_sync", init_sync))
+    annotation = TensorAnnotation.from_items(items) if items else None
+    axes = _parse_axes(layout)
+    _validate_explicit_layout_axes(axes)
+    return TensorSpec(axes, annotation=annotation)
+
+
+def _validate_layout_value(layout):
+    if not isinstance(layout, str):
+        raise TypeError("Parameter layout must be a string")
+
+
+def _validate_explicit_layout_axes(axes):
+    if any(isinstance(axis, AxisGroup) for axis in axes):
+        raise ValueError("Explicit parameter layouts cannot contain factored axes")
+
+
+def _validate_annotation_value(name, value):
+    if not isinstance(value, str):
+        raise TypeError(f"{name} must be a string annotation value")
+    parts = value.split(":")
+    if len(parts) > 2 or any(not part for part in parts):
+        raise ValueError(f"Invalid {name} annotation value {value!r}")
+    mesh_group = parts[0]
+    if any(not token or not token.isalnum() for token in mesh_group.split("-")):
+        raise ValueError(f"Invalid {name} annotation value {value!r}")
+    if len(parts) == 2 and not parts[1].isalnum():
+        raise ValueError(f"Invalid {name} annotation value {value!r}")
+
+
+def _axis_layout(axis):
+    if isinstance(axis, EllipsisAxis):
+        raise ValueError("Parameter layout helpers do not support ellipsis axes")
+    if isinstance(axis, AxisGroup):
+        raise NotImplementedError("Parameter layout helpers do not support factored-axis groups")
+    if axis.shard_dim:
+        return f"{axis.name}/{axis.shard_dim}"
+    return axis.name
+
+
+def _bias_layout_from_weight_layout(weight_layout):
+    _validate_layout_value(weight_layout)
+    axes = _parse_axes(weight_layout)
+    if not axes:
+        raise ValueError("Linear weight layout must contain at least one axis")
+    return _axis_layout(axes[0])
+
+
+def _validate_linear_bias_layout(weight_layout, bias_layout):
+    _validate_bias_layout_matches_first_axis(weight_layout, bias_layout, "Linear")
+
+
+def _validate_bias_layout_matches_first_axis(weight_layout, bias_layout, label):
+    _validate_layout_value(weight_layout)
+    _validate_layout_value(bias_layout)
+    weight_axes = _parse_axes(weight_layout)
+    bias_axes = _parse_axes(bias_layout)
+    if not weight_axes:
+        raise ValueError(f"{label} weight layout must contain at least one axis")
+    if len(bias_axes) != 1 or _axis_signature(bias_axes[0]) != _axis_signature(weight_axes[0]):
+        raise ValueError(f"{label} bias layout must match the first weight layout axis")
+
+
+def _validate_matching_layout(layout, other_layout, label):
+    _validate_layout_value(layout)
+    _validate_layout_value(other_layout)
+    axes = _parse_axes(layout)
+    other_axes = _parse_axes(other_layout)
+    if tuple(_axis_signature(axis) for axis in axes) != tuple(_axis_signature(axis) for axis in other_axes):
+        raise ValueError(f"{label} layout must match weight layout")
+
+
+def _parameter_attr(module, name):
+    param = getattr(module, name, None)
+    if param is None:
+        return None
+    if not isinstance(param, torch.nn.Parameter):
+        raise TypeError(f"module.{name} must be a torch.nn.Parameter")
+    return param
+
+
+def _module_parameter(module, name):
+    if not isinstance(name, str):
+        raise TypeError("Parameter names must be strings")
+    if not name:
+        raise ValueError("Parameter names must be non-empty")
+    try:
+        return module.get_parameter(name)
+    except AttributeError as error:
+        raise ValueError(f"module does not define parameter {name!r}") from error
+
+
+def _metadata_for_parameter(value, name):
+    if isinstance(value, Mapping):
+        return value.get(name)
+    return value
+
+
+def _validate_metadata_keys(value, names, label):
+    if not isinstance(value, Mapping):
+        return
+    unknown = sorted(set(value) - set(names), key=repr)
+    if unknown:
+        formatted = ", ".join(repr(name) for name in unknown)
+        raise ValueError(f"{label} metadata contains unknown parameter names: {formatted}")
+
+
+def _validate_parameter_state_rank(param, state):
+    if state.spec is None:
+        return
+    if hasattr(param, "ndim") and param.ndim != len(state.axes):
+        raise ValueError(
+            f"Parameter rank {param.ndim} does not match parameter layout rank {len(state.axes)}"
+        )
+
+
+def _validate_linear_parameter_shapes(weight, bias):
+    if weight.ndim != 2:
+        raise ValueError("Linear weight must be rank 2")
+    if bias is not None and bias.ndim != 1:
+        raise ValueError("Linear bias must be rank 1")
+    if bias is not None and weight.shape[0] != bias.shape[0]:
+        raise ValueError("Linear bias shape must match weight output dimension")
+
+
+def _default_conv_weight_layout(rank):
+    if rank == 3:
+        return "out in k"
+    if rank == 4:
+        return "out in kh kw"
+    if rank == 5:
+        return "out in kd kh kw"
+    raise ValueError("Conv weight must be rank 3, 4, or 5")
+
+
+def _validate_conv_parameter_shapes(module, weight, bias):
+    if isinstance(module, torch.nn.modules.conv._ConvTransposeNd):
+        raise NotImplementedError("ConvTranspose parameter registration is not supported")
+    if getattr(module, "groups", 1) != 1:
+        raise NotImplementedError("Conv parameter registration currently supports only groups=1")
+    if weight.ndim not in (3, 4, 5):
+        raise ValueError("Conv weight must be rank 3, 4, or 5")
+    if bias is not None and bias.ndim != 1:
+        raise ValueError("Conv bias must be rank 1")
+    if bias is not None and weight.shape[0] != bias.shape[0]:
+        raise ValueError("Conv bias shape must match weight output dimension")
+
+
+def _validate_norm_parameter_shapes(weight, bias):
+    if bias is not None and weight.shape != bias.shape:
+        raise ValueError("Norm bias shape must match weight shape")
+
+
+class _DefaultNormLayout:
     def __repr__(self):
-        args = [repr(self.layout)]
-        if self.shared:
-            args.append(f"shared={self.shared!r}")
-        if self.reduce:
-            args.append(f"reduce={self.reduce!r}")
-        return f"ParamSpec({', '.join(args)})"
+        return '"c"'
+
+
+_DEFAULT_NORM_LAYOUT = _DefaultNormLayout()
+
+
+@dataclass(frozen=True)
+class ParameterInitSync:
+    mode: str = "none"
+    mesh_dims: tuple[str, ...] = ()
+
+    @classmethod
+    def from_annotation(cls, annotation, layout_shard_dims, mesh_dim_names):
+        if annotation is not None:
+            if annotation.mode in {"none", "external"}:
+                return cls(mode=annotation.mode)
+            if annotation.mode == "explicit":
+                return cls(mode="explicit", mesh_dims=annotation.mesh_dims)
+
+        if not mesh_dim_names:
+            return cls(mode="none")
+        shard_dims = _mesh_dims_components(layout_shard_dims)
+        mesh_dims = tuple(
+            dim for dim in mesh_dim_names
+            if not _mesh_dim_components(dim).intersection(shard_dims)
+        )
+        return cls(mode="inferred", mesh_dims=mesh_dims)
+
+
+@dataclass(frozen=True)
+class ParameterGradComm:
+    mode: str = "none"
+    mesh_dims: tuple[str, ...] = ()
+    backend: str = "none"
+    schedule: str = "backend_default"
+
+    @classmethod
+    def from_annotation(cls, annotation, *, is_param=False):
+        if annotation is None:
+            if is_param:
+                return cls(mode="inferred", backend="native")
+            return cls()
+        return cls(
+            mode=annotation.mode,
+            mesh_dims=annotation.mesh_dims,
+            backend=annotation.backend,
+            schedule=annotation.schedule,
+        )
+
+    @property
+    def pending_inference(self):
+        return self.mode == "inferred" and not self.mesh_dims
+
+
+@dataclass(frozen=True)
+class ParameterState:
+    spec: TensorSpec | None
+    tensor_state: TensorState | None = None
+    layout_shard_dims: tuple[str, ...] = ()
+    mesh_dim_names: tuple[str, ...] = ()
+    init_sync: ParameterInitSync = field(default_factory=ParameterInitSync)
+    grad_comm: ParameterGradComm = field(default_factory=ParameterGradComm)
+    source: str = "inferred"
+    explicit_init_sync_none: bool = False
+    explicit_grad_comm_none: bool = False
+
+    @classmethod
+    def from_spec(cls, spec, *, mesh_dim_names=(), source="inferred"):
+        mesh_dim_names = _mesh_dim_names_from(mesh_dim_names=mesh_dim_names)
+        if getattr(spec, "partials", ()):
+            raise ValueError("Parameter states must contain only axis layout notation")
+        layout_shard_dims = tuple(spec.axes.all_shard_dims())
+        annotation = getattr(spec, "annotation", None)
+        is_param = bool(getattr(annotation, "is_param", False))
+        init_sync = ParameterInitSync.from_annotation(
+            getattr(annotation, "init_sync", None),
+            layout_shard_dims,
+            mesh_dim_names,
+        )
+        _validate_parameter_layout(layout_shard_dims, init_sync)
+        grad_comm = ParameterGradComm.from_annotation(getattr(annotation, "grad", None), is_param=is_param)
+        _validate_parameter_grad_comm(layout_shard_dims, grad_comm)
+        _validate_parameter_mesh_groups(mesh_dim_names, layout_shard_dims, init_sync, grad_comm)
+        init_sync_annotation = getattr(annotation, "init_sync", None)
+        grad_annotation = getattr(annotation, "grad", None)
+        return cls(
+            spec=spec,
+            tensor_state=_tensor_state_or_none(spec, mesh_dim_names),
+            layout_shard_dims=layout_shard_dims,
+            mesh_dim_names=mesh_dim_names,
+            init_sync=init_sync,
+            grad_comm=grad_comm,
+            source=source,
+            explicit_init_sync_none=init_sync_annotation is not None and init_sync_annotation.mode == "none",
+            explicit_grad_comm_none=grad_annotation is not None and grad_annotation.mode == "none",
+        )
+
+    @classmethod
+    def from_layout(
+        cls,
+        layout,
+        *,
+        mesh=None,
+        mesh_dim_names=(),
+        grad=None,
+        init_sync=None,
+        source="layout",
+    ):
+        spec = _parameter_spec_from_layout(layout, grad=grad, init_sync=init_sync)
+        state = cls.from_spec(
+            spec,
+            mesh_dim_names=_mesh_dim_names_from(mesh, mesh_dim_names),
+            source=source,
+        )
+        if state.tensor_state is None:
+            raise ValueError("Explicit parameter layouts must be representable as TensorState")
+        return state
+
+    @property
+    def axes(self):
+        if self.spec is None:
+            raise ValueError("ParameterState does not have an inferred parameter layout yet")
+        return self.spec.axes
+
+    @property
+    def shared(self):
+        if self.init_sync.mode in {"none", "external"}:
+            return ()
+        return self.init_sync.mesh_dims
+
+    @property
+    def reduce(self):
+        if self.grad_comm.mode == "none" or self.grad_comm.backend == "external":
+            return ()
+        return self.grad_comm.mesh_dims
 
 
 @dataclass(frozen=True)
@@ -81,6 +552,181 @@ class ParamShardMetadata:
     local_slices: tuple[slice, ...]
     local_shape: tuple[int, ...]
     shard_dims: tuple[str, ...]
+
+
+def _state_from_metadata(metadata):
+    if isinstance(metadata, ParameterState):
+        return metadata
+    raise TypeError("Parameter metadata must be a ParameterState")
+
+
+def _require_state(param_or_metadata):
+    if isinstance(param_or_metadata, ParameterState):
+        return _state_from_metadata(param_or_metadata)
+    state = get_parameter_state(param_or_metadata)
+    if state is None:
+        raise ValueError("Parameter does not have an attached ParameterState")
+    return state
+
+
+def _native_reduce_groups(state):
+    if state is None:
+        return ()
+    if state.grad_comm.pending_inference:
+        if state.grad_comm.backend in {"native", "ddp"}:
+            raise ValueError("Parameter gradient communication is still pending inference")
+        return ()
+    if state.grad_comm.mode == "none" or state.grad_comm.backend != "native":
+        return ()
+    return state.grad_comm.mesh_dims
+
+
+def _ddp_hook_reduce_groups(state):
+    if state is None:
+        return ()
+    if state.grad_comm.pending_inference:
+        if state.grad_comm.backend in {"native", "ddp"}:
+            raise ValueError("Parameter gradient communication is still pending inference")
+        return ()
+    if state.grad_comm.mode == "none" or state.grad_comm.backend not in {"native", "ddp"}:
+        return ()
+    return state.grad_comm.mesh_dims
+
+
+def _validation_grad_groups(state, *, allow_pending):
+    if state.grad_comm.pending_inference:
+        if state.grad_comm.backend in {"native", "ddp"} and not allow_pending:
+            raise ValueError("Parameter gradient communication is still pending inference")
+        return ()
+    if state.grad_comm.mode == "none" or state.grad_comm.backend == "external":
+        return ()
+    if state.grad_comm.backend in {"native", "ddp"}:
+        return state.grad_comm.mesh_dims
+    return ()
+
+
+def _validate_metadata_tuple(value, label):
+    if not isinstance(value, tuple):
+        raise TypeError(f"{label} must be a tuple of strings")
+    if any(not isinstance(item, str) for item in value):
+        raise TypeError(f"{label} entries must be strings")
+
+
+def _validate_parameter_init_sync_object(init_sync):
+    if not isinstance(init_sync, ParameterInitSync):
+        raise TypeError("ParameterState init_sync must be a ParameterInitSync")
+    _validate_metadata_tuple(init_sync.mesh_dims, "ParameterInitSync mesh_dims")
+    if init_sync.mode not in {"none", "external", "explicit", "inferred"}:
+        raise ValueError(f"Unknown ParameterInitSync mode {init_sync.mode!r}")
+    if init_sync.mode in {"none", "external"} and init_sync.mesh_dims:
+        raise ValueError("ParameterInitSync none/external modes cannot carry mesh_dims")
+    if init_sync.mode == "explicit" and not init_sync.mesh_dims:
+        raise ValueError("ParameterInitSync explicit mode requires mesh_dims")
+
+
+def _validate_parameter_grad_comm_object(grad_comm):
+    if not isinstance(grad_comm, ParameterGradComm):
+        raise TypeError("ParameterState grad_comm must be a ParameterGradComm")
+    _validate_metadata_tuple(grad_comm.mesh_dims, "ParameterGradComm mesh_dims")
+    if grad_comm.mode not in {"none", "inferred", "explicit"}:
+        raise ValueError(f"Unknown ParameterGradComm mode {grad_comm.mode!r}")
+    if grad_comm.backend not in {"none", "native", "ddp", "external"}:
+        raise ValueError(f"Unknown ParameterGradComm backend {grad_comm.backend!r}")
+    if grad_comm.schedule not in {"backend_default", "synchronous", "async"}:
+        raise ValueError(f"Unknown ParameterGradComm schedule {grad_comm.schedule!r}")
+    if grad_comm.mode == "none":
+        if grad_comm.backend != "none" or grad_comm.mesh_dims:
+            raise ValueError("ParameterGradComm none mode cannot carry backend or mesh_dims")
+    elif grad_comm.backend == "none":
+        raise ValueError("ParameterGradComm non-none modes require a backend")
+    if grad_comm.mode == "explicit" and not grad_comm.mesh_dims:
+        raise ValueError("ParameterGradComm explicit mode requires mesh_dims")
+    if grad_comm.backend != "native" and grad_comm.schedule != "backend_default":
+        raise ValueError("ParameterGradComm schedules other than backend_default require native backend")
+
+
+def _validate_parameter_state_object(state):
+    if not isinstance(state, ParameterState):
+        raise TypeError("Attached parameter metadata must be a ParameterState")
+    _validate_parameter_init_sync_object(state.init_sync)
+    _validate_parameter_grad_comm_object(state.grad_comm)
+    if state.spec is None:
+        _validate_metadata_tuple(state.layout_shard_dims, "ParameterState layout_shard_dims")
+        mesh_dim_names = _normalize_mesh_dim_names(state.mesh_dim_names)
+        if tuple(state.mesh_dim_names) != mesh_dim_names:
+            raise ValueError("ParameterState mesh_dim_names are malformed")
+        if state.tensor_state is not None:
+            raise ValueError("ParameterState without a layout cannot carry tensor_state")
+        if state.grad_comm.mode != "none":
+            raise ValueError("ParameterState without a layout cannot carry grad_comm")
+        if state.init_sync.mode == "inferred":
+            expected = ParameterInitSync.from_annotation(None, state.layout_shard_dims, mesh_dim_names).mesh_dims
+            if state.init_sync.mesh_dims != expected:
+                actual = ", ".join(state.init_sync.mesh_dims) or "<none>"
+                expected_text = ", ".join(expected) or "<none>"
+                raise ValueError(
+                    "ParameterState inferred init_sync mesh_dims "
+                    f"{actual} do not match sharding-derived mesh dims {expected_text}"
+                )
+        return
+    if getattr(state.spec, "partials", ()):
+        raise ValueError("Parameter states must contain only axis layout notation")
+    layout_shard_dims = tuple(state.spec.axes.all_shard_dims())
+    if tuple(state.layout_shard_dims) != layout_shard_dims:
+        raise ValueError("ParameterState layout_shard_dims do not match spec axes")
+    mesh_dim_names = _normalize_mesh_dim_names(state.mesh_dim_names)
+    if tuple(state.mesh_dim_names) != mesh_dim_names:
+        raise ValueError("ParameterState mesh_dim_names are malformed")
+    if state.init_sync.mode == "inferred":
+        expected = ParameterInitSync.from_annotation(None, layout_shard_dims, mesh_dim_names).mesh_dims
+        if state.init_sync.mesh_dims != expected:
+            actual = ", ".join(state.init_sync.mesh_dims) or "<none>"
+            expected_text = ", ".join(expected) or "<none>"
+            raise ValueError(
+                "ParameterState inferred init_sync mesh_dims "
+                f"{actual} do not match layout-derived mesh dims {expected_text}"
+            )
+
+
+def _validate_parameter_state_metadata(state):
+    _validate_parameter_state_object(state)
+    _validate_parameter_layout(state.layout_shard_dims, state.init_sync)
+    _validate_parameter_grad_comm(state.layout_shard_dims, state.grad_comm)
+    _validate_parameter_mesh_groups(state.mesh_dim_names, state.layout_shard_dims, state.init_sync, state.grad_comm)
+
+
+class NativeGradReductionHandle:
+    def __init__(self):
+        self._hooks = []
+        self._works = []
+
+    @property
+    def pending(self):
+        return len(self._works)
+
+    def _add_hook(self, hook):
+        self._hooks.append(hook)
+
+    def _add_work(self, work):
+        self._works.append(work)
+
+    def wait(self):
+        works = self._works
+        self._works = []
+        for index, work in enumerate(works):
+            try:
+                work.wait()
+            except Exception:
+                self._works = works[index:] + self._works
+                raise
+        return self
+
+    def remove(self):
+        self.wait()
+        for hook in self._hooks:
+            hook.remove()
+        self._hooks = []
+        return self
 
 
 def _group(mesh, name):
@@ -94,8 +740,138 @@ def _group(mesh, name):
         raise ValueError(f"Mesh does not contain parameter metadata group {name!r}") from error
 
 
-def sync_param_(param, spec, mesh):
-    for name in spec.shared:
+def _validate_mesh_groups_exist(mesh, names):
+    for name in names:
+        _group(mesh, name)
+
+
+def _validate_no_ddp_group_overlap(ddp_group, reduce_groups):
+    if ddp_group is None or not reduce_groups:
+        return
+    _validate_mesh_group_components_unique((ddp_group,), "ddp_group")
+    _validate_mesh_group_components_unique(reduce_groups, "grad")
+    ddp_components = _mesh_group_components_only(ddp_group)
+    for name in reduce_groups:
+        overlap = ddp_components.intersection(_mesh_group_components_only(name))
+        if overlap:
+            dims = ", ".join(sorted(overlap))
+            raise ValueError(f"Parameter gradient reduction groups overlap with ddp_group: {dims}")
+
+
+def _validate_combined_reduce_config(ddp_group, combined_reduce_group, combined_reduce):
+    if combined_reduce_group is None:
+        return
+    if ddp_group is None:
+        raise ValueError("combined_reduce_group requires a named ddp_group")
+    names = (ddp_group, combined_reduce_group, *combined_reduce)
+    _validate_mesh_group_components_unique(names, "combined_reduce")
+    _validate_mesh_groups_disjoint((ddp_group, *combined_reduce), "combined_reduce")
+    expected = _mesh_groups_components_only((ddp_group, *combined_reduce))
+    actual = _mesh_group_components_only(combined_reduce_group)
+    if actual != expected:
+        raise ValueError("combined_reduce_group must cover ddp_group and combined_reduce")
+
+
+def _init_sync_from_value(sync, layout_shard_dims, mesh_dim_names):
+    if sync is None:
+        return ParameterInitSync.from_annotation(None, layout_shard_dims, mesh_dim_names)
+    if not isinstance(sync, str):
+        mesh_dims = _tuple(sync)
+        for name in mesh_dims:
+            _validate_annotation_value("sync", name)
+        return ParameterInitSync(mode="explicit", mesh_dims=mesh_dims)
+    if sync in {"none", "external"}:
+        return ParameterInitSync(mode=sync)
+    _validate_annotation_value("sync", sync)
+    return ParameterInitSync(mode="explicit", mesh_dims=(sync,))
+
+
+def _init_parameter_state(*, sync, sharded, mesh_dim_names, source):
+    layout_shard_dims = _tuple(sharded)
+    _validate_known_layout_mesh_groups(mesh_dim_names, layout_shard_dims)
+    init_sync = _init_sync_from_value(sync, layout_shard_dims, mesh_dim_names)
+    _validate_parameter_layout(layout_shard_dims, init_sync)
+    _validate_parameter_mesh_groups(mesh_dim_names, layout_shard_dims, init_sync, ParameterGradComm())
+    return ParameterState(
+        spec=None,
+        layout_shard_dims=layout_shard_dims,
+        mesh_dim_names=mesh_dim_names,
+        init_sync=init_sync,
+        source=source,
+        explicit_init_sync_none=sync == "none",
+    )
+
+
+def init_param_(param, mesh, *, sync=None, sharded=(), mesh_dim_names=(), source="init"):
+    if not isinstance(param, torch.nn.Parameter):
+        raise TypeError("Parameter initialization requires a torch.nn.Parameter")
+    mesh_dim_names = _mesh_dim_names_from(mesh, mesh_dim_names)
+    state = _init_parameter_state(
+        sync=sync,
+        sharded=sharded,
+        mesh_dim_names=mesh_dim_names,
+        source=source,
+    )
+    if state.shared:
+        if mesh is None:
+            raise ValueError("Parameter initialization sync requires mesh")
+        _validate_mesh_groups_exist(mesh, state.shared)
+    register_parameter_state(param, state)
+    return sync_param_(param, get_parameter_state(param), mesh)
+
+
+def init_params_(module, mesh, *, sync=None, sharded=None, mesh_dim_names=(), source="init"):
+    if isinstance(module, torch.nn.Parameter):
+        return init_param_(
+            module,
+            mesh,
+            sync=sync,
+            sharded=() if sharded is None else sharded,
+            mesh_dim_names=mesh_dim_names,
+            source=source,
+        )
+    if not isinstance(module, torch.nn.Module):
+        raise TypeError("Parameter initialization requires a torch.nn.Module or torch.nn.Parameter")
+
+    named_params = tuple(module.named_parameters())
+    names = tuple(name for name, _ in named_params)
+    _validate_metadata_keys(sync, names, "sync")
+    _validate_metadata_keys(sharded, names, "sharded")
+    mesh_dim_names = _mesh_dim_names_from(mesh, mesh_dim_names)
+
+    updates = []
+    for name, param in named_params:
+        sharded_value = _metadata_for_parameter(sharded, name)
+        if sharded_value is None:
+            sharded_value = ()
+        updates.append((
+            param,
+            _init_parameter_state(
+                sync=_metadata_for_parameter(sync, name),
+                sharded=sharded_value,
+                mesh_dim_names=mesh_dim_names,
+                source=source,
+            ),
+        ))
+
+    prepared = _prepare_parameter_state_updates(updates)
+    for _, state in prepared:
+        _validate_parameter_state_metadata(state)
+    if mesh is None and any(state.shared for _, state in prepared):
+        raise ValueError("Parameter initialization sync requires mesh")
+    if mesh is not None:
+        for _, state in prepared:
+            _validate_mesh_groups_exist(mesh, state.shared)
+    for param, state in prepared:
+        set_parameter_state(param, state)
+    for param, state in prepared:
+        sync_param_(param, state, mesh)
+    return module
+
+
+def sync_param_(param, state, mesh):
+    state = _state_from_metadata(state)
+    for name in state.shared:
         group = _group(mesh, name)
         if dist.get_world_size(group) == 1:
             continue
@@ -103,42 +879,687 @@ def sync_param_(param, spec, mesh):
     return param
 
 
-def reduce_grad_(param, spec, mesh):
+def reduce_grad_(param, state, mesh):
     if param.grad is None:
         return param
-    for name in spec.reduce:
+    state = _state_from_metadata(state)
+    for name in _native_reduce_groups(state):
         param.grad = all_reduce(param.grad, _group(mesh, name))
     return param
 
 
-def set_param_spec(param, spec):
-    setattr(param, PARAM_SPEC_ATTR, spec)
+def set_parameter_state(param, state):
+    setattr(param, PARAM_STATE_ATTR, state)
     return param
 
 
-def get_param_spec(param):
-    return getattr(param, PARAM_SPEC_ATTR, None)
+def get_parameter_state(param):
+    return _parameter_state_from_attached_metadata(param)
 
 
-def iter_param_specs(module):
+def iter_parameter_states(module):
     for name, param in module.named_parameters():
-        spec = get_param_spec(param)
-        if spec is not None:
-            yield name, param, spec
+        state = get_parameter_state(param)
+        if state is not None:
+            yield name, param, state
 
 
-def _require_spec(param_or_spec):
-    if isinstance(param_or_spec, ParamSpec):
-        return param_or_spec
-    spec = get_param_spec(param_or_spec)
-    if spec is None:
-        raise ValueError("Parameter does not have an attached ParamSpec")
-    return spec
+def validate_module_parameter_states_(module, mesh=None, *, allow_pending=False):
+    for name, param in module.named_parameters():
+        state = _parameter_state_from_attached_metadata(param)
+        if state is None:
+            continue
+        try:
+            _validate_parameter_state_object(state)
+            _validate_parameter_state_rank(param, state)
+            _validate_parameter_layout(state.layout_shard_dims, state.init_sync)
+            _validate_parameter_grad_comm(state.layout_shard_dims, state.grad_comm)
+            _validate_parameter_mesh_groups(
+                state.mesh_dim_names,
+                state.layout_shard_dims,
+                state.init_sync,
+                state.grad_comm,
+            )
+            grad_groups = _validation_grad_groups(state, allow_pending=allow_pending)
+            if mesh is not None:
+                if state.mesh_dim_names:
+                    _validate_mesh_dim_names_match_mesh(mesh, state.mesh_dim_names)
+                _validate_mesh_groups_exist(mesh, (*state.layout_shard_dims, *state.shared, *grad_groups))
+        except (AttributeError, TypeError, ValueError) as error:
+            raise ValueError(f"Invalid parameter metadata for {name!r}: {error}") from error
+    return module
 
 
-def param_shard_dims(param_or_spec):
-    spec = _require_spec(param_or_spec)
-    return tuple(spec.axes.all_shard_dims())
+def _finalized_grad_comm_from_value(value):
+    _validate_annotation_value("grad", value)
+    annotation = TensorAnnotation.from_items((("grad", value),)).grad
+    grad_comm = ParameterGradComm.from_annotation(annotation)
+    if grad_comm.pending_inference or grad_comm.mode == "none":
+        raise ValueError("Finalized grad communication must use an explicit mesh group")
+    return grad_comm
+
+
+def _finalized_parameter_grad_state(state, grad, mesh_dim_names):
+    if not state.grad_comm.pending_inference:
+        raise ValueError("Parameter gradient communication is not pending inference")
+    grad_comm = _finalized_grad_comm_from_value(grad)
+    mesh_dim_names = mesh_dim_names or state.mesh_dim_names
+    _validate_parameter_grad_comm(state.layout_shard_dims, grad_comm)
+    _validate_parameter_mesh_groups(mesh_dim_names, state.layout_shard_dims, state.init_sync, grad_comm)
+    return replace(
+        state,
+        mesh_dim_names=mesh_dim_names,
+        grad_comm=grad_comm,
+        explicit_grad_comm_none=False,
+    )
+
+
+def _validate_finalized_grad_groups_exist(mesh, state):
+    if mesh is None or state.grad_comm.backend not in {"native", "ddp"}:
+        return
+    _validate_mesh_groups_exist(mesh, state.grad_comm.mesh_dims)
+
+
+def finalize_parameter_grad_comm_(param, grad, *, mesh=None, mesh_dim_names=()):
+    if not isinstance(param, torch.nn.Parameter):
+        raise TypeError("Parameter grad finalization requires a torch.nn.Parameter")
+    state = _parameter_state_from_attached_metadata(param)
+    if state is None:
+        raise ValueError("Parameter does not have an attached ParameterState")
+    mesh_dim_names = _mesh_dim_names_from(mesh, mesh_dim_names)
+    finalized = _finalized_parameter_grad_state(state, grad, mesh_dim_names)
+    _validate_finalized_grad_groups_exist(mesh, finalized)
+    return register_parameter_state(param, finalized)
+
+
+def finalize_module_parameter_grad_comm_(module, grad, *, mesh=None, mesh_dim_names=()):
+    if not isinstance(grad, Mapping):
+        raise TypeError("grad finalization must be a mapping from parameter names to grad policies")
+    if not grad:
+        raise ValueError("grad finalization mapping must not be empty")
+    mesh_dim_names = _mesh_dim_names_from(mesh, mesh_dim_names)
+    updates = []
+    for name, value in grad.items():
+        param = _module_parameter(module, name)
+        state = _parameter_state_from_attached_metadata(param)
+        if state is None:
+            raise ValueError(f"module parameter {name!r} does not have attached ParameterState")
+        finalized = _finalized_parameter_grad_state(state, value, mesh_dim_names)
+        _validate_finalized_grad_groups_exist(mesh, finalized)
+        updates.append((param, finalized))
+
+    prepared = _prepare_parameter_state_updates(updates)
+    for param, state in prepared:
+        set_parameter_state(param, state)
+    return module
+
+
+def _compatible_init_sync(existing, state):
+    if existing == state:
+        return True
+    if existing.mode in {"none", "external"} or state.mode in {"none", "external"}:
+        return False
+    return existing.mesh_dims == state.mesh_dims
+
+
+def _merge_grad_schedule(existing, new):
+    if existing.schedule == new.schedule:
+        return existing.schedule
+    if existing.schedule == "backend_default":
+        return new.schedule
+    if new.schedule == "backend_default":
+        return existing.schedule
+    raise ValueError("Parameter is already registered with incompatible metadata")
+
+
+def _merge_non_none_grad_comm(existing, new):
+    if existing.backend != new.backend:
+        raise ValueError("Parameter is already registered with incompatible metadata")
+    schedule = _merge_grad_schedule(existing, new)
+    if existing.pending_inference and new.pending_inference:
+        return replace(existing, schedule=schedule)
+    if existing.pending_inference or new.pending_inference:
+        concrete = new if existing.pending_inference else existing
+        pending = existing if existing.pending_inference else new
+        if concrete.mode == "explicit":
+            return replace(concrete, schedule=schedule)
+        return replace(pending, schedule=schedule)
+    if existing.mesh_dims != new.mesh_dims:
+        raise ValueError("Parameter is already registered with incompatible metadata")
+    return replace(existing, schedule=schedule)
+
+
+def _parameter_state_from_attached_metadata(param):
+    return getattr(param, PARAM_STATE_ATTR, None)
+
+
+def _explicit_init_sync_none(state):
+    if getattr(state, "explicit_init_sync_none", False):
+        return True
+    annotation = getattr(state.spec, "annotation", None)
+    init_sync = getattr(annotation, "init_sync", None)
+    return init_sync is not None and init_sync.mode == "none"
+
+
+def _explicit_grad_comm_none(state):
+    if getattr(state, "explicit_grad_comm_none", False):
+        return True
+    annotation = getattr(state.spec, "annotation", None)
+    grad = getattr(annotation, "grad", None)
+    return grad is not None and grad.mode == "none"
+
+
+def _merge_init_sync(existing_state, state):
+    existing = existing_state.init_sync
+    new = state.init_sync
+    if _explicit_init_sync_none(state):
+        if existing.mode != "none":
+            raise ValueError("Parameter is already registered with incompatible metadata")
+        return existing
+    if new.mode == "none":
+        return existing
+    if new.mode == "inferred" and existing.mode != "none":
+        return existing
+    if existing.mode == "none":
+        if _explicit_init_sync_none(existing_state):
+            raise ValueError("Parameter is already registered with incompatible metadata")
+        return new
+    if not _compatible_init_sync(existing, new):
+        raise ValueError("Parameter is already registered with incompatible metadata")
+    return existing
+
+
+def _merge_grad_comm(existing_state, state):
+    existing = existing_state.grad_comm
+    new = state.grad_comm
+    if _explicit_grad_comm_none(state):
+        if existing.mode != "none":
+            raise ValueError("Parameter is already registered with incompatible metadata")
+        return existing
+    if new.mode == "none":
+        return existing
+    if existing.mode == "none":
+        if _explicit_grad_comm_none(existing_state):
+            raise ValueError("Parameter is already registered with incompatible metadata")
+        return new
+    return _merge_non_none_grad_comm(existing, new)
+
+
+def _merged_source(existing, state):
+    return existing.source
+
+
+def _merge_tensor_state(existing, state):
+    if state.tensor_state is None:
+        return existing.tensor_state
+    if existing.tensor_state is None:
+        return state.tensor_state
+    if len(state.tensor_state.replicated_dims) > len(existing.tensor_state.replicated_dims):
+        return state.tensor_state
+    return existing.tensor_state
+
+
+def _merge_mesh_dim_names(existing, state):
+    if not existing.mesh_dim_names:
+        return state.mesh_dim_names
+    if not state.mesh_dim_names:
+        return existing.mesh_dim_names
+    if existing.mesh_dim_names != state.mesh_dim_names:
+        raise ValueError("Parameter is already registered with incompatible mesh_dim_names")
+    return existing.mesh_dim_names
+
+
+def _merge_parameter_state(existing, state):
+    if existing is None:
+        return state
+    if (
+        existing.spec is not None
+        and state.spec is not None
+        and _spec_layout_signature(existing.spec) != _spec_layout_signature(state.spec)
+    ):
+        raise ValueError("Parameter is already registered with a different layout")
+    if existing.spec is None and state.spec is not None and existing.layout_shard_dims:
+        existing_components = _mesh_dims_components(existing.layout_shard_dims)
+        state_components = _mesh_dims_components(state.layout_shard_dims)
+        if existing_components != state_components:
+            raise ValueError("Parameter is already registered with a different sharded mesh footprint")
+    if existing.spec is not None and state.spec is None and state.layout_shard_dims:
+        existing_components = _mesh_dims_components(existing.layout_shard_dims)
+        state_components = _mesh_dims_components(state.layout_shard_dims)
+        if existing_components != state_components:
+            raise ValueError("Parameter is already registered with a different sharded mesh footprint")
+    if existing.spec is None and state.spec is None and existing.layout_shard_dims and state.layout_shard_dims:
+        existing_components = _mesh_dims_components(existing.layout_shard_dims)
+        state_components = _mesh_dims_components(state.layout_shard_dims)
+        if existing_components != state_components:
+            raise ValueError("Parameter is already registered with a different sharded mesh footprint")
+    init_sync = _merge_init_sync(existing, state)
+    grad_comm = _merge_grad_comm(existing, state)
+    tensor_state = _merge_tensor_state(existing, state)
+    mesh_dim_names = _merge_mesh_dim_names(existing, state)
+    if state.spec is not None or not existing.layout_shard_dims:
+        layout_shard_dims = state.layout_shard_dims
+    else:
+        layout_shard_dims = existing.layout_shard_dims
+    spec = state.spec if state.spec is not None else existing.spec
+    _validate_parameter_layout(layout_shard_dims, init_sync)
+    _validate_parameter_grad_comm(layout_shard_dims, grad_comm)
+    _validate_parameter_mesh_groups(mesh_dim_names, layout_shard_dims, init_sync, grad_comm)
+    source = _merged_source(existing, state)
+    explicit_init_sync_none = _explicit_init_sync_none(existing) or _explicit_init_sync_none(state)
+    explicit_grad_comm_none = _explicit_grad_comm_none(existing) or _explicit_grad_comm_none(state)
+    if (
+        spec == existing.spec
+        and tuple(layout_shard_dims) == tuple(existing.layout_shard_dims)
+        and init_sync == existing.init_sync
+        and grad_comm == existing.grad_comm
+        and tensor_state == existing.tensor_state
+        and mesh_dim_names == existing.mesh_dim_names
+        and source == existing.source
+        and explicit_init_sync_none == existing.explicit_init_sync_none
+        and explicit_grad_comm_none == existing.explicit_grad_comm_none
+    ):
+        return existing
+    return replace(
+        existing,
+        spec=spec,
+        tensor_state=tensor_state,
+        layout_shard_dims=layout_shard_dims,
+        mesh_dim_names=mesh_dim_names,
+        init_sync=init_sync,
+        grad_comm=grad_comm,
+        source=source,
+        explicit_init_sync_none=explicit_init_sync_none,
+        explicit_grad_comm_none=explicit_grad_comm_none,
+    )
+
+
+def register_parameter_state(param, state):
+    _validate_parameter_state_metadata(state)
+    existing = _parameter_state_from_attached_metadata(param)
+    if existing is not None:
+        _validate_parameter_state_metadata(existing)
+    merged = _merge_parameter_state(existing, state)
+    _validate_parameter_state_metadata(merged)
+    return set_parameter_state(param, merged)
+
+
+def register_parameter_layout(
+    param,
+    layout,
+    *,
+    mesh=None,
+    mesh_dim_names=(),
+    grad=None,
+    init_sync=None,
+    source="layout",
+):
+    if not isinstance(param, torch.nn.Parameter):
+        raise TypeError("Parameter layout registration requires a torch.nn.Parameter")
+    state = ParameterState.from_layout(
+        layout,
+        mesh=mesh,
+        mesh_dim_names=mesh_dim_names,
+        grad=grad,
+        init_sync=init_sync,
+        source=source,
+    )
+    _validate_parameter_state_rank(param, state)
+    return register_parameter_state(param, state)
+
+
+def _prepare_parameter_state_updates(updates):
+    merged_by_id = {}
+    params_by_id = {}
+    for param, state in updates:
+        _validate_parameter_state_rank(param, state)
+        key = id(param)
+        if key in merged_by_id:
+            existing = merged_by_id[key]
+        else:
+            existing = _parameter_state_from_attached_metadata(param)
+        merged_by_id[key] = _merge_parameter_state(existing, state)
+        params_by_id[key] = param
+    return [(params_by_id[key], state) for key, state in merged_by_id.items()]
+
+
+def register_module_parameter_layouts_(
+    module,
+    layouts,
+    *,
+    mesh=None,
+    mesh_dim_names=(),
+    grad=None,
+    init_sync=None,
+    source="module",
+):
+    if not isinstance(layouts, Mapping):
+        raise TypeError("Parameter layouts must be a mapping from parameter name to layout")
+    if not layouts:
+        raise ValueError("Parameter layouts mapping must not be empty")
+
+    names = tuple(layouts)
+    _validate_metadata_keys(grad, names, "grad")
+    _validate_metadata_keys(init_sync, names, "init_sync")
+    mesh_dim_names = _mesh_dim_names_from(mesh, mesh_dim_names)
+
+    updates = []
+    for name, layout in layouts.items():
+        param = _module_parameter(module, name)
+        updates.append((
+            param,
+            ParameterState.from_layout(
+                layout,
+                mesh_dim_names=mesh_dim_names,
+                grad=_metadata_for_parameter(grad, name),
+                init_sync=_metadata_for_parameter(init_sync, name),
+                source=source,
+            ),
+        ))
+
+    prepared = _prepare_parameter_state_updates(updates)
+    for param, state in prepared:
+        set_parameter_state(param, state)
+    return module
+
+
+def register_linear_parameters_(
+    module,
+    *,
+    weight_layout="out in",
+    bias_layout=None,
+    mesh=None,
+    mesh_dim_names=(),
+    weight_grad=None,
+    bias_grad=None,
+    init_sync=None,
+    weight_init_sync=None,
+    bias_init_sync=None,
+    source="linear",
+):
+    mesh_dim_names = _mesh_dim_names_from(mesh, mesh_dim_names)
+    weight = _parameter_attr(module, "weight")
+    if weight is None:
+        raise ValueError("module must define a weight parameter")
+
+    explicit_bias_metadata = bias_layout is not None or bias_grad is not None or bias_init_sync is not None
+    weight_init_sync = init_sync if weight_init_sync is None else weight_init_sync
+    bias_init_sync = init_sync if bias_init_sync is None else bias_init_sync
+    updates = [(
+        weight,
+        ParameterState.from_layout(
+            weight_layout,
+            mesh_dim_names=mesh_dim_names,
+            grad=weight_grad,
+            init_sync=weight_init_sync,
+            source=source,
+        ),
+    )]
+
+    bias = _parameter_attr(module, "bias")
+    if bias is None and explicit_bias_metadata:
+        raise ValueError("module does not define a bias parameter")
+    _validate_linear_parameter_shapes(weight, bias)
+    if bias is not None:
+        if bias_layout is None:
+            bias_layout = _bias_layout_from_weight_layout(weight_layout)
+        else:
+            _validate_linear_bias_layout(weight_layout, bias_layout)
+        updates.append((
+            bias,
+            ParameterState.from_layout(
+                bias_layout,
+                mesh_dim_names=mesh_dim_names,
+                grad=bias_grad,
+                init_sync=bias_init_sync,
+                source=source,
+            ),
+        ))
+
+    prepared = _prepare_parameter_state_updates(updates)
+    for param, state in prepared:
+        set_parameter_state(param, state)
+    return module
+
+
+def register_conv_parameters_(
+    module,
+    *,
+    weight_layout=None,
+    bias_layout=None,
+    mesh=None,
+    mesh_dim_names=(),
+    grad=None,
+    weight_grad=None,
+    bias_grad=None,
+    init_sync=None,
+    weight_init_sync=None,
+    bias_init_sync=None,
+    source="conv",
+):
+    mesh_dim_names = _mesh_dim_names_from(mesh, mesh_dim_names)
+    explicit_bias_metadata = bias_layout is not None or bias_grad is not None or bias_init_sync is not None
+    weight_grad = grad if weight_grad is None else weight_grad
+    bias_grad = grad if bias_grad is None else bias_grad
+    weight_init_sync = init_sync if weight_init_sync is None else weight_init_sync
+    bias_init_sync = init_sync if bias_init_sync is None else bias_init_sync
+
+    weight = _parameter_attr(module, "weight")
+    if weight is None:
+        raise ValueError("module must define a weight parameter")
+    bias = _parameter_attr(module, "bias")
+    if bias is None and explicit_bias_metadata:
+        raise ValueError("module does not define a bias parameter")
+    _validate_conv_parameter_shapes(module, weight, bias)
+
+    if weight_layout is None:
+        weight_layout = _default_conv_weight_layout(weight.ndim)
+
+    updates = [(
+        weight,
+        ParameterState.from_layout(
+            weight_layout,
+            mesh_dim_names=mesh_dim_names,
+            grad=weight_grad,
+            init_sync=weight_init_sync,
+            source=source,
+        ),
+    )]
+
+    if bias is not None:
+        if bias_layout is None:
+            bias_layout = _bias_layout_from_weight_layout(weight_layout)
+        else:
+            _validate_bias_layout_matches_first_axis(weight_layout, bias_layout, "Conv")
+        updates.append((
+            bias,
+            ParameterState.from_layout(
+                bias_layout,
+                mesh_dim_names=mesh_dim_names,
+                grad=bias_grad,
+                init_sync=bias_init_sync,
+                source=source,
+            ),
+        ))
+
+    prepared = _prepare_parameter_state_updates(updates)
+    for param, state in prepared:
+        set_parameter_state(param, state)
+    return module
+
+
+def register_norm_parameters_(
+    module,
+    *,
+    layout=_DEFAULT_NORM_LAYOUT,
+    weight_layout=None,
+    bias_layout=None,
+    mesh=None,
+    mesh_dim_names=(),
+    grad=None,
+    weight_grad=None,
+    bias_grad=None,
+    init_sync=None,
+    weight_init_sync=None,
+    bias_init_sync=None,
+    source="norm",
+):
+    mesh_dim_names = _mesh_dim_names_from(mesh, mesh_dim_names)
+    explicit_bias_metadata = bias_layout is not None or bias_grad is not None or bias_init_sync is not None
+    layout_omitted = layout is _DEFAULT_NORM_LAYOUT
+    layout = "c" if layout_omitted else layout
+    if weight_layout is None:
+        weight_layout = layout
+    elif not layout_omitted:
+        _validate_matching_layout(layout, weight_layout, "Norm weight")
+    weight_grad = grad if weight_grad is None else weight_grad
+    bias_grad = grad if bias_grad is None else bias_grad
+    weight_init_sync = init_sync if weight_init_sync is None else weight_init_sync
+    bias_init_sync = init_sync if bias_init_sync is None else bias_init_sync
+
+    weight = _parameter_attr(module, "weight")
+    if weight is None:
+        raise ValueError("module must define a weight parameter")
+
+    updates = [(
+        weight,
+        ParameterState.from_layout(
+            weight_layout,
+            mesh_dim_names=mesh_dim_names,
+            grad=weight_grad,
+            init_sync=weight_init_sync,
+            source=source,
+        ),
+    )]
+
+    bias = _parameter_attr(module, "bias")
+    if bias is None and explicit_bias_metadata:
+        raise ValueError("module does not define a bias parameter")
+    _validate_norm_parameter_shapes(weight, bias)
+    if bias is not None:
+        if bias_layout is None:
+            bias_layout = weight_layout
+        else:
+            _validate_matching_layout(weight_layout, bias_layout, "Norm bias")
+        updates.append((
+            bias,
+            ParameterState.from_layout(
+                bias_layout,
+                mesh_dim_names=mesh_dim_names,
+                grad=bias_grad,
+                init_sync=bias_init_sync,
+                source=source,
+            ),
+        ))
+
+    prepared = _prepare_parameter_state_updates(updates)
+    for param, state in prepared:
+        set_parameter_state(param, state)
+    return module
+
+
+def _infer_parameter_grad_mesh_dims(input_specs, output_spec, operand_index, *, include_axes=True):
+    param_spec = input_specs[operand_index]
+    param_axis_names = {
+        axis.name
+        for axis in _flat_axes(param_spec)
+        if not isinstance(axis, EllipsisAxis)
+    }
+    mesh_dims = []
+
+    if include_axes:
+        for spec in (*input_specs[:operand_index], *input_specs[operand_index + 1:], output_spec):
+            for axis in _flat_axes(spec):
+                if isinstance(axis, EllipsisAxis) or axis.name in param_axis_names:
+                    continue
+                _add_unique_mesh_dim(mesh_dims, axis.shard_dim)
+
+    for partial in getattr(output_spec, "partials", ()):  # incoming output gradients preserve partial obligations
+        _add_unique_mesh_dim(mesh_dims, partial)
+
+    return tuple(mesh_dims)
+
+
+def _with_inferred_parameter_grad_comm(
+    state,
+    input_specs,
+    output_spec,
+    operand_index,
+    *,
+    include_axes=True,
+    mesh_dim_names=(),
+):
+    grad_comm = state.grad_comm
+    if not grad_comm.pending_inference:
+        return state
+
+    mesh_dims = _infer_parameter_grad_mesh_dims(
+        input_specs,
+        output_spec,
+        operand_index,
+        include_axes=include_axes,
+    )
+    if not mesh_dims:
+        grad_comm = ParameterGradComm()
+    else:
+        grad_comm = replace(grad_comm, mesh_dims=mesh_dims)
+    _validate_parameter_grad_comm(state.layout_shard_dims, grad_comm)
+    _validate_parameter_mesh_groups(mesh_dim_names, state.layout_shard_dims, state.init_sync, grad_comm)
+    return replace(state, grad_comm=grad_comm)
+
+
+def parameter_operand_state(
+    param,
+    input_specs,
+    output_spec,
+    operand_index,
+    *,
+    mesh_dim_names=(),
+    source="formula",
+    infer_grad=True,
+):
+    if not isinstance(param, torch.nn.Parameter):
+        raise TypeError("Annotated parameter operands must be torch.nn.Parameter instances")
+    mesh_dim_names = _mesh_dim_names_from(mesh_dim_names=mesh_dim_names)
+    spec = input_specs[operand_index]
+    state = ParameterState.from_spec(spec, mesh_dim_names=mesh_dim_names, source=source)
+    if not infer_grad:
+        return state
+    return _with_inferred_parameter_grad_comm(
+        state,
+        input_specs,
+        output_spec,
+        operand_index,
+        include_axes=infer_grad != "partials",
+        mesh_dim_names=mesh_dim_names,
+    )
+
+
+def register_parameter_operand(
+    param,
+    input_specs,
+    output_spec,
+    operand_index,
+    *,
+    mesh_dim_names=(),
+    source="formula",
+    infer_grad=True,
+):
+    state = parameter_operand_state(
+        param,
+        input_specs,
+        output_spec,
+        operand_index,
+        mesh_dim_names=mesh_dim_names,
+        source=source,
+        infer_grad=infer_grad,
+    )
+    return register_parameter_state(param, state)
+
+
+def param_shard_dims(param_or_state):
+    state = _require_state(param_or_state)
+    return state.layout_shard_dims
 
 
 def _mesh_rank_and_size(mesh, shard_dim):
@@ -190,16 +1611,17 @@ def _factor_for(axis, factors):
     return int(factors.get(name, 1))
 
 
-def param_local_slices(param_or_spec, global_shape, mesh, factors=None):
-    spec = _require_spec(param_or_spec)
+def param_local_slices(param_or_state, global_shape, mesh, factors=None):
+    state = _require_state(param_or_state)
+    axes = state.axes
     global_shape = tuple(int(size) for size in global_shape)
-    if len(global_shape) != len(spec.axes):
+    if len(global_shape) != len(axes):
         raise ValueError(
-            f"Global shape rank {len(global_shape)} does not match ParamSpec rank {len(spec.axes)}"
+            f"Global shape rank {len(global_shape)} does not match parameter metadata rank {len(axes)}"
         )
 
     slices = []
-    for axis, size in zip(spec.axes, global_shape):
+    for axis, size in zip(axes, global_shape):
         shard_dim = _axis_shard_dim(axis)
         if not shard_dim:
             slices.append(slice(None))
@@ -212,8 +1634,8 @@ def param_local_slices(param_or_spec, global_shape, mesh, factors=None):
     return tuple(slices)
 
 
-def param_local_shape(param_or_spec, global_shape, mesh, factors=None):
-    slices = param_local_slices(param_or_spec, global_shape, mesh, factors=factors)
+def param_local_shape(param_or_state, global_shape, mesh, factors=None):
+    slices = param_local_slices(param_or_state, global_shape, mesh, factors=factors)
     return _shape_from_slices(global_shape, slices)
 
 
@@ -226,32 +1648,74 @@ def _shape_from_slices(global_shape, slices):
     return tuple(shape)
 
 
-def param_shard_metadata(param_or_spec, global_shape, mesh, factors=None):
-    spec = _require_spec(param_or_spec)
+def param_shard_metadata(param_or_state, global_shape, mesh, factors=None):
+    state = _require_state(param_or_state)
     global_shape = tuple(int(size) for size in global_shape)
-    local_slices = param_local_slices(spec, global_shape, mesh, factors=factors)
+    local_slices = param_local_slices(state, global_shape, mesh, factors=factors)
     return ParamShardMetadata(
         global_shape=global_shape,
         local_slices=local_slices,
         local_shape=_shape_from_slices(global_shape, local_slices),
-        shard_dims=param_shard_dims(spec),
+        shard_dims=param_shard_dims(state),
     )
 
 
 def sync_module_params_(module, mesh):
     for param in module.parameters():
-        spec = get_param_spec(param)
-        if spec is not None:
-            sync_param_(param, spec, mesh)
+        state = get_parameter_state(param)
+        if state is not None:
+            sync_param_(param, state, mesh)
     return module
 
 
 def reduce_module_grads_(module, mesh):
     for param in module.parameters():
-        spec = get_param_spec(param)
-        if spec is not None:
-            reduce_grad_(param, spec, mesh)
+        state = get_parameter_state(param)
+        if state is not None:
+            reduce_grad_(param, state, mesh)
     return module
+
+
+def register_native_grad_reduction_hooks_(module, mesh):
+    """Register native per-parameter gradient reductions.
+
+    Every registered parameter must participate in backward in the same order on
+    every rank. Use the DDP communication hook or an external backend for models
+    with rank-dependent control flow or unused parameters.
+    """
+    handle = NativeGradReductionHandle()
+    hook_specs = []
+
+    for param in module.parameters():
+        state = _parameter_state_from_attached_metadata(param)
+        if state is None:
+            continue
+
+        if state.grad_comm.backend != "native":
+            continue
+
+        groups = tuple((name, _group(mesh, name)) for name in _native_reduce_groups(state))
+        if not groups:
+            continue
+
+        if not param.requires_grad:
+            raise ValueError("Cannot register gradient reduction hook for a parameter that does not require gradients")
+        hook_specs.append((param, groups))
+
+    try:
+        for param, groups in hook_specs:
+            def hook(grad, *, groups=groups):
+                for _, group in groups:
+                    if dist.get_world_size(group) > 1:
+                        grad = all_reduce(grad, group)
+                return grad
+
+            handle._add_hook(param.register_hook(hook))
+    except Exception:
+        handle.remove()
+        raise
+
+    return handle
 
 
 def register_grad_reduction_hook_(
@@ -264,6 +1728,21 @@ def register_grad_reduction_hook_(
     combined_reduce = _tuple(combined_reduce)
     if combined_reduce_group is not None and not combined_reduce:
         raise ValueError("combined_reduce must be provided with combined_reduce_group")
+    if combined_reduce and combined_reduce_group is None:
+        raise ValueError("combined_reduce_group must be provided with combined_reduce")
+    _validate_combined_reduce_config(ddp_group, combined_reduce_group, combined_reduce)
+    if ddp_group is not None:
+        _validate_mesh_groups_exist(mesh, (ddp_group,))
+    if combined_reduce_group is not None:
+        _validate_mesh_groups_exist(mesh, (combined_reduce_group,))
+        _validate_mesh_groups_exist(mesh, combined_reduce)
+
+    for param in ddp_model.parameters():
+        state = _parameter_state_from_attached_metadata(param)
+        if state is not None:
+            reduce_groups = _ddp_hook_reduce_groups(state)
+            _validate_no_ddp_group_overlap(ddp_group, reduce_groups)
+            _validate_mesh_groups_exist(mesh, reduce_groups)
 
     def bucket_views(bucket):
         offset = 0
@@ -271,7 +1750,7 @@ def register_grad_reduction_hook_(
         buffer = bucket.buffer()
         for param in bucket.parameters():
             view = buffer.narrow(0, offset, param.numel()).view_as(param)
-            views.append((param, view, get_param_spec(param)))
+            views.append((param, view, get_parameter_state(param)))
             offset += param.numel()
         return views
 
@@ -281,22 +1760,22 @@ def register_grad_reduction_hook_(
         if not views:
             return False
         expected = set(combined_reduce)
-        for _, _, spec in views:
-            if spec is None or set(spec.reduce) != expected:
+        for _, _, state in views:
+            if state is None or set(_ddp_hook_reduce_groups(state)) != expected:
                 return False
         return True
 
-    def reduce_by_param_specs(buffer, views):
+    def reduce_by_parameter_states(buffer, views):
         groups = sorted({
             name
-            for _, _, spec in views
-            for name in (spec.reduce if spec is not None else ())
+            for _, _, state in views
+            for name in _ddp_hook_reduce_groups(state)
         })
         for name in groups:
             grad_views = [
                 view
-                for _, view, spec in views
-                if spec is not None and name in spec.reduce
+                for _, view, state in views
+                if name in _ddp_hook_reduce_groups(state)
             ]
             if not grad_views:
                 continue
@@ -343,7 +1822,7 @@ def register_grad_reduction_hook_(
             if group_size > 1:
                 buffer.div_(group_size)
 
-            return reduce_by_param_specs(buffer, views)
+            return reduce_by_parameter_states(buffer, views)
 
         return future.then(finish)
 

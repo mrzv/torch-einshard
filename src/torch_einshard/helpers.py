@@ -24,10 +24,11 @@ def init_process_group(backend, use_cuda):
 
     return local_rank, world_rank, world_size
 
-# TODO: add async_op option
-def all_reduce(input, group):
+def all_reduce(input, group, *, async_op=False):
     output = input.contiguous().clone()
-    dist.all_reduce(output, group = group)
+    work = dist.all_reduce(output, group=group, async_op=async_op)
+    if async_op:
+        return output, work
     return output
 
 

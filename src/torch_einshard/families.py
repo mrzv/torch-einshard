@@ -4,6 +4,7 @@ from functools import lru_cache
 
 _FAMILY = re.compile(r"\*([A-Za-z0-9]+)")
 _ZIPPED = re.compile(r"\[([^\]]+)\]")
+_ANNOTATION_KEYS = ("param", "grad=", "init_sync=")
 
 
 def _normalize_families(families):
@@ -70,7 +71,11 @@ def expand_family_mapping(mapping, families, *, label):
 
 
 def _expand_zipped(match, families):
-    tokens = match.group(1).split()
+    content = match.group(1)
+    if _is_annotation_brackets(content):
+        return match.group(0)
+
+    tokens = content.split()
     if not tokens or any(not token.startswith("*") for token in tokens):
         raise ValueError("Zipped axis-family groups must contain only family references")
 
@@ -87,6 +92,14 @@ def _expand_zipped(match, families):
         f"({' '.join(axes)})"
         for axes in zip(*(families[name] for name in names))
     )
+
+
+def _is_annotation_brackets(content):
+    items = [item.strip() for item in content.split(",")]
+    if not items:
+        return False
+    normalized = [re.sub(r"\s+", "", item) for item in items]
+    return all(any(item.startswith(key) for key in _ANNOTATION_KEYS) for item in normalized)
 
 
 def expand_axis_families(expression, sizes=None, families=None):
@@ -111,4 +124,13 @@ def _cached_expand_axis_families(expression, sizes_key, families_key):
 
 
 def cached_expand_axis_families(expression, sizes=None, families=None):
-    return _cached_expand_axis_families(expression, _mapping_key(sizes), _family_key(families))
+    expanded, expanded_sizes = _cached_expand_axis_families(expression, _mapping_key(sizes), _family_key(families))
+    return expanded, _copy_cached_mapping(expanded_sizes)
+
+
+def _copy_cached_mapping(value):
+    if isinstance(value, dict):
+        return dict(value)
+    if isinstance(value, list):
+        return list(value)
+    return value
