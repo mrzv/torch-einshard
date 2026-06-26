@@ -16,6 +16,8 @@ from .params import (
     finalize_module_parameter_grad_comm_,
     finalize_parameter_grad_comm_,
     get_parameter_state,
+    init_param_,
+    init_params_,
     iter_parameter_states,
     param_local_shape,
     param_local_slices,

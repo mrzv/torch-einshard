@@ -2547,6 +2547,130 @@ def test_sync_param_broadcasts_shared_values(dist_env, mesh_2d):
     assert_close(param, torch.ones_like(param))
 
 
+def test_init_param_attaches_init_state_and_broadcasts(dist_env, mesh_2d):
+    mesh = es.wrap_mesh(mesh_2d)
+    param = torch.nn.Parameter(torch.full((3,), float(dist.get_rank() + 1)))
+
+    assert es.init_param_(param, mesh, sync="dp-sp") is param
+
+    state = es.get_parameter_state(param)
+    assert_close(param, torch.ones_like(param))
+    assert state.spec is None
+    assert state.init_sync.mode == "explicit"
+    assert state.shared == ("dp-sp",)
+    assert state.grad_comm.mode == "none"
+
+
+def test_init_param_infers_sync_from_sharded_mesh_footprint(dist_env, mesh_2d):
+    mesh = es.wrap_mesh(mesh_2d)
+    param = torch.nn.Parameter(torch.full((3,), float(dist.get_rank() + 1)))
+
+    es.init_param_(param, mesh, sharded="sp")
+
+    state = es.get_parameter_state(param)
+    assert state.spec is None
+    assert state.layout_shard_dims == ("sp",)
+    assert state.init_sync.mode == "inferred"
+    assert state.shared == ("dp",)
+
+
+def test_init_param_metadata_merges_with_later_formula_grad(dist_env, mesh_2d):
+    mesh = es.wrap_mesh(mesh_2d)
+    x = torch.ones(2, 3)
+    weight = torch.nn.Parameter(torch.full((3,), float(dist.get_rank() + 1)))
+
+    es.init_param_(weight, mesh, sync="dp-sp")
+    es.einshard("b/dp c, c [param, grad=async] -> b/dp c", x, weight, mesh=mesh_2d)
+
+    state = es.get_parameter_state(weight)
+    assert state.spec is not None
+    assert state.source == "init"
+    assert state.shared == ("dp-sp",)
+    assert state.grad_comm.mesh_dims == ("dp",)
+    assert state.grad_comm.schedule == "async"
+
+
+def test_init_param_rejects_later_formula_layout_shard_footprint_mismatch(dist_env, mesh_2d):
+    mesh = es.wrap_mesh(mesh_2d)
+    x = torch.ones(2, 3)
+    weight = torch.nn.Parameter(torch.ones(3))
+
+    es.init_param_(weight, mesh, sharded="sp")
+
+    try:
+        es.einshard("b c, c [param] -> b c", x, weight, mesh=mesh_2d)
+    except ValueError as error:
+        assert "sharded mesh footprint" in str(error)
+    else:
+        raise AssertionError("Expected init sharded footprint mismatch to fail")
+
+
+def test_init_param_rejects_later_formula_init_sync_overlap(dist_env, mesh_2d):
+    mesh = es.wrap_mesh(mesh_2d)
+    x = torch.ones(2, 3)
+    weight = torch.nn.Parameter(torch.ones(3))
+
+    es.init_param_(weight, mesh, sync="sp")
+
+    try:
+        es.einshard("b c/sp, c/sp [param] -> b", x, weight, mesh=mesh_2d)
+    except ValueError as error:
+        assert "init_sync" in str(error)
+    else:
+        raise AssertionError("Expected init sync and layout overlap to fail")
+
+
+def test_init_params_initializes_module_parameters_from_name_mappings(dist_env, mesh_2d):
+    mesh = es.wrap_mesh(mesh_2d)
+    module = nn.Linear(3, 2, bias=False)
+    module.weight.data.fill_(float(dist.get_rank() + 1))
+
+    assert es.init_params_(module, mesh, sync={"weight": "dp-sp"}) is module
+
+    state = es.get_parameter_state(module.weight)
+    assert_close(module.weight, torch.ones_like(module.weight))
+    assert state.spec is None
+    assert state.shared == ("dp-sp",)
+
+
+def test_init_param_rejects_repeated_sharded_footprint_conflict(dist_env, mesh_2d):
+    mesh = es.wrap_mesh(mesh_2d)
+    param = torch.nn.Parameter(torch.ones(3))
+
+    es.init_param_(param, mesh, sharded="dp")
+
+    try:
+        es.init_param_(param, mesh, sharded="sp")
+    except ValueError as error:
+        assert "sharded mesh footprint" in str(error)
+    else:
+        raise AssertionError("Expected repeated init sharded footprint mismatch to fail")
+
+
+def test_init_params_rejects_invalid_falsy_sharded_mapping_value(dist_env, mesh_2d):
+    mesh = es.wrap_mesh(mesh_2d)
+    module = nn.Linear(3, 2, bias=False)
+
+    try:
+        es.init_params_(module, mesh, sharded={"weight": False})
+    except TypeError as error:
+        assert "iterable" in str(error)
+    else:
+        raise AssertionError("Expected invalid sharded mapping value to fail")
+
+
+def test_init_params_rejects_empty_sync_mapping_value(dist_env, mesh_2d):
+    mesh = es.wrap_mesh(mesh_2d)
+    module = nn.Linear(3, 2, bias=False)
+
+    try:
+        es.init_params_(module, mesh, sync={"weight": ()})
+    except ValueError as error:
+        assert "explicit mode requires mesh_dims" in str(error)
+    else:
+        raise AssertionError("Expected empty sync mapping value to fail")
+
+
 def test_module_param_helpers_use_attached_states(dist_env, mesh_2d):
     mesh = es.wrap_mesh(mesh_2d)
     module = nn.Linear(3, 2, bias=False)

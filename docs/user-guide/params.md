@@ -7,19 +7,11 @@ explicitly for parameters hidden inside modules.
 
 ```python
 mesh = es.wrap_mesh(mesh)
-weight_state = es.ParameterState.from_layout(
-    "out/tp in",
-    mesh=mesh,
-    init_sync="sp1-sp2",
-    grad="sp1-sp2",
-)
-
 weight = torch.nn.Parameter(local_weight)
-es.set_parameter_state(weight, weight_state)
-es.sync_param_(weight, weight_state, mesh)
+es.init_param_(weight, mesh, sync="sp1-sp2")
 
 y = es.einshard(
-    "batch in, out/tp in -> batch out/tp",
+    "batch in, out/tp in [param, grad=sp1-sp2] -> batch out/tp",
     x,
     weight,
     mesh=mesh,
@@ -27,11 +19,12 @@ y = es.einshard(
 )
 loss = y.sum()
 loss.backward()
-es.reduce_grad_(weight, weight_state, mesh)
+es.reduce_grad_(weight, es.get_parameter_state(weight), mesh)
 ```
 
-`init_sync` uses broadcast from group rank 0 to make replicated parameter values
-identical. Concrete native `grad` obligations use sum all-reduce on `param.grad`.
+Initialization sync uses broadcast from group rank 0 to make replicated parameter
+values identical. Concrete native `grad` obligations use sum all-reduce on
+`param.grad`.
 Compound names such as `sp1-sp2` work with `wrap_mesh` and reuse the wrapped
 mesh's cached compound process groups.
 
@@ -81,9 +74,6 @@ Supported annotation forms include:
 [param, grad=dp:ddp]
 [param, grad=dp:external]
 [param, grad=none]
-[param, init_sync=none]
-[param, init_sync=external]
-[param, init_sync=tp]
 ```
 
 For local formulas, inferred native gradient obligations are recorded in
@@ -106,10 +96,52 @@ records that another system owns the obligation, and native reduction helpers
 skip it. `grad=none` is an explicit opt-out and conflicts with later non-none
 formula metadata for the same parameter.
 
-Initialization sync is inferred from managed mesh dimension names when a mesh is
-available: dimensions used by the parameter layout are excluded, and remaining
-managed dimensions become `state.shared`. Use `init_sync=none`,
-`init_sync=external`, or an explicit mesh group to override this inference.
+Ordinary forward formulas should not repeat initialization policy. Use
+`init_param_` or `init_params_` to record and execute initial synchronization;
+later formulas preserve that metadata while filling in layout and gradient
+information.
+
+## Parameter Initialization
+
+Use `init_param_` to attach initialization metadata and immediately perform the
+initial broadcast:
+
+```python
+es.init_param_(weight, mesh, sync="sp1-sp2")
+es.init_param_(bias, mesh)                 # infer sync over all managed mesh dims
+es.init_param_(tp_weight, mesh, sharded="tp")
+es.init_param_(external_weight, mesh, sync="external")
+```
+
+Inside this API the argument is named `sync` because the function is already
+scoped to initialization. Internally it populates `ParameterState.init_sync`.
+
+`sync="sp1-sp2"` records and executes a broadcast over `sp1-sp2`. `sync="none"`
+records that no initial synchronization is needed. `sync="external"` records that
+another system, such as checkpoint loading or a training framework, owns initial
+value consistency, so `torch-einshard` does not broadcast.
+
+If `sync` is omitted, the broadcast groups are inferred from the managed mesh
+dimension names minus the optional `sharded` footprint. For example,
+`sharded="tp"` means the parameter's local value differs across `tp`, so
+initialization sync is inferred over the remaining mesh dimensions.
+
+Use `init_params_` for a whole module. `sync` and `sharded` can be single values
+or mappings keyed by parameter name:
+
+```python
+es.init_params_(
+    module,
+    mesh,
+    sync={"weight": "sp1-sp2", "bias": "sp1-sp2"},
+    sharded={"weight": "tp", "bias": "tp"},
+)
+```
+
+The initialization state may be layout-free. A later `[param]` formula installs
+the concrete parameter layout and gradient metadata. If that formula proves the
+initialization sync overlaps a sharded parameter dimension, or contradicts the
+declared `sharded` footprint, registration fails.
 
 ## Explicit Layout Registration
 
