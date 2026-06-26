@@ -7,7 +7,6 @@ from torch.nn.parallel import DistributedDataParallel
 
 import torch_einshard as es
 from torch_einshard.params import (
-    PARAM_SPEC_ATTR,
     PARAM_STATE_ATTR,
     parameter_operand_state,
     register_parameter_operand,
@@ -19,167 +18,6 @@ from conftest import assert_close
 
 def _global_sp_size(mesh, local_size):
     return local_size * dist.get_world_size(mesh["sp"].get_group())
-
-
-def test_param_spec_parses_layout_and_metadata():
-    spec = es.ParamSpec("o/tp c", shared="sp1-sp2", reduce=("sp1-sp2",))
-
-    assert spec.layout == "o/tp c"
-    assert spec.spec.axes is spec.axes
-    assert spec.axes[0].name == "o"
-    assert spec.axes[0].shard_dim == "tp"
-    assert spec.axes[1].name == "c"
-    assert spec.shared == ("sp1-sp2",)
-    assert spec.reduce == ("sp1-sp2",)
-
-
-def test_param_spec_repr_includes_nondefault_metadata():
-    spec = es.ParamSpec("o/tp c", shared="sp", reduce="sp")
-
-    assert repr(spec) == "ParamSpec('o/tp c', shared=('sp',), reduce=('sp',))"
-
-
-def test_param_spec_equality_ignores_cached_tensor_spec_identity():
-    assert es.ParamSpec("o c", shared="sp", reduce="sp") == es.ParamSpec(
-        "o c",
-        shared="sp",
-        reduce="sp",
-    )
-
-
-def test_param_spec_rejects_shared_sharded_axis_overlap():
-    try:
-        es.ParamSpec("o/tp c", shared="tp")
-    except ValueError as error:
-        assert "overlaps" in str(error)
-    else:
-        raise AssertionError("Expected overlapping shared and sharded metadata to fail")
-
-
-def test_param_spec_rejects_duplicate_shard_dims():
-    try:
-        es.ParamSpec("o/tp c/tp")
-    except ValueError as error:
-        assert "same mesh dimension" in str(error)
-    else:
-        raise AssertionError("Expected duplicate parameter shard dimensions to fail")
-
-
-def test_param_spec_rejects_overlapping_compound_shard_dims():
-    try:
-        es.ParamSpec("o/dp-sp c/dp")
-    except ValueError as error:
-        assert "same mesh dimension" in str(error)
-    else:
-        raise AssertionError("Expected overlapping compound shard dimensions to fail")
-
-
-def test_param_spec_rejects_shared_compound_shard_overlap():
-    try:
-        es.ParamSpec("o/dp-sp c", shared="dp")
-    except ValueError as error:
-        assert "overlaps" in str(error)
-    else:
-        raise AssertionError("Expected shared metadata over a compound shard component to fail")
-
-
-def test_param_spec_rejects_overlapping_shared_groups():
-    cases = (
-        ("dp", "dp"),
-        ("dp", "dp-sp"),
-    )
-    for shared in cases:
-        try:
-            es.ParamSpec("o c", shared=shared)
-        except ValueError as error:
-            assert "init_sync" in str(error)
-            assert "overlap" in str(error)
-        else:
-            raise AssertionError("Expected overlapping shared groups to fail")
-
-
-def test_param_spec_rejects_reduce_sharded_axis_overlap():
-    try:
-        es.ParamSpec("o/sp c", reduce="sp")
-    except ValueError as error:
-        assert "grad" in str(error)
-        assert "overlaps" in str(error)
-    else:
-        raise AssertionError("Expected gradient reduction over a parameter shard dim to fail")
-
-
-def test_param_spec_rejects_reduce_compound_sharded_axis_overlap():
-    try:
-        es.ParamSpec("o/dp-sp c", reduce="sp")
-    except ValueError as error:
-        assert "grad" in str(error)
-        assert "overlaps" in str(error)
-    else:
-        raise AssertionError("Expected gradient reduction over a compound shard component to fail")
-
-
-def test_param_spec_rejects_overlapping_reduce_groups():
-    cases = (
-        ("dp", "dp-sp"),
-        ("dp-sp", "sp-dp"),
-    )
-    for reduce in cases:
-        try:
-            es.ParamSpec("o c", reduce=reduce)
-        except ValueError as error:
-            assert "grad" in str(error)
-            assert "overlap" in str(error)
-        else:
-            raise AssertionError("Expected overlapping gradient reduction groups to fail")
-
-
-def test_param_spec_rejects_repeated_compound_group_components():
-    cases = (
-        {"layout": "o/dp-dp c"},
-        {"layout": "o c", "shared": "dp-dp"},
-        {"layout": "o c", "reduce": "dp-dp"},
-    )
-    for kwargs in cases:
-        try:
-            es.ParamSpec(**kwargs)
-        except ValueError as error:
-            assert "repeated mesh" in str(error)
-        else:
-            raise AssertionError("Expected repeated compound group component to fail")
-
-
-def test_param_spec_rejects_empty_compound_group_components():
-    cases = (
-        {"layout": "o c", "shared": ""},
-        {"layout": "o c", "reduce": ""},
-        {"layout": "o c", "shared": "dp-"},
-        {"layout": "o c", "reduce": "dp-"},
-    )
-    for kwargs in cases:
-        try:
-            es.ParamSpec(**kwargs)
-        except ValueError as error:
-            assert "empty mesh" in str(error)
-        else:
-            raise AssertionError("Expected empty compound group component to fail")
-
-
-def test_param_spec_rejects_non_string_layout():
-    try:
-        es.ParamSpec(None)
-    except TypeError as error:
-        assert "layout" in str(error)
-    else:
-        raise AssertionError("Expected non-string ParamSpec layout to fail")
-
-
-def test_param_shard_dims_reads_specs_from_params():
-    param = torch.nn.Parameter(torch.zeros(2, 3))
-    spec = es.ParamSpec("o/tp c/sp")
-    es.set_param_spec(param, spec)
-
-    assert es.param_shard_dims(spec) == ("tp", "sp")
-    assert es.param_shard_dims(param) == ("tp", "sp")
 
 
 def test_param_shard_dims_accepts_parameter_states():
@@ -197,41 +35,9 @@ def test_param_shard_dims_requires_attached_spec():
     try:
         es.param_shard_dims(param)
     except ValueError as error:
-        assert "ParamSpec" in str(error)
+        assert "ParameterState" in str(error)
     else:
-        raise AssertionError("Expected missing ParamSpec to fail")
-
-
-def test_iter_param_specs_yields_only_attached_specs():
-    module = nn.Sequential(nn.Linear(3, 2), nn.Linear(2, 1))
-    spec = es.ParamSpec("o c")
-    es.set_param_spec(module[0].weight, spec)
-
-    entries = list(es.iter_param_specs(module))
-    assert len(entries) == 1
-    name, param, actual_spec = entries[0]
-    assert name == "0.weight"
-    assert param is module[0].weight
-    assert actual_spec is spec
-
-
-def test_set_param_spec_attaches_compatible_parameter_state():
-    param = torch.nn.Parameter(torch.zeros(2, 3))
-    spec = es.ParamSpec("o/tp c", shared="sp1-sp2", reduce="sp1-sp2")
-
-    es.set_param_spec(param, spec)
-    state = es.get_parameter_state(param)
-
-    assert state.source == "ParamSpec"
-    assert state.spec is spec.spec
-    assert state.axes is spec.axes
-    assert state.layout_shard_dims == ("tp",)
-    assert state.init_sync.mode == "explicit"
-    assert state.shared == ("sp1-sp2",)
-    assert state.grad_comm.mode == "explicit"
-    assert state.grad_comm.backend == "native"
-    assert state.grad_comm.schedule == "synchronous"
-    assert state.reduce == ("sp1-sp2",)
+        raise AssertionError("Expected missing ParameterState to fail")
 
 
 def test_parameter_state_infers_init_sync_from_mesh_dims_and_annotation():
@@ -638,38 +444,6 @@ def test_parameter_state_from_layout_rejects_repeated_compound_group_components(
             raise AssertionError("Expected repeated compound group component to fail")
 
 
-def test_parameter_state_from_param_spec_rejects_unknown_mesh_groups():
-    cases = (
-        es.ParamSpec("out/tp in"),
-        es.ParamSpec("out in", shared="sp"),
-        es.ParamSpec("out in", reduce="sp"),
-    )
-    for spec in cases:
-        try:
-            es.ParameterState.from_param_spec(spec, mesh_dim_names=("dp",))
-        except ValueError as error:
-            assert "unknown mesh" in str(error)
-        else:
-            raise AssertionError("Expected unknown ParamSpec mesh group to fail")
-
-
-def test_register_parameter_layout_revalidates_attached_param_spec_with_mesh_names():
-    param = torch.nn.Parameter(torch.ones(2))
-    es.set_param_spec(param, es.ParamSpec("o", reduce="foo"))
-
-    try:
-        es.register_parameter_layout(param, "o", mesh_dim_names=("dp",))
-    except ValueError as error:
-        assert "unknown mesh" in str(error)
-    else:
-        raise AssertionError("Expected attached ParamSpec unknown group to fail")
-
-    state = es.get_parameter_state(param)
-    assert state.source == "ParamSpec"
-    assert state.reduce == ("foo",)
-    assert state.mesh_dim_names == ()
-
-
 def test_parameter_state_from_layout_rejects_array_like_mesh_dim_names():
     try:
         es.ParameterState.from_layout("out in", mesh_dim_names=torch.tensor([0]))
@@ -821,17 +595,6 @@ def test_register_parameter_layout_merges_with_later_formula_grad(dist_env, mesh
     assert state.grad_comm.schedule == "async"
 
 
-def test_register_parameter_layout_source_reflects_param_spec_merge():
-    weight = torch.nn.Parameter(torch.ones(3))
-    es.set_param_spec(weight, es.ParamSpec("c"))
-
-    es.register_parameter_layout(weight, "c", grad="dp")
-
-    state = es.get_parameter_state(weight)
-    assert state.source == "ParamSpec+layout"
-    assert state.reduce == ("dp",)
-
-
 def test_register_linear_parameters_registers_weight_and_bias():
     module = nn.Linear(3, 2)
 
@@ -942,7 +705,7 @@ def test_register_linear_parameters_rejects_non_linear_bias_rank():
 
 def test_register_linear_parameters_is_atomic_on_metadata_conflict():
     module = nn.Linear(3, 2)
-    es.set_param_spec(module.bias, es.ParamSpec("other"))
+    es.set_parameter_state(module.bias, es.ParameterState.from_layout("other"))
 
     try:
         es.register_linear_parameters_(module, weight_layout="out in")
@@ -952,7 +715,7 @@ def test_register_linear_parameters_is_atomic_on_metadata_conflict():
         raise AssertionError("Expected bias metadata conflict to fail")
 
     assert es.get_parameter_state(module.weight) is None
-    assert es.get_parameter_state(module.bias).source == "ParamSpec"
+    assert es.get_parameter_state(module.bias).source == "layout"
 
 
 def test_register_linear_parameters_rejects_aliased_parameters_atomically():
@@ -2110,7 +1873,7 @@ def test_einshard_pending_grad_backend_conflicts_with_existing_native_reduce(dis
     c_local = 3
     x = torch.ones(2, c_local)
     weight = torch.nn.Parameter(torch.ones(_global_sp_size(mesh_2d, c_local)))
-    es.set_param_spec(weight, es.ParamSpec("c", reduce="sp"))
+    es.set_parameter_state(weight, es.ParameterState.from_layout("c", grad="sp"))
 
     try:
         es.einshard(
@@ -2198,7 +1961,7 @@ def test_register_parameter_operand_can_defer_grad_inference(dist_env, mesh_2d):
 def test_einshard_merges_formula_grad_into_layout_only_param_spec(dist_env, mesh_2d):
     x = torch.ones(2, 3)
     weight = torch.nn.Parameter(torch.ones(3))
-    es.set_param_spec(weight, es.ParamSpec("c"))
+    es.register_parameter_layout(weight, "c", mesh_dim_names=mesh_2d.mesh_dim_names)
 
     es.einshard(
         "b/dp c, c [param, grad=async] -> b/dp c",
@@ -2208,17 +1971,22 @@ def test_einshard_merges_formula_grad_into_layout_only_param_spec(dist_env, mesh
     )
     state = es.get_parameter_state(weight)
 
-    assert state.source == "ParamSpec+formula"
+    assert state.source == "layout"
     assert state.shared == ("dp", "sp")
     assert state.tensor_state.replicated_dims == ("dp", "sp")
     assert state.grad_comm.mesh_dims == ("dp",)
     assert state.grad_comm.schedule == "async"
 
 
-def test_einshard_accepts_semantically_matching_param_spec_metadata(dist_env, mesh_2d):
+def test_einshard_accepts_semantically_matching_parameter_state_metadata(dist_env, mesh_2d):
     x = torch.ones(2, 3)
     weight = torch.nn.Parameter(torch.ones(3))
-    es.set_param_spec(weight, es.ParamSpec("c", shared=("dp", "sp"), reduce="sp"))
+    es.register_parameter_layout(
+        weight,
+        "c",
+        mesh_dim_names=mesh_2d.mesh_dim_names,
+        grad="sp",
+    )
 
     es.einshard(
         "b/dp c, c [param, grad=sp] -> b/dp c",
@@ -2228,16 +1996,16 @@ def test_einshard_accepts_semantically_matching_param_spec_metadata(dist_env, me
     )
     state = es.get_parameter_state(weight)
 
-    assert state.source == "ParamSpec+formula"
+    assert state.source == "layout"
     assert state.shared == ("dp", "sp")
     assert state.reduce == ("sp",)
     assert state.tensor_state.replicated_dims == ("dp", "sp")
 
 
-def test_einshard_rejects_param_spec_formula_grad_conflict(dist_env, mesh_2d):
+def test_einshard_rejects_existing_state_formula_grad_conflict(dist_env, mesh_2d):
     x = torch.ones(2, 3)
     weight = torch.nn.Parameter(torch.ones(3))
-    es.set_param_spec(weight, es.ParamSpec("c", reduce="sp"))
+    es.set_parameter_state(weight, es.ParameterState.from_layout("c", grad="sp"))
 
     try:
         es.einshard(
@@ -2249,41 +2017,41 @@ def test_einshard_rejects_param_spec_formula_grad_conflict(dist_env, mesh_2d):
     except ValueError as error:
         assert "incompatible metadata" in str(error)
     else:
-        raise AssertionError("Expected ParamSpec/formula gradient conflict to fail")
+        raise AssertionError("Expected state/formula gradient conflict to fail")
 
-    assert es.get_parameter_state(weight).source == "ParamSpec"
+    assert es.get_parameter_state(weight).source == "layout"
     assert es.get_parameter_state(weight).reduce == ("sp",)
 
 
-def test_einshard_rejects_param_spec_formula_init_sync_none_conflict():
+def test_einshard_rejects_existing_state_formula_init_sync_none_conflict():
     x = torch.ones(2, 3)
     weight = torch.nn.Parameter(torch.ones(3))
-    es.set_param_spec(weight, es.ParamSpec("c", shared="sp"))
+    es.set_parameter_state(weight, es.ParameterState.from_layout("c", init_sync="sp"))
 
     try:
         es.einshard("b c, c [param, init_sync=none] -> b c", x, weight)
     except ValueError as error:
         assert "incompatible metadata" in str(error)
     else:
-        raise AssertionError("Expected ParamSpec/formula init-sync conflict to fail")
+        raise AssertionError("Expected state/formula init-sync conflict to fail")
 
-    assert es.get_parameter_state(weight).source == "ParamSpec"
+    assert es.get_parameter_state(weight).source == "layout"
     assert es.get_parameter_state(weight).shared == ("sp",)
 
 
-def test_einshard_rejects_param_spec_formula_grad_none_conflict():
+def test_einshard_rejects_existing_state_formula_grad_none_conflict():
     x = torch.ones(2, 3)
     weight = torch.nn.Parameter(torch.ones(3))
-    es.set_param_spec(weight, es.ParamSpec("c", reduce="sp"))
+    es.set_parameter_state(weight, es.ParameterState.from_layout("c", grad="sp"))
 
     try:
         es.einshard("b c, c [param, grad=none] -> b c", x, weight)
     except ValueError as error:
         assert "incompatible metadata" in str(error)
     else:
-        raise AssertionError("Expected ParamSpec/formula gradient conflict to fail")
+        raise AssertionError("Expected state/formula gradient conflict to fail")
 
-    assert es.get_parameter_state(weight).source == "ParamSpec"
+    assert es.get_parameter_state(weight).source == "layout"
     assert es.get_parameter_state(weight).reduce == ("sp",)
 
 
@@ -2470,7 +2238,7 @@ def test_einshard_failed_dispatch_does_not_attach_parameter_state():
 def test_einshard_validates_metadata_conflict_before_dispatch(dist_env, mesh_2d):
     x = torch.ones(2, 4)
     weight = torch.nn.Parameter(torch.ones(3))
-    es.set_param_spec(weight, es.ParamSpec("c", reduce="sp"))
+    es.set_parameter_state(weight, es.ParameterState.from_layout("c", grad="sp"))
 
     try:
         es.einshard(
@@ -2484,13 +2252,13 @@ def test_einshard_validates_metadata_conflict_before_dispatch(dist_env, mesh_2d)
     else:
         raise AssertionError("Expected metadata conflict to fail before dispatch")
 
-    assert es.get_parameter_state(weight).source == "ParamSpec"
+    assert es.get_parameter_state(weight).source == "layout"
 
 
 def test_einshard_registration_conflict_does_not_partially_attach_state(dist_env, mesh_2d):
     left = torch.nn.Parameter(torch.ones(2, 3))
     right = torch.nn.Parameter(torch.ones(3))
-    es.set_param_spec(right, es.ParamSpec("c", reduce="sp"))
+    es.set_parameter_state(right, es.ParameterState.from_layout("c", grad="sp"))
 
     try:
         es.einshard(
@@ -2505,13 +2273,13 @@ def test_einshard_registration_conflict_does_not_partially_attach_state(dist_env
         raise AssertionError("Expected conflicting parameter metadata to fail")
 
     assert es.get_parameter_state(left) is None
-    assert es.get_parameter_state(right).source == "ParamSpec"
+    assert es.get_parameter_state(right).source == "layout"
 
 
-def test_einshard_failed_atomic_registration_does_not_lazily_attach_legacy_state(dist_env, mesh_2d):
+def test_einshard_failed_atomic_registration_does_not_attach_partial_state(dist_env, mesh_2d):
     left = torch.nn.Parameter(torch.ones(2, 3))
     right = torch.nn.Parameter(torch.ones(3))
-    setattr(right, PARAM_SPEC_ATTR, es.ParamSpec("c", reduce="sp"))
+    es.set_parameter_state(right, es.ParameterState.from_layout("c", grad="sp"))
 
     try:
         es.einshard(
@@ -2526,12 +2294,13 @@ def test_einshard_failed_atomic_registration_does_not_lazily_attach_legacy_state
         raise AssertionError("Expected conflicting parameter metadata to fail")
 
     assert getattr(left, PARAM_STATE_ATTR, None) is None
-    assert getattr(right, PARAM_STATE_ATTR, None) is None
+    assert getattr(right, PARAM_STATE_ATTR, None) is not None
 
 
-def test_register_parameter_state_failure_does_not_lazily_attach_legacy_state():
+def test_register_parameter_state_failure_preserves_existing_state():
     param = torch.nn.Parameter(torch.ones(3))
-    setattr(param, PARAM_SPEC_ATTR, es.ParamSpec("c", reduce="sp"))
+    existing = es.ParameterState.from_layout("c", grad="sp")
+    es.set_parameter_state(param, existing)
     spec, _, _ = es.parse_sharding("c [param, grad=dp] -> c")
     state = es.ParameterState.from_spec(spec, source="formula")
 
@@ -2542,7 +2311,7 @@ def test_register_parameter_state_failure_does_not_lazily_attach_legacy_state():
     else:
         raise AssertionError("Expected conflicting parameter metadata to fail")
 
-    assert getattr(param, PARAM_STATE_ATTR, None) is None
+    assert getattr(param, PARAM_STATE_ATTR, None) is existing
 
 
 def test_register_parameter_state_rejects_malformed_new_state():
@@ -2611,7 +2380,7 @@ def test_einshard_validates_bad_mesh_dim_names_with_parameter_annotations():
 
 
 def test_param_local_slices_uses_mesh_coordinates(dist_env, mesh_2d):
-    spec = es.ParamSpec("o/dp c/sp")
+    state = es.ParameterState.from_layout("o/dp c/sp")
     global_shape = (5, 7)
     coord = (mesh_2d.mesh == dist.get_rank()).nonzero()[0].tolist()
     dp_sections = es.helpers.compute_split_shapes_for_factors(
@@ -2625,26 +2394,26 @@ def test_param_local_slices_uses_mesh_coordinates(dist_env, mesh_2d):
         slice(sum(sp_sections[:coord[1]]), sum(sp_sections[:coord[1] + 1])),
     )
 
-    assert es.param_local_slices(spec, global_shape, mesh_2d) == expected
-    assert es.param_local_shape(spec, global_shape, mesh_2d) == (
+    assert es.param_local_slices(state, global_shape, mesh_2d) == expected
+    assert es.param_local_shape(state, global_shape, mesh_2d) == (
         dp_sections[coord[0]],
         sp_sections[coord[1]],
     )
 
 
 def test_param_local_slices_supports_factor_aware_splits(dist_env, mesh_2d):
-    spec = es.ParamSpec("o/dp c")
+    state = es.ParameterState.from_layout("o/dp c")
     global_shape = (10, 3)
     coord = (mesh_2d.mesh == dist.get_rank()).nonzero()[0].tolist()
     sections = es.helpers.compute_split_shapes_for_factors(
         global_shape[0], mesh_2d.mesh.shape[0], 4
     )
 
-    assert es.param_local_slices(spec, global_shape, mesh_2d, factors={"o": 4}) == (
+    assert es.param_local_slices(state, global_shape, mesh_2d, factors={"o": 4}) == (
         slice(sum(sections[:coord[0]]), sum(sections[:coord[0] + 1])),
         slice(None),
     )
-    assert es.param_local_shape(spec, global_shape, mesh_2d, factors={"o": 4}) == (
+    assert es.param_local_shape(state, global_shape, mesh_2d, factors={"o": 4}) == (
         sections[coord[0]],
         3,
     )
@@ -2652,7 +2421,7 @@ def test_param_local_slices_supports_factor_aware_splits(dist_env, mesh_2d):
 
 def test_param_local_slices_accepts_attached_params(dist_env, mesh_2d):
     param = torch.nn.Parameter(torch.zeros(2, 3))
-    es.set_param_spec(param, es.ParamSpec("o/dp c"))
+    es.set_parameter_state(param, es.ParameterState.from_layout("o/dp c"))
 
     assert es.param_local_slices(param, (2, 3), mesh_2d)[1] == slice(None)
 
@@ -2663,7 +2432,7 @@ def test_param_local_slices_accepts_attached_parameter_states(dist_env, mesh_2d)
     es.set_parameter_state(param, state)
 
     assert es.param_local_slices(state, (2, 3), mesh_2d) == es.param_local_slices(
-        es.ParamSpec("o/dp c"),
+        es.ParameterState.from_layout("o/dp c"),
         (2, 3),
         mesh_2d,
     )
@@ -2671,10 +2440,10 @@ def test_param_local_slices_accepts_attached_parameter_states(dist_env, mesh_2d)
 
 
 def test_param_local_slices_rejects_rank_mismatch(dist_env, mesh_2d):
-    spec = es.ParamSpec("o/dp c")
+    state = es.ParameterState.from_layout("o/dp c")
 
     try:
-        es.param_local_slices(spec, (2,), mesh_2d)
+        es.param_local_slices(state, (2,), mesh_2d)
     except ValueError as error:
         assert "rank" in str(error)
     else:
@@ -2682,10 +2451,10 @@ def test_param_local_slices_rejects_rank_mismatch(dist_env, mesh_2d):
 
 
 def test_param_local_slices_rejects_missing_mesh_dim(dist_env, mesh_2d):
-    spec = es.ParamSpec("o/tp c")
+    state = es.ParameterState.from_layout("o/tp c")
 
     try:
-        es.param_local_slices(spec, (2, 3), mesh_2d)
+        es.param_local_slices(state, (2, 3), mesh_2d)
     except ValueError as error:
         assert "tp" in str(error)
     else:
@@ -2693,10 +2462,10 @@ def test_param_local_slices_rejects_missing_mesh_dim(dist_env, mesh_2d):
 
 
 def test_param_local_slices_rejects_raw_mesh_compound_group(dist_env, mesh_2d):
-    spec = es.ParamSpec("o/dp-sp c")
+    state = es.ParameterState.from_layout("o/dp-sp c")
 
     try:
-        es.param_local_slices(spec, (2, 3), mesh_2d)
+        es.param_local_slices(state, (2, 3), mesh_2d)
     except ValueError as error:
         assert "wrap_mesh" in str(error)
     else:
@@ -2707,7 +2476,7 @@ def test_param_local_slices_requires_initialized_process_group(monkeypatch, mesh
     monkeypatch.setattr(dist, "is_initialized", lambda: False)
 
     try:
-        es.param_local_slices(es.ParamSpec("o/dp c"), (2, 3), mesh_2d)
+        es.param_local_slices(es.ParameterState.from_layout("o/dp c"), (2, 3), mesh_2d)
     except RuntimeError as error:
         assert "initialized process group" in str(error)
     else:
@@ -2716,7 +2485,7 @@ def test_param_local_slices_requires_initialized_process_group(monkeypatch, mesh
 
 def test_param_shard_metadata_supports_compound_groups(dist_env, mesh_2d):
     mesh = es.wrap_mesh(mesh_2d)
-    spec = es.ParamSpec("o/dp-sp c")
+    state = es.ParameterState.from_layout("o/dp-sp c")
     global_shape = (dist_env.world_size + 3, 2)
     group = mesh["dp-sp"].get_group()
     rank = dist.get_rank(group)
@@ -2724,7 +2493,7 @@ def test_param_shard_metadata_supports_compound_groups(dist_env, mesh_2d):
         global_shape[0], dist.get_world_size(group), 1
     )
 
-    metadata = es.param_shard_metadata(spec, global_shape, mesh)
+    metadata = es.param_shard_metadata(state, global_shape, mesh)
 
     assert metadata.global_shape == global_shape
     assert metadata.local_slices == (
@@ -2739,8 +2508,8 @@ def test_param_shard_metadata_normalizes_compound_group_order(dist_env, mesh_2d)
     mesh = es.wrap_mesh(mesh_2d)
     global_shape = (dist_env.world_size + 3, 2)
 
-    dp_sp = es.param_shard_metadata(es.ParamSpec("o/dp-sp c"), global_shape, mesh)
-    sp_dp = es.param_shard_metadata(es.ParamSpec("o/sp-dp c"), global_shape, mesh)
+    dp_sp = es.param_shard_metadata(es.ParameterState.from_layout("o/dp-sp c"), global_shape, mesh)
+    sp_dp = es.param_shard_metadata(es.ParameterState.from_layout("o/sp-dp c"), global_shape, mesh)
 
     assert dp_sp.local_slices == sp_dp.local_slices
     assert dp_sp.local_shape == sp_dp.local_shape
@@ -2751,16 +2520,17 @@ def test_param_shard_metadata_accepts_parameter_states(dist_env, mesh_2d):
     state = es.ParameterState.from_spec(es.parse_sharding("o/dp c [param] -> o c")[0])
 
     metadata = es.param_shard_metadata(state, global_shape, mesh_2d)
-    expected = es.param_shard_metadata(es.ParamSpec("o/dp c"), global_shape, mesh_2d)
+    expected = es.param_shard_metadata(es.ParameterState.from_layout("o/dp c"), global_shape, mesh_2d)
 
     assert metadata == expected
 
 
 def test_param_local_slices_rejects_sharded_factored_axes(dist_env, mesh_2d):
-    spec = es.ParamSpec("(a/dp b) c")
+    spec = es.parse_sharding("(a/dp b) c [param] -> (a b) c")[0]
+    state = es.ParameterState.from_spec(spec)
 
     try:
-        es.param_local_slices(spec, (6, 2), mesh_2d)
+        es.param_local_slices(state, (6, 2), mesh_2d)
     except NotImplementedError as error:
         assert "factored-axis" in str(error)
     else:
@@ -2769,21 +2539,24 @@ def test_param_local_slices_rejects_sharded_factored_axes(dist_env, mesh_2d):
 
 def test_sync_param_broadcasts_shared_values(dist_env, mesh_2d):
     mesh = es.wrap_mesh(mesh_2d)
-    spec = es.ParamSpec("o c", shared="dp-sp")
+    state = es.ParameterState.from_layout("o c", init_sync="dp-sp")
     param = torch.nn.Parameter(torch.full((2, 3), float(dist.get_rank() + 1)))
 
-    es.sync_param_(param, spec, mesh)
+    es.sync_param_(param, state, mesh)
 
     assert_close(param, torch.ones_like(param))
 
 
-def test_module_param_helpers_use_attached_specs(dist_env, mesh_2d):
+def test_module_param_helpers_use_attached_states(dist_env, mesh_2d):
     mesh = es.wrap_mesh(mesh_2d)
     module = nn.Linear(3, 2, bias=False)
-    es.set_param_spec(module.weight, es.ParamSpec("o c", shared="dp-sp", reduce="dp-sp"))
+    es.set_parameter_state(
+        module.weight,
+        es.ParameterState.from_layout("o c", init_sync="dp-sp", grad="dp-sp"),
+    )
     module.weight.data.fill_(float(dist.get_rank() + 1))
 
-    assert es.get_param_spec(module.weight).shared == ("dp-sp",)
+    assert es.get_parameter_state(module.weight).shared == ("dp-sp",)
     assert es.sync_module_params_(module, mesh) is module
     assert_close(module.weight, torch.ones_like(module.weight))
 
@@ -2813,12 +2586,12 @@ def test_module_param_helpers_use_attached_parameter_states(dist_env, mesh_2d):
 
 def test_reduce_grad_allreduces_reduce_groups(dist_env, mesh_2d):
     mesh = es.wrap_mesh(mesh_2d)
-    spec = es.ParamSpec("o c", reduce="dp-sp")
+    state = es.ParameterState.from_layout("o c", grad="dp-sp")
     param = torch.nn.Parameter(torch.zeros(2, 3))
     param.grad = torch.full_like(param, float(dist.get_rank() + 1))
     world_size = dist.get_world_size()
 
-    es.reduce_grad_(param, spec, mesh)
+    es.reduce_grad_(param, state, mesh)
 
     expected = float(world_size * (world_size + 1) // 2)
     assert_close(param.grad, torch.full_like(param, expected))
@@ -2839,10 +2612,10 @@ def test_reduce_grad_skips_external_and_ddp_backends(dist_env, mesh_2d):
 
 
 def test_reduce_grad_allows_missing_grad(dist_env, mesh_2d):
-    spec = es.ParamSpec("o c", reduce="dp")
+    state = es.ParameterState.from_layout("o c", grad="dp")
     param = torch.nn.Parameter(torch.zeros(2, 3))
 
-    assert es.reduce_grad_(param, spec, mesh_2d) is param
+    assert es.reduce_grad_(param, state, mesh_2d) is param
     assert param.grad is None
 
 
@@ -2859,23 +2632,6 @@ def test_native_grad_reduction_hooks_allreduce_concrete_native_state(dist_env, m
     x = torch.tensor([[float(dist.get_rank() + 1)]])
     model(x).sum().backward()
     handle.wait()
-
-    world_size = dist.get_world_size()
-    expected = float(world_size * (world_size + 1) // 2)
-    assert_close(model.weight.grad, torch.full_like(model.weight.grad, expected))
-    assert handle.pending == 0
-    handle.remove()
-
-
-def test_native_grad_reduction_hooks_support_param_specs(dist_env, mesh_2d):
-    mesh = es.wrap_mesh(mesh_2d)
-    model = nn.Linear(1, 1, bias=False)
-    model.weight.data.fill_(1.0)
-    es.set_param_spec(model.weight, es.ParamSpec("o c", reduce="dp-sp"))
-    handle = es.register_native_grad_reduction_hooks_(model, mesh)
-
-    x = torch.tensor([[float(dist.get_rank() + 1)]])
-    model(x).sum().backward()
 
     world_size = dist.get_world_size()
     expected = float(world_size * (world_size + 1) // 2)
@@ -2965,7 +2721,7 @@ def test_native_grad_reduction_hooks_validate_before_registering(dist_env, mesh_
     assert_close(model.left.weight.grad, torch.tensor([[float(dist.get_rank() + 1)]]))
 
 
-def test_native_grad_reduction_hooks_failure_does_not_lazily_attach_legacy_state(dist_env, mesh_2d):
+def test_native_grad_reduction_hooks_failure_does_not_leave_partial_hooks(dist_env, mesh_2d):
     mesh = es.wrap_mesh(mesh_2d)
     model = nn.Module()
     model.left = nn.Linear(1, 1, bias=False)
@@ -2974,7 +2730,10 @@ def test_native_grad_reduction_hooks_failure_does_not_lazily_attach_legacy_state
         model.left.weight,
         es.ParameterState.from_spec(es.parse_sharding("o c [param, grad=dp-sp] -> o c")[0]),
     )
-    setattr(model.right.weight, PARAM_SPEC_ATTR, es.ParamSpec("o c", reduce="dp-sp"))
+    es.set_parameter_state(
+        model.right.weight,
+        es.ParameterState.from_spec(es.parse_sharding("o c [param, grad=dp-sp] -> o c")[0]),
+    )
     model.right.weight.requires_grad_(False)
 
     try:
@@ -2988,7 +2747,7 @@ def test_native_grad_reduction_hooks_failure_does_not_lazily_attach_legacy_state
     model.left(x).sum().backward()
 
     assert_close(model.left.weight.grad, torch.tensor([[float(dist.get_rank() + 1)]]))
-    assert getattr(model.right.weight, PARAM_STATE_ATTR, None) is None
+    assert getattr(model.right.weight, PARAM_STATE_ATTR, None) is not None
 
 
 def test_native_grad_reduction_hooks_validate_requires_grad_before_registering(dist_env, mesh_2d):
@@ -3029,27 +2788,6 @@ def test_native_grad_reduction_hook_remove_detaches_hooks(dist_env, mesh_2d):
     model(x).sum().backward()
 
     assert_close(model.weight.grad, torch.tensor([[float(dist.get_rank() + 1)]]))
-
-
-def test_ddp_grad_reduction_hook_uses_param_specs(dist_env, mesh_2d):
-    model = nn.Linear(1, 1, bias=False)
-    model.weight.data.fill_(1.0)
-    es.set_param_spec(model.weight, es.ParamSpec("o c", reduce="sp"))
-    ddp = DistributedDataParallel(model, process_group=mesh_2d["dp"].get_group())
-    es.register_grad_reduction_hook_(ddp, mesh_2d, ddp_group="dp")
-
-    x = torch.tensor([[float(dist.get_rank() + 1)]])
-    ddp(x).sum().backward()
-
-    dp_size = dist.get_world_size(mesh_2d["dp"].get_group())
-    sp_size = dist.get_world_size(mesh_2d["sp"].get_group())
-    sp_rank = dist.get_rank(mesh_2d["sp"].get_group())
-    expected = 0.0
-    for peer_sp_rank in range(sp_size):
-        expected += 1.0 + peer_sp_rank + sp_size * (dp_size - 1) / 2
-
-    assert sp_rank < sp_size
-    assert_close(model.weight.grad, torch.full_like(model.weight.grad, expected))
 
 
 def test_ddp_grad_reduction_hook_uses_parameter_states(dist_env, mesh_2d):
@@ -3106,11 +2844,14 @@ def test_ddp_grad_reduction_hook_rejects_pending_ddp_parameter_states(dist_env, 
         raise AssertionError("Expected pending DDP gradient obligation to fail")
 
 
-def test_ddp_grad_reduction_hook_combines_uniform_reduce_specs(dist_env, mesh_2d):
+def test_ddp_grad_reduction_hook_combines_uniform_state_reductions(dist_env, mesh_2d):
     mesh = es.wrap_mesh(mesh_2d)
     model = nn.Linear(1, 1, bias=False)
     model.weight.data.fill_(1.0)
-    es.set_param_spec(model.weight, es.ParamSpec("o c", reduce="sp"))
+    es.set_parameter_state(
+        model.weight,
+        es.ParameterState.from_spec(es.parse_sharding("o c [param, grad=sp] -> o c")[0]),
+    )
     ddp = DistributedDataParallel(model, process_group=mesh_2d["dp"].get_group())
     es.register_grad_reduction_hook_(
         ddp,
@@ -3160,12 +2901,15 @@ def test_ddp_grad_reduction_hook_combines_uniform_parameter_states(dist_env, mes
     assert_close(model.weight.grad, torch.full_like(model.weight.grad, expected))
 
 
-def test_ddp_grad_reduction_hook_combined_option_falls_back_for_mixed_specs(dist_env, mesh_2d):
+def test_ddp_grad_reduction_hook_combined_option_falls_back_for_mixed_states(dist_env, mesh_2d):
     mesh = es.wrap_mesh(mesh_2d)
     model = nn.Linear(1, 1, bias=True)
     model.weight.data.fill_(1.0)
     model.bias.data.zero_()
-    es.set_param_spec(model.weight, es.ParamSpec("o c", reduce="sp"))
+    es.set_parameter_state(
+        model.weight,
+        es.ParameterState.from_spec(es.parse_sharding("o c [param, grad=sp] -> o c")[0]),
+    )
     ddp = DistributedDataParallel(model, process_group=mesh_2d["dp"].get_group())
     es.register_grad_reduction_hook_(
         ddp,
@@ -3209,7 +2953,7 @@ def test_ddp_grad_reduction_hook_validates_combined_reduce_args(mesh_2d):
 
 def test_ddp_grad_reduction_hook_validates_parameter_reduce_groups(dist_env, mesh_2d):
     model = nn.Linear(1, 1, bias=False)
-    es.set_param_spec(model.weight, es.ParamSpec("o c", reduce="foo"))
+    es.set_parameter_state(model.weight, es.ParameterState.from_layout("o c", grad="foo"))
     ddp = DistributedDataParallel(model, process_group=mesh_2d["dp"].get_group())
 
     try:
@@ -3222,7 +2966,7 @@ def test_ddp_grad_reduction_hook_validates_parameter_reduce_groups(dist_env, mes
 
 def test_ddp_grad_reduction_hook_rejects_reduce_group_overlapping_ddp(dist_env, mesh_2d):
     model = nn.Linear(1, 1, bias=False)
-    es.set_param_spec(model.weight, es.ParamSpec("o c", reduce="dp"))
+    es.set_parameter_state(model.weight, es.ParameterState.from_layout("o c", grad="dp"))
     ddp = DistributedDataParallel(model, process_group=mesh_2d["dp"].get_group())
 
     try:
@@ -3235,7 +2979,7 @@ def test_ddp_grad_reduction_hook_rejects_reduce_group_overlapping_ddp(dist_env, 
 
 def test_ddp_grad_reduction_hook_validates_combined_groups(dist_env, mesh_2d):
     model = nn.Linear(1, 1, bias=False)
-    es.set_param_spec(model.weight, es.ParamSpec("o c", reduce="sp"))
+    es.set_parameter_state(model.weight, es.ParameterState.from_layout("o c", grad="sp"))
     ddp = DistributedDataParallel(model, process_group=mesh_2d["dp"].get_group())
 
     try:
@@ -3254,7 +2998,7 @@ def test_ddp_grad_reduction_hook_validates_combined_groups(dist_env, mesh_2d):
 
 def test_ddp_grad_reduction_hook_rejects_mismatched_combined_group(dist_env, mesh_2d):
     model = nn.Linear(1, 1, bias=False)
-    es.set_param_spec(model.weight, es.ParamSpec("o c", reduce="sp"))
+    es.set_parameter_state(model.weight, es.ParameterState.from_layout("o c", grad="sp"))
     ddp = DistributedDataParallel(model, process_group=mesh_2d["dp"].get_group())
 
     try:
@@ -3273,7 +3017,7 @@ def test_ddp_grad_reduction_hook_rejects_mismatched_combined_group(dist_env, mes
 
 def test_ddp_grad_reduction_hook_rejects_combined_reduce_overlap(dist_env, mesh_2d):
     model = nn.Linear(1, 1, bias=False)
-    es.set_param_spec(model.weight, es.ParamSpec("o c", reduce="sp"))
+    es.set_parameter_state(model.weight, es.ParameterState.from_layout("o c", grad="sp"))
     ddp = DistributedDataParallel(model, process_group=mesh_2d["dp"].get_group())
 
     try:

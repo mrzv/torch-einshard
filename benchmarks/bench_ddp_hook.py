@@ -33,12 +33,12 @@ class TinyMLP(nn.Module):
         return self.net(x)
 
 
-def attach_specs(model, mode):
+def attach_states(model, mode):
     for name, param in model.named_parameters():
         if mode == "mixed" and name.endswith("bias"):
             continue
         layout = "out in" if param.ndim == 2 else "out"
-        es.set_param_spec(param, es.ParamSpec(layout, reduce="sp"))
+        es.register_parameter_layout(param, layout, grad="sp")
 
 
 def build_model(args, device):
@@ -61,7 +61,7 @@ def main():
     mesh = es.wrap_mesh(mesh_2d(device, names=("dp", "sp")))
 
     model, width = build_model(args, device)
-    attach_specs(model, "mixed" if args.mode == "mixed" else "uniform")
+    attach_states(model, "mixed" if args.mode == "mixed" else "uniform")
     ddp = DistributedDataParallel(
         model,
         process_group=mesh["dp"].get_group(),
