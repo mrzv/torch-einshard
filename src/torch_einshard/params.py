@@ -727,6 +727,13 @@ def _validate_parameter_state_object(state):
             )
 
 
+def _validate_parameter_state_metadata(state):
+    _validate_parameter_state_object(state)
+    _validate_parameter_layout(state.layout_shard_dims, state.init_sync)
+    _validate_parameter_grad_comm(state.layout_shard_dims, state.grad_comm)
+    _validate_parameter_mesh_groups(state.mesh_dim_names, state.layout_shard_dims, state.init_sync, state.grad_comm)
+
+
 class NativeGradReductionHandle:
     def __init__(self):
         self._hooks = []
@@ -1102,8 +1109,12 @@ def _merge_parameter_state(existing, state):
 
 
 def register_parameter_state(param, state):
+    _validate_parameter_state_metadata(state)
     existing = _parameter_state_from_attached_metadata(param)
+    if existing is not None:
+        _validate_parameter_state_metadata(existing)
     merged = _merge_parameter_state(existing, state)
+    _validate_parameter_state_metadata(merged)
     return set_parameter_state(param, merged)
 
 

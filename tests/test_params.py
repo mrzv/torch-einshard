@@ -2545,6 +2545,38 @@ def test_register_parameter_state_failure_does_not_lazily_attach_legacy_state():
     assert getattr(param, PARAM_STATE_ATTR, None) is None
 
 
+def test_register_parameter_state_rejects_malformed_new_state():
+    param = torch.nn.Parameter(torch.ones(3))
+    state = replace(
+        es.ParameterState.from_layout("c"),
+        grad_comm=es.ParameterGradComm(mode="explicit", mesh_dims=("dp",), backend="bogus"),
+    )
+
+    try:
+        es.register_parameter_state(param, state)
+    except ValueError as error:
+        assert "backend" in str(error)
+    else:
+        raise AssertionError("Expected malformed ParameterState to fail registration")
+
+    assert es.get_parameter_state(param) is None
+
+
+def test_register_parameter_state_rejects_malformed_existing_state():
+    param = torch.nn.Parameter(torch.ones(3))
+    existing = replace(es.ParameterState.from_layout("c"), layout_shard_dims=("missing",))
+    es.set_parameter_state(param, existing)
+
+    try:
+        es.register_parameter_state(param, es.ParameterState.from_layout("c", grad="dp"))
+    except ValueError as error:
+        assert "layout_shard_dims" in str(error)
+    else:
+        raise AssertionError("Expected malformed existing ParameterState to fail registration")
+
+    assert es.get_parameter_state(param) is existing
+
+
 def test_einshard_ignores_unnamed_mesh_for_unannotated_local_operation():
     class UnnamedMesh:
         mesh_dim_names = None
