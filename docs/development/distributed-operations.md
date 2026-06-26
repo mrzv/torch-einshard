@@ -142,7 +142,9 @@ This is less a new tensor semantic and more a scheduling primitive. It would mat
 
 ## 6. Async Collectives And Overlap
 
-`helpers.py` currently has `# TODO: add async_op option`.
+`helpers.all_reduce(..., async_op=True)` provides the first low-level async
+collective hook. The planner still executes the other collective primitives
+synchronously and does not yet schedule async work across plan steps.
 
 Async versions of allgather, reduce-scatter, allreduce, and all-to-all would let the planner overlap communication with local einsum or other computation.
 
