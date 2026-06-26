@@ -145,7 +145,7 @@ Implemented behavior:
 - `register_grad_reduction_hook_` adds DDP-style averaging plus extra concrete native or DDP-backed reductions as a DDP communication hook.
 - `register_grad_reduction_hook_` can optionally combine DDP averaging and a uniform extra reduction into one compound-group all-reduce for matching buckets.
 - Compound names work through `wrap_mesh`.
-- `shared` metadata is rejected when it overlaps with axis shard dimensions.
+- `init_sync` metadata is rejected when it overlaps with axis shard dimensions.
 - Concrete native/DDP gradient reductions are rejected when they overlap with parameter layout shard dimensions.
 - `param_local_slices`, `param_local_shape`, and `param_shard_metadata` derive local shard metadata from `ParameterState` layouts.
 - Input operand annotations such as `[param]`, `[param, grad=async]`, `[param, grad=none]`, and `[param, init_sync=none]` are parsed and stored in `TensorSpec`.
@@ -154,13 +154,12 @@ Implemented behavior:
 - `ParameterState.from_layout`, `register_parameter_layout`, `register_module_parameter_layouts_`, `register_linear_parameters_`, `register_conv_parameters_`, and `register_norm_parameters_` provide explicit state registration for hidden parameters, fused/custom modules, and common linear/conv/norm-style modules that cannot expose parameters as formula operands.
 - SciGPT-style tensor-parallel MLP and attention projection patterns are covered by tests using explicit `einshard` calls, and MLP/norm/spatial-position parameter metadata patterns are covered by registration-helper tests.
 
-Deferred string notation:
+Historical string notation:
 
-```text
-[o c] shared(tp-sp1-sp2) reduce(sp1-sp2)
-[o/tp c] shared(sp1-sp2) reduce(sp1-sp2)
-[o c/tp] shared(sp1-sp2) reduce(sp1-sp2)
-```
+Earlier discussions considered a separate bracketed parameter-metadata string
+syntax. That is not an active implementation target now: formula operand
+annotations and explicit `ParameterState` registration cover the supported
+parameter metadata paths.
 
 Remaining work:
 
@@ -168,7 +167,7 @@ Remaining work:
 - Add execution backends for native async parameter-gradient reductions and automatic DDP-backed obligation finalization.
 - Add bucketed/native scheduling for unused-parameter or rank-dependent-control-flow cases; the current native hook path requires identical backward participation and hook order across ranks.
 - Extend higher-level module/layer wrappers beyond the current generic and linear/conv/norm registration foundation where specialized validation is useful.
-- Continue removing downstream uses of the former explicit spec API in favor of `ParameterState` registration.
+- Coordinate downstream migrations away from the former explicit spec API in favor of `ParameterState` registration.
 
 ## Deferred Cleanup
 
