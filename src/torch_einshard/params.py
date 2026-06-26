@@ -303,12 +303,18 @@ def _bias_layout_from_weight_layout(weight_layout):
 
 
 def _validate_linear_bias_layout(weight_layout, bias_layout):
+    _validate_bias_layout_matches_first_axis(weight_layout, bias_layout, "Linear")
+
+
+def _validate_bias_layout_matches_first_axis(weight_layout, bias_layout, label):
     _validate_layout_value(weight_layout)
     _validate_layout_value(bias_layout)
     weight_axes = _parse_axes(weight_layout)
     bias_axes = _parse_axes(bias_layout)
+    if not weight_axes:
+        raise ValueError(f"{label} weight layout must contain at least one axis")
     if len(bias_axes) != 1 or _axis_signature(bias_axes[0]) != _axis_signature(weight_axes[0]):
-        raise ValueError("Linear bias layout must match the first weight layout axis")
+        raise ValueError(f"{label} bias layout must match the first weight layout axis")
 
 
 def _validate_matching_layout(layout, other_layout, label):
@@ -343,6 +349,29 @@ def _validate_linear_parameter_shapes(weight, bias):
         raise ValueError("Linear bias must be rank 1")
     if bias is not None and weight.shape[0] != bias.shape[0]:
         raise ValueError("Linear bias shape must match weight output dimension")
+
+
+def _default_conv_weight_layout(rank):
+    if rank == 3:
+        return "out in k"
+    if rank == 4:
+        return "out in kh kw"
+    if rank == 5:
+        return "out in kd kh kw"
+    raise ValueError("Conv weight must be rank 3, 4, or 5")
+
+
+def _validate_conv_parameter_shapes(module, weight, bias):
+    if isinstance(module, torch.nn.modules.conv._ConvTransposeNd):
+        raise NotImplementedError("ConvTranspose parameter registration is not supported")
+    if getattr(module, "groups", 1) != 1:
+        raise NotImplementedError("Conv parameter registration currently supports only groups=1")
+    if weight.ndim not in (3, 4, 5):
+        raise ValueError("Conv weight must be rank 3, 4, or 5")
+    if bias is not None and bias.ndim != 1:
+        raise ValueError("Conv bias must be rank 1")
+    if bias is not None and weight.shape[0] != bias.shape[0]:
+        raise ValueError("Conv bias shape must match weight output dimension")
 
 
 def _validate_norm_parameter_shapes(weight, bias):
@@ -954,6 +983,72 @@ def register_linear_parameters_(
             bias_layout = _bias_layout_from_weight_layout(weight_layout)
         else:
             _validate_linear_bias_layout(weight_layout, bias_layout)
+        updates.append((
+            bias,
+            ParameterState.from_layout(
+                bias_layout,
+                mesh_dim_names=mesh_dim_names,
+                grad=bias_grad,
+                init_sync=bias_init_sync,
+                source=source,
+            ),
+        ))
+
+    prepared = _prepare_parameter_state_updates(updates)
+    for param, state in prepared:
+        set_parameter_state(param, state)
+    return module
+
+
+def register_conv_parameters_(
+    module,
+    *,
+    weight_layout=None,
+    bias_layout=None,
+    mesh=None,
+    mesh_dim_names=(),
+    grad=None,
+    weight_grad=None,
+    bias_grad=None,
+    init_sync=None,
+    weight_init_sync=None,
+    bias_init_sync=None,
+    source="conv",
+):
+    mesh_dim_names = _mesh_dim_names_from(mesh, mesh_dim_names)
+    explicit_bias_metadata = bias_layout is not None or bias_grad is not None or bias_init_sync is not None
+    weight_grad = grad if weight_grad is None else weight_grad
+    bias_grad = grad if bias_grad is None else bias_grad
+    weight_init_sync = init_sync if weight_init_sync is None else weight_init_sync
+    bias_init_sync = init_sync if bias_init_sync is None else bias_init_sync
+
+    weight = _parameter_attr(module, "weight")
+    if weight is None:
+        raise ValueError("module must define a weight parameter")
+    bias = _parameter_attr(module, "bias")
+    if bias is None and explicit_bias_metadata:
+        raise ValueError("module does not define a bias parameter")
+    _validate_conv_parameter_shapes(module, weight, bias)
+
+    if weight_layout is None:
+        weight_layout = _default_conv_weight_layout(weight.ndim)
+
+    updates = [(
+        weight,
+        ParameterState.from_layout(
+            weight_layout,
+            mesh_dim_names=mesh_dim_names,
+            grad=weight_grad,
+            init_sync=weight_init_sync,
+            source=source,
+        ),
+    )]
+
+    if bias is not None:
+        if bias_layout is None:
+            bias_layout = _bias_layout_from_weight_layout(weight_layout)
+        else:
+            _validate_bias_layout_matches_first_axis(weight_layout, bias_layout, "Conv")
         updates.append((
             bias,
             ParameterState.from_layout(

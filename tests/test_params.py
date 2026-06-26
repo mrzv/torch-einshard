@@ -993,6 +993,162 @@ def test_register_linear_parameters_rejects_non_string_layouts():
         raise AssertionError("Expected non-string weight layout to fail")
 
 
+def test_register_conv_parameters_registers_weight_and_bias():
+    module = nn.Conv2d(3, 2, kernel_size=3)
+
+    es.register_conv_parameters_(module, mesh_dim_names=("tp", "sp"), grad="sp")
+
+    weight_state = es.get_parameter_state(module.weight)
+    bias_state = es.get_parameter_state(module.bias)
+    assert weight_state.source == "conv"
+    assert bias_state.source == "conv"
+    assert repr(weight_state.spec.axes) == "out × in × kh × kw"
+    assert repr(bias_state.spec.axes) == "out"
+    assert weight_state.shared == ("tp", "sp")
+    assert bias_state.shared == ("tp", "sp")
+    assert weight_state.reduce == ("sp",)
+    assert bias_state.reduce == ("sp",)
+
+
+def test_register_conv_parameters_derives_rank_specific_weight_layouts():
+    conv1 = nn.Conv1d(3, 2, kernel_size=3, bias=False)
+    conv3 = nn.Conv3d(3, 2, kernel_size=3, bias=False)
+
+    es.register_conv_parameters_(conv1)
+    es.register_conv_parameters_(conv3)
+
+    assert repr(es.get_parameter_state(conv1.weight).spec.axes) == "out × in × k"
+    assert repr(es.get_parameter_state(conv3.weight).spec.axes) == "out × in × kd × kh × kw"
+
+
+def test_register_conv_parameters_derives_sharded_bias_layout():
+    module = nn.Conv2d(3, 2, kernel_size=3)
+
+    es.register_conv_parameters_(
+        module,
+        weight_layout="out/tp in kh kw",
+        mesh_dim_names=("tp", "sp"),
+        weight_grad="sp",
+        bias_grad="sp",
+    )
+
+    assert repr(es.get_parameter_state(module.weight).spec.axes) == "out / tp × in × kh × kw"
+    assert repr(es.get_parameter_state(module.bias).spec.axes) == "out / tp"
+    assert es.get_parameter_state(module.weight).shared == ("sp",)
+    assert es.get_parameter_state(module.bias).shared == ("sp",)
+
+
+def test_register_conv_parameters_supports_biasless_modules():
+    module = nn.Conv2d(3, 2, kernel_size=3, bias=False)
+
+    es.register_conv_parameters_(module, grad="dp")
+
+    assert es.get_parameter_state(module.weight).reduce == ("dp",)
+
+
+def test_register_conv_parameters_rejects_bias_metadata_without_bias():
+    module = nn.Conv2d(3, 2, kernel_size=3, bias=False)
+
+    try:
+        es.register_conv_parameters_(module, bias_grad="dp")
+    except ValueError as error:
+        assert "bias" in str(error)
+    else:
+        raise AssertionError("Expected bias metadata on a biasless conv module to fail")
+
+    assert es.get_parameter_state(module.weight) is None
+
+
+def test_register_conv_parameters_rejects_explicit_bias_layout_mismatch():
+    module = nn.Conv2d(3, 2, kernel_size=3)
+
+    try:
+        es.register_conv_parameters_(module, bias_layout="in")
+    except ValueError as error:
+        assert "bias" in str(error)
+        assert "layout" in str(error)
+    else:
+        raise AssertionError("Expected mismatched conv bias layout to fail")
+
+    assert es.get_parameter_state(module.weight) is None
+    assert es.get_parameter_state(module.bias) is None
+
+
+def test_register_conv_parameters_rejects_grouped_convolutions():
+    module = nn.Conv2d(4, 4, kernel_size=3, groups=2)
+
+    try:
+        es.register_conv_parameters_(module)
+    except NotImplementedError as error:
+        assert "groups" in str(error)
+    else:
+        raise AssertionError("Expected grouped conv registration to fail")
+
+    assert es.get_parameter_state(module.weight) is None
+    assert es.get_parameter_state(module.bias) is None
+
+
+def test_register_conv_parameters_rejects_conv_transpose():
+    module = nn.ConvTranspose2d(3, 2, kernel_size=3)
+
+    try:
+        es.register_conv_parameters_(module)
+    except NotImplementedError as error:
+        assert "ConvTranspose" in str(error)
+    else:
+        raise AssertionError("Expected ConvTranspose registration to fail")
+
+    assert es.get_parameter_state(module.weight) is None
+    assert es.get_parameter_state(module.bias) is None
+
+
+def test_register_conv_parameters_rejects_conv_transpose_subclasses():
+    class CustomTranspose(nn.ConvTranspose2d):
+        pass
+
+    module = CustomTranspose(3, 3, kernel_size=3)
+
+    try:
+        es.register_conv_parameters_(module)
+    except NotImplementedError as error:
+        assert "ConvTranspose" in str(error)
+    else:
+        raise AssertionError("Expected ConvTranspose subclass registration to fail")
+
+    assert es.get_parameter_state(module.weight) is None
+    assert es.get_parameter_state(module.bias) is None
+
+
+def test_register_conv_parameters_rejects_bias_shape_mismatch():
+    module = nn.Module()
+    module.weight = torch.nn.Parameter(torch.ones(2, 3, 3, 3))
+    module.bias = torch.nn.Parameter(torch.ones(4))
+
+    try:
+        es.register_conv_parameters_(module)
+    except ValueError as error:
+        assert "bias shape" in str(error)
+    else:
+        raise AssertionError("Expected conv bias shape mismatch to fail")
+
+    assert es.get_parameter_state(module.weight) is None
+    assert es.get_parameter_state(module.bias) is None
+
+
+def test_register_conv_parameters_is_atomic_on_rank_mismatch():
+    module = nn.Conv2d(3, 2, kernel_size=3)
+
+    try:
+        es.register_conv_parameters_(module, weight_layout="out in")
+    except ValueError as error:
+        assert "rank" in str(error)
+    else:
+        raise AssertionError("Expected conv layout rank mismatch to fail")
+
+    assert es.get_parameter_state(module.weight) is None
+    assert es.get_parameter_state(module.bias) is None
+
+
 def test_register_norm_parameters_registers_weight_and_bias():
     module = nn.LayerNorm(3)
 

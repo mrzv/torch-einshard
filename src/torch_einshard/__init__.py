@@ -24,6 +24,7 @@ from .params import (
     param_shard_metadata,
     reduce_grad_,
     reduce_module_grads_,
+    register_conv_parameters_,
     register_grad_reduction_hook_,
     register_linear_parameters_,
     register_native_grad_reduction_hooks_,

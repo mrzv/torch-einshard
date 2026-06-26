@@ -113,9 +113,10 @@ managed dimensions become `state.shared`. Use `init_sync=none`,
 ## Explicit Layout Registration
 
 Formula annotations only work when the parameter is an `einshard` operand. Hidden
-parameters inside `nn.Linear`, LayerNorm/RMSNorm-style affine parameters,
-`torch.nn.functional.linear`, or fused kernels can be registered explicitly
-without constructing a legacy `ParamSpec`:
+parameters inside `nn.Linear`, `nn.Conv1d`/`nn.Conv2d`/`nn.Conv3d`,
+LayerNorm/RMSNorm-style affine parameters, `torch.nn.functional.linear`, or
+fused kernels can be registered explicitly without constructing a legacy
+`ParamSpec`:
 
 ```python
 state = es.ParameterState.from_layout(
@@ -154,6 +155,28 @@ that first weight axis. The helper expects `nn.Linear`-style shapes: a rank-2
 weight and, when present, a rank-1 bias whose length matches the weight output
 dimension. It validates both parameters before attaching either state; shape,
 rank, or metadata conflicts do not partially update the module.
+
+For `nn.Conv1d`/`nn.Conv2d`/`nn.Conv3d`-style modules, register weight and
+optional bias metadata similarly:
+
+```python
+conv = torch.nn.Conv2d(in_channels, out_channels, kernel_size=3)
+
+es.register_conv_parameters_(
+    conv,
+    weight_layout="out/tp in kh kw",
+    mesh=mesh,
+    weight_grad="sp1-sp2",
+    bias_grad="sp1-sp2",
+)
+```
+
+If `weight_layout` is omitted, it is derived from the weight rank:
+`"out in k"`, `"out in kh kw"`, or `"out in kd kh kw"`. If `bias_layout` is
+omitted, it is derived from the first weight axis. The helper supports only
+ungrouped ConvNd-style parameters, not grouped convolutions or ConvTranspose
+modules, and validates rank-3/4/5 weight shapes plus optional rank-1 bias shape
+before attaching either state.
 
 For LayerNorm/RMSNorm-style affine parameters whose weight and bias have the same
 layout and shape, use `register_norm_parameters_`:
