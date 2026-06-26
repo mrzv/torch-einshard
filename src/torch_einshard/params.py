@@ -892,6 +892,12 @@ def _finalized_parameter_grad_state(state, grad, mesh_dim_names):
     )
 
 
+def _validate_finalized_grad_groups_exist(mesh, state):
+    if mesh is None or state.grad_comm.backend not in {"native", "ddp"}:
+        return
+    _validate_mesh_groups_exist(mesh, state.grad_comm.mesh_dims)
+
+
 def finalize_parameter_grad_comm_(param, grad, *, mesh=None, mesh_dim_names=()):
     if not isinstance(param, torch.nn.Parameter):
         raise TypeError("Parameter grad finalization requires a torch.nn.Parameter")
@@ -900,6 +906,7 @@ def finalize_parameter_grad_comm_(param, grad, *, mesh=None, mesh_dim_names=()):
         raise ValueError("Parameter does not have an attached ParameterState or ParamSpec")
     mesh_dim_names = _mesh_dim_names_from(mesh, mesh_dim_names)
     finalized = _finalized_parameter_grad_state(state, grad, mesh_dim_names)
+    _validate_finalized_grad_groups_exist(mesh, finalized)
     return register_parameter_state(param, finalized)
 
 
@@ -915,7 +922,9 @@ def finalize_module_parameter_grad_comm_(module, grad, *, mesh=None, mesh_dim_na
         state = _parameter_state_from_attached_metadata(param)
         if state is None:
             raise ValueError(f"module parameter {name!r} does not have attached ParameterState or ParamSpec")
-        updates.append((param, _finalized_parameter_grad_state(state, value, mesh_dim_names)))
+        finalized = _finalized_parameter_grad_state(state, value, mesh_dim_names)
+        _validate_finalized_grad_groups_exist(mesh, finalized)
+        updates.append((param, finalized))
 
     prepared = _prepare_parameter_state_updates(updates)
     for param, state in prepared:

@@ -1549,6 +1549,33 @@ def test_finalize_parameter_grad_comm_rejects_layout_shard_overlap():
     assert es.get_parameter_state(weight).grad_comm.pending_inference
 
 
+def test_finalize_parameter_grad_comm_validates_supplied_mesh_groups(mesh_2d):
+    weight = torch.nn.Parameter(torch.ones(3))
+    es.set_parameter_state(weight, es.ParameterState.from_layout("c", grad="async"))
+
+    try:
+        es.finalize_parameter_grad_comm_(weight, "dp-sp", mesh=mesh_2d)
+    except ValueError as error:
+        assert "wrap_mesh" in str(error)
+    else:
+        raise AssertionError("Expected unwrapped compound finalized grad group to fail")
+
+    assert es.get_parameter_state(weight).grad_comm.pending_inference
+    es.finalize_parameter_grad_comm_(weight, "dp-sp", mesh=es.wrap_mesh(mesh_2d))
+    assert es.get_parameter_state(weight).reduce == ("dp-sp",)
+
+
+def test_finalize_parameter_grad_comm_skips_external_mesh_group_validation(mesh_2d):
+    weight = torch.nn.Parameter(torch.ones(3))
+    es.set_parameter_state(weight, es.ParameterState.from_layout("c", grad="external"))
+
+    es.finalize_parameter_grad_comm_(weight, "missing:external", mesh=mesh_2d)
+
+    state = es.get_parameter_state(weight)
+    assert state.grad_comm.backend == "external"
+    assert state.grad_comm.mesh_dims == ("missing",)
+
+
 def test_finalize_module_parameter_grad_comm_is_atomic_on_failure():
     module = nn.Linear(3, 2)
     es.set_parameter_state(module.weight, es.ParameterState.from_layout("o c", grad="async"))
