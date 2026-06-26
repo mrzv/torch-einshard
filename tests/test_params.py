@@ -17,6 +17,10 @@ from torch_einshard.params import (
 from conftest import assert_close
 
 
+def _global_sp_size(mesh, local_size):
+    return local_size * dist.get_world_size(mesh["sp"].get_group())
+
+
 def test_param_spec_parses_layout_and_metadata():
     spec = es.ParamSpec("o/tp c", shared="sp1-sp2", reduce=("sp1-sp2",))
 
@@ -1977,8 +1981,9 @@ def test_einshard_defers_unary_output_partial_parameter_grad(dist_env, mesh_2d):
 
 
 def test_einshard_defers_inferred_parameter_grad_for_distributed_formula(dist_env, mesh_2d):
-    x = torch.ones(2, 3)
-    weight = torch.nn.Parameter(torch.ones(3))
+    c_local = 3
+    x = torch.ones(2, c_local)
+    weight = torch.nn.Parameter(torch.ones(_global_sp_size(mesh_2d, c_local)))
 
     es.einshard(
         "b/dp c/sp, c [param, grad=async] -> b/dp c",
@@ -1993,8 +1998,9 @@ def test_einshard_defers_inferred_parameter_grad_for_distributed_formula(dist_en
 
 
 def test_reduce_grad_rejects_pending_native_parameter_grad(dist_env, mesh_2d):
-    x = torch.ones(2, 3)
-    weight = torch.nn.Parameter(torch.ones(3))
+    c_local = 3
+    x = torch.ones(2, c_local)
+    weight = torch.nn.Parameter(torch.ones(_global_sp_size(mesh_2d, c_local)))
 
     es.einshard(
         "b/dp c/sp, c [param, grad=async] -> b/dp c",
@@ -2013,13 +2019,16 @@ def test_reduce_grad_rejects_pending_native_parameter_grad(dist_env, mesh_2d):
 
 
 def test_einshard_distributed_pending_grad_fills_nonexplicit_none(dist_env, mesh_2d):
-    x = torch.ones(2, 3)
-    weight = torch.nn.Parameter(torch.ones(3))
+    c_local = 3
+    c_global = _global_sp_size(mesh_2d, c_local)
+    x_full = torch.ones(2, c_global)
+    x_shard = torch.ones(2, c_local)
+    weight = torch.nn.Parameter(torch.ones(c_global))
 
-    es.einshard("b c, c [param] -> b c", x, weight)
+    es.einshard("b c, c [param] -> b c", x_full, weight)
     es.einshard(
         "b/dp c/sp, c [param, grad=async] -> b/dp c",
-        x,
+        x_shard,
         weight,
         mesh=mesh_2d,
     )
@@ -2030,15 +2039,18 @@ def test_einshard_distributed_pending_grad_fills_nonexplicit_none(dist_env, mesh
 
 
 def test_einshard_distributed_pending_grad_overrides_prior_inferred_concrete(dist_env, mesh_2d):
-    x = torch.ones(2, 3)
-    weight = torch.nn.Parameter(torch.ones(3))
+    c_local = 3
+    c_global = _global_sp_size(mesh_2d, c_local)
+    x_full = torch.ones(2, c_global)
+    x_shard = torch.ones(2, c_local)
+    weight = torch.nn.Parameter(torch.ones(c_global))
 
-    es.einshard("b/dp c, c [param, grad=async] -> b/dp c", x, weight, mesh=mesh_2d)
+    es.einshard("b/dp c, c [param, grad=async] -> b/dp c", x_full, weight, mesh=mesh_2d)
     assert es.get_parameter_state(weight).grad_comm.mesh_dims == ("dp",)
 
     es.einshard(
         "b/dp c/sp, c [param, grad=async] -> b/dp c",
-        x,
+        x_shard,
         weight,
         mesh=mesh_2d,
     )
@@ -2050,16 +2062,19 @@ def test_einshard_distributed_pending_grad_overrides_prior_inferred_concrete(dis
 
 
 def test_einshard_prior_pending_grad_masks_later_inferred_concrete(dist_env, mesh_2d):
-    x = torch.ones(2, 3)
-    weight = torch.nn.Parameter(torch.ones(3))
+    c_local = 3
+    c_global = _global_sp_size(mesh_2d, c_local)
+    x_full = torch.ones(2, c_global)
+    x_shard = torch.ones(2, c_local)
+    weight = torch.nn.Parameter(torch.ones(c_global))
 
     es.einshard(
         "b/dp c/sp, c [param, grad=async] -> b/dp c",
-        x,
+        x_shard,
         weight,
         mesh=mesh_2d,
     )
-    es.einshard("b/dp c, c [param, grad=async] -> b/dp c", x, weight, mesh=mesh_2d)
+    es.einshard("b/dp c, c [param, grad=async] -> b/dp c", x_full, weight, mesh=mesh_2d)
     state = es.get_parameter_state(weight)
 
     assert state.grad_comm.pending_inference
@@ -2068,15 +2083,18 @@ def test_einshard_prior_pending_grad_masks_later_inferred_concrete(dist_env, mes
 
 
 def test_einshard_distributed_pending_grad_conflicts_with_explicit_none(dist_env, mesh_2d):
-    x = torch.ones(2, 3)
-    weight = torch.nn.Parameter(torch.ones(3))
+    c_local = 3
+    c_global = _global_sp_size(mesh_2d, c_local)
+    x_full = torch.ones(2, c_global)
+    x_shard = torch.ones(2, c_local)
+    weight = torch.nn.Parameter(torch.ones(c_global))
 
-    es.einshard("b c, c [param, grad=none] -> b c", x, weight)
+    es.einshard("b c, c [param, grad=none] -> b c", x_full, weight)
 
     try:
         es.einshard(
             "b/dp c/sp, c [param, grad=async] -> b/dp c",
-            x,
+            x_shard,
             weight,
             mesh=mesh_2d,
         )
@@ -2089,8 +2107,9 @@ def test_einshard_distributed_pending_grad_conflicts_with_explicit_none(dist_env
 
 
 def test_einshard_pending_grad_backend_conflicts_with_existing_native_reduce(dist_env, mesh_2d):
-    x = torch.ones(2, 3)
-    weight = torch.nn.Parameter(torch.ones(3))
+    c_local = 3
+    x = torch.ones(2, c_local)
+    weight = torch.nn.Parameter(torch.ones(_global_sp_size(mesh_2d, c_local)))
     es.set_param_spec(weight, es.ParamSpec("c", reduce="sp"))
 
     try:
@@ -2109,12 +2128,15 @@ def test_einshard_pending_grad_backend_conflicts_with_existing_native_reduce(dis
 
 
 def test_einshard_pending_external_grad_conflicts_with_later_native_inference(dist_env, mesh_2d):
-    x = torch.ones(2, 3)
-    weight = torch.nn.Parameter(torch.ones(3))
+    c_local = 3
+    c_global = _global_sp_size(mesh_2d, c_local)
+    x_full = torch.ones(2, c_global)
+    x_shard = torch.ones(2, c_local)
+    weight = torch.nn.Parameter(torch.ones(c_global))
 
     es.einshard(
         "b/dp c/sp, c [param, grad=external] -> b/dp c",
-        x,
+        x_shard,
         weight,
         mesh=mesh_2d,
     )
@@ -2122,7 +2144,7 @@ def test_einshard_pending_external_grad_conflicts_with_later_native_inference(di
     try:
         es.einshard(
             "b/dp c, c [param, grad=async] -> b/dp c",
-            x,
+            x_full,
             weight,
             mesh=mesh_2d,
         )
