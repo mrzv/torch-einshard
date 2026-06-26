@@ -113,8 +113,9 @@ managed dimensions become `state.shared`. Use `init_sync=none`,
 ## Explicit Layout Registration
 
 Formula annotations only work when the parameter is an `einshard` operand. Hidden
-parameters inside `nn.Linear`, `torch.nn.functional.linear`, or fused kernels can
-be registered explicitly without constructing a legacy `ParamSpec`:
+parameters inside `nn.Linear`, LayerNorm/RMSNorm-style affine parameters,
+`torch.nn.functional.linear`, or fused kernels can be registered explicitly
+without constructing a legacy `ParamSpec`:
 
 ```python
 state = es.ParameterState.from_layout(
@@ -153,6 +154,28 @@ that first weight axis. The helper expects `nn.Linear`-style shapes: a rank-2
 weight and, when present, a rank-1 bias whose length matches the weight output
 dimension. It validates both parameters before attaching either state; shape,
 rank, or metadata conflicts do not partially update the module.
+
+For LayerNorm/RMSNorm-style affine parameters whose weight and bias have the same
+layout and shape, use `register_norm_parameters_`:
+
+```python
+norm = torch.nn.LayerNorm(hidden)
+
+es.register_norm_parameters_(
+    norm,
+    layout="c",
+    mesh=mesh,
+    grad="sp1-sp2",
+)
+```
+
+If `layout` is omitted, it defaults to `"c"`. If `bias_layout` is omitted, it
+matches the weight layout. `weight_layout` can be used instead of `layout`; if
+both are supplied, they must describe the same layout. Shared `grad=` and
+`init_sync=` defaults apply to both weight and bias unless `weight_*` or
+`bias_*` overrides are provided. The helper requires a weight parameter and
+validates that an optional bias has the same shape before attaching either state.
+It does not synchronize running-stat buffers.
 
 ## Module Helpers
 

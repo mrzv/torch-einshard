@@ -311,6 +311,15 @@ def _validate_linear_bias_layout(weight_layout, bias_layout):
         raise ValueError("Linear bias layout must match the first weight layout axis")
 
 
+def _validate_matching_layout(layout, other_layout, label):
+    _validate_layout_value(layout)
+    _validate_layout_value(other_layout)
+    axes = _parse_axes(layout)
+    other_axes = _parse_axes(other_layout)
+    if tuple(_axis_signature(axis) for axis in axes) != tuple(_axis_signature(axis) for axis in other_axes):
+        raise ValueError(f"{label} layout must match weight layout")
+
+
 def _parameter_attr(module, name):
     param = getattr(module, name, None)
     if param is None:
@@ -334,6 +343,19 @@ def _validate_linear_parameter_shapes(weight, bias):
         raise ValueError("Linear bias must be rank 1")
     if bias is not None and weight.shape[0] != bias.shape[0]:
         raise ValueError("Linear bias shape must match weight output dimension")
+
+
+def _validate_norm_parameter_shapes(weight, bias):
+    if bias is not None and weight.shape != bias.shape:
+        raise ValueError("Norm bias shape must match weight shape")
+
+
+class _DefaultNormLayout:
+    def __repr__(self):
+        return '"c"'
+
+
+_DEFAULT_NORM_LAYOUT = _DefaultNormLayout()
 
 
 @dataclass(frozen=True)
@@ -932,6 +954,76 @@ def register_linear_parameters_(
             bias_layout = _bias_layout_from_weight_layout(weight_layout)
         else:
             _validate_linear_bias_layout(weight_layout, bias_layout)
+        updates.append((
+            bias,
+            ParameterState.from_layout(
+                bias_layout,
+                mesh_dim_names=mesh_dim_names,
+                grad=bias_grad,
+                init_sync=bias_init_sync,
+                source=source,
+            ),
+        ))
+
+    prepared = _prepare_parameter_state_updates(updates)
+    for param, state in prepared:
+        set_parameter_state(param, state)
+    return module
+
+
+def register_norm_parameters_(
+    module,
+    *,
+    layout=_DEFAULT_NORM_LAYOUT,
+    weight_layout=None,
+    bias_layout=None,
+    mesh=None,
+    mesh_dim_names=(),
+    grad=None,
+    weight_grad=None,
+    bias_grad=None,
+    init_sync=None,
+    weight_init_sync=None,
+    bias_init_sync=None,
+    source="norm",
+):
+    mesh_dim_names = _mesh_dim_names_from(mesh, mesh_dim_names)
+    explicit_bias_metadata = bias_layout is not None or bias_grad is not None or bias_init_sync is not None
+    layout_omitted = layout is _DEFAULT_NORM_LAYOUT
+    layout = "c" if layout_omitted else layout
+    if weight_layout is None:
+        weight_layout = layout
+    elif not layout_omitted:
+        _validate_matching_layout(layout, weight_layout, "Norm weight")
+    weight_grad = grad if weight_grad is None else weight_grad
+    bias_grad = grad if bias_grad is None else bias_grad
+    weight_init_sync = init_sync if weight_init_sync is None else weight_init_sync
+    bias_init_sync = init_sync if bias_init_sync is None else bias_init_sync
+
+    weight = _parameter_attr(module, "weight")
+    if weight is None:
+        raise ValueError("module must define a weight parameter")
+
+    updates = [(
+        weight,
+        ParameterState.from_layout(
+            weight_layout,
+            mesh_dim_names=mesh_dim_names,
+            grad=weight_grad,
+            init_sync=weight_init_sync,
+            source=source,
+        ),
+    )]
+
+    bias = _parameter_attr(module, "bias")
+    if bias is None and explicit_bias_metadata:
+        raise ValueError("module does not define a bias parameter")
+    _validate_norm_parameter_shapes(weight, bias)
+    if bias is not None:
+        if bias_layout is None:
+            bias_layout = weight_layout
+        else:
+            _validate_matching_layout(weight_layout, bias_layout, "Norm bias")
         updates.append((
             bias,
             ParameterState.from_layout(

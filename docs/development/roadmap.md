@@ -144,7 +144,7 @@ Implemented behavior:
 - Input operand annotations such as `[param]`, `[param, grad=async]`, `[param, grad=none]`, and `[param, init_sync=none]` are parsed and stored in `TensorSpec`.
 - `einshard` registers annotated `torch.nn.Parameter` operands after successful execution, merges compatible formula metadata with layout-only or semantically compatible legacy `ParamSpec` metadata, and rejects conflicting layouts or conflicting explicit opt-outs.
 - Local formula uses infer visible native gradient obligations; distributed inferred obligations remain pending until planner-aware inference can prove the correct execution behavior.
-- `ParameterState.from_layout`, `register_parameter_layout`, and `register_linear_parameters_` provide explicit state registration for hidden parameters and `nn.Linear`-style modules that cannot expose parameters as formula operands.
+- `ParameterState.from_layout`, `register_parameter_layout`, `register_linear_parameters_`, and `register_norm_parameters_` provide explicit state registration for hidden parameters and common linear/norm-style modules that cannot expose parameters as formula operands.
 - SciGPT-style tensor-parallel MLP and attention projection patterns are covered by tests using explicit `einshard` calls.
 
 Deferred string notation:
@@ -160,7 +160,7 @@ Remaining work:
 - Add planner-aware distributed backward inference for pending annotated parameter obligations.
 - Add execution backends for native async parameter-gradient reductions and DDP-backed obligations.
 - Add bucketed/native scheduling for unused-parameter or rank-dependent-control-flow cases; the current native hook path requires identical backward participation and hook order across ranks.
-- Extend higher-level module/layer wrappers beyond the current linear-parameter registration foundation, including convolution, normalization, and fused-kernel cases.
+- Extend higher-level module/layer wrappers beyond the current linear/norm registration foundation, including convolution and fused-kernel cases.
 - Make `ParamSpec` a thin compatibility wrapper once inferred `ParameterState` has feature parity and downstream users have migrated.
 
 ## Deferred Cleanup

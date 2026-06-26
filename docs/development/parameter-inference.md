@@ -73,10 +73,10 @@ The initial foundation is implemented.
   hooks for non-DDP training loops. This path reduces each incoming gradient
   contribution synchronously and requires identical backward participation and
   hook order across ranks.
-- Hidden linear-style parameters can be registered explicitly with
-  `ParameterState.from_layout`, `register_parameter_layout`, or
-  `register_linear_parameters_`; this covers state attachment without inferring
-  arbitrary module internals.
+- Hidden linear- and norm-style parameters can be registered explicitly with
+  `ParameterState.from_layout`, `register_parameter_layout`,
+  `register_linear_parameters_`, or `register_norm_parameters_`; this covers
+  state attachment without inferring arbitrary module internals.
 
 The remaining major gap is execution-layer and planner-aware distributed
 inference work. The current implementation records obligations and preserves
@@ -603,9 +603,11 @@ Status: partially implemented.
 - Implemented: `nn.Linear`-style weight/bias registration through
   `register_linear_parameters_`, including derived bias layout and atomic
   conflict validation.
+- Implemented: normalization-style weight/bias registration through
+  `register_norm_parameters_`, including shared layout defaults, same-shape bias
+  validation, and atomic conflict validation.
 
 - Add wrappers or explicit registration helpers for convolution layers.
-- Add wrappers or explicit registration helpers for normalization layers.
 - Add extension points for Transformer Engine or other fused modules.
 - Cover SciGPT-style MLP, attention, Swin, positional embedding, and head cases.
 

@@ -993,6 +993,161 @@ def test_register_linear_parameters_rejects_non_string_layouts():
         raise AssertionError("Expected non-string weight layout to fail")
 
 
+def test_register_norm_parameters_registers_weight_and_bias():
+    module = nn.LayerNorm(3)
+
+    es.register_norm_parameters_(module, layout="c", mesh_dim_names=("dp", "sp"), grad="dp-sp")
+
+    weight_state = es.get_parameter_state(module.weight)
+    bias_state = es.get_parameter_state(module.bias)
+    assert weight_state.source == "norm"
+    assert bias_state.source == "norm"
+    assert repr(weight_state.spec.axes) == "c"
+    assert repr(bias_state.spec.axes) == "c"
+    assert weight_state.shared == ("dp", "sp")
+    assert bias_state.shared == ("dp", "sp")
+    assert weight_state.reduce == ("dp-sp",)
+    assert bias_state.reduce == ("dp-sp",)
+
+
+def test_register_norm_parameters_supports_weight_only_modules():
+    module = nn.Module()
+    module.weight = torch.nn.Parameter(torch.ones(3))
+    module.bias = None
+
+    es.register_norm_parameters_(module, layout="c", grad="dp")
+
+    assert es.get_parameter_state(module.weight).reduce == ("dp",)
+
+
+def test_register_norm_parameters_uses_grad_overrides():
+    module = nn.LayerNorm(3)
+
+    es.register_norm_parameters_(module, layout="c", grad="dp", bias_grad="sp")
+
+    assert es.get_parameter_state(module.weight).reduce == ("dp",)
+    assert es.get_parameter_state(module.bias).reduce == ("sp",)
+
+
+def test_register_norm_parameters_accepts_weight_layout_alias():
+    module = nn.LayerNorm(3)
+
+    es.register_norm_parameters_(module, weight_layout="hidden", grad="dp")
+
+    assert repr(es.get_parameter_state(module.weight).spec.axes) == "hidden"
+    assert repr(es.get_parameter_state(module.bias).spec.axes) == "hidden"
+
+
+def test_register_norm_parameters_rejects_conflicting_layout_aliases():
+    module = nn.LayerNorm(3)
+
+    try:
+        es.register_norm_parameters_(module, layout="c", weight_layout="hidden")
+    except ValueError as error:
+        assert "weight" in str(error)
+        assert "layout" in str(error)
+    else:
+        raise AssertionError("Expected conflicting norm layout aliases to fail")
+
+    assert es.get_parameter_state(module.weight) is None
+    assert es.get_parameter_state(module.bias) is None
+
+
+def test_register_norm_parameters_allows_matching_layout_aliases():
+    module = nn.LayerNorm(3)
+
+    es.register_norm_parameters_(module, layout="hidden", weight_layout="hidden", grad="dp")
+
+    assert repr(es.get_parameter_state(module.weight).spec.axes) == "hidden"
+    assert repr(es.get_parameter_state(module.bias).spec.axes) == "hidden"
+
+
+def test_register_norm_parameters_rejects_explicit_none_layout():
+    module = nn.LayerNorm(3)
+
+    try:
+        es.register_norm_parameters_(module, layout=None, weight_layout="hidden")
+    except TypeError as error:
+        assert "layout" in str(error)
+    else:
+        raise AssertionError("Expected explicit None norm layout to fail")
+
+    assert es.get_parameter_state(module.weight) is None
+    assert es.get_parameter_state(module.bias) is None
+
+
+def test_register_norm_parameters_rejects_bias_metadata_without_bias():
+    module = nn.Module()
+    module.weight = torch.nn.Parameter(torch.ones(3))
+    module.bias = None
+
+    try:
+        es.register_norm_parameters_(module, layout="c", bias_grad="dp")
+    except ValueError as error:
+        assert "bias" in str(error)
+    else:
+        raise AssertionError("Expected bias metadata on a biasless norm module to fail")
+
+    assert es.get_parameter_state(module.weight) is None
+
+
+def test_register_norm_parameters_rejects_bias_layout_mismatch():
+    module = nn.LayerNorm(3)
+
+    try:
+        es.register_norm_parameters_(module, layout="c", bias_layout="d")
+    except ValueError as error:
+        assert "bias" in str(error)
+        assert "layout" in str(error)
+    else:
+        raise AssertionError("Expected mismatched norm bias layout to fail")
+
+    assert es.get_parameter_state(module.weight) is None
+    assert es.get_parameter_state(module.bias) is None
+
+
+def test_register_norm_parameters_rejects_bias_shape_mismatch():
+    module = nn.Module()
+    module.weight = torch.nn.Parameter(torch.ones(3))
+    module.bias = torch.nn.Parameter(torch.ones(4))
+
+    try:
+        es.register_norm_parameters_(module, layout="c")
+    except ValueError as error:
+        assert "bias shape" in str(error)
+    else:
+        raise AssertionError("Expected norm bias shape mismatch to fail")
+
+    assert es.get_parameter_state(module.weight) is None
+    assert es.get_parameter_state(module.bias) is None
+
+
+def test_register_norm_parameters_is_atomic_on_rank_mismatch():
+    module = nn.LayerNorm(3)
+
+    try:
+        es.register_norm_parameters_(module, layout="h w")
+    except ValueError as error:
+        assert "rank" in str(error)
+    else:
+        raise AssertionError("Expected norm layout rank mismatch to fail")
+
+    assert es.get_parameter_state(module.weight) is None
+    assert es.get_parameter_state(module.bias) is None
+
+
+def test_register_norm_parameters_rejects_missing_weight_parameter():
+    module = nn.Module()
+    module.bias = torch.nn.Parameter(torch.ones(3))
+
+    try:
+        es.register_norm_parameters_(module)
+    except ValueError as error:
+        assert "weight" in str(error)
+    else:
+        raise AssertionError("Expected missing norm weight parameter to fail")
+
+
 def test_iter_parameter_states_yields_attached_states():
     module = nn.Sequential(nn.Linear(3, 2), nn.Linear(2, 1))
     state = es.ParameterState.from_spec(es.parse_sharding("o c [param] -> o c")[0])
