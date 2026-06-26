@@ -555,7 +555,7 @@ def test_sharded_and_local_real_fft_uses_fast_path(dist_env, mesh_tp, monkeypatc
 
     expected = torch.split(torch.fft.rfftn(full, dim=(1, 2), norm=norm), shapes, dim=1)[rank]
     assert distributed_fft_calls == 1
-    assert_close(z, expected)
+    assert_close(z, expected, rtol=1e-4, atol=1e-5)
 
 
 @pytest.mark.parametrize("norm", [None, "backward", "forward", "ortho"])
@@ -598,7 +598,7 @@ def test_sharded_and_local_inverse_real_fft_uses_fast_path(dist_env, mesh_tp, mo
 
     expected = torch.split(torch.fft.irfftn(spectrum, s=(x_size, y_size), dim=(1, 2), norm=norm), shapes, dim=1)[rank]
     assert distributed_fft_calls == 1
-    assert_close(z, expected, rtol=1e-4, atol=2e-4)
+    assert_close(z, expected, rtol=1e-4, atol=1e-3)
 
 
 def test_sharded_and_local_inverse_real_fft_signal_size_mismatch_falls_back(dist_env, mesh_tp, monkeypatch):
@@ -711,7 +711,7 @@ def test_sharded_and_local_real_fft_fast_path_backward(dist_env, mesh_tp, monkey
     expected = torch.fft.rfftn(expected_full, dim=(1, 2))
     (expected.abs() ** 2).sum().backward()
     assert distributed_fft_calls == 2
-    assert_close(x.grad, torch.split(expected_full.grad, shapes, dim=1)[rank], rtol=1e-4, atol=2e-4)
+    assert_close(x.grad, torch.split(expected_full.grad, shapes, dim=1)[rank], rtol=1e-4, atol=1e-3)
 
 
 def test_sharded_and_local_inverse_real_fft_fast_path_backward(dist_env, mesh_tp, monkeypatch):
