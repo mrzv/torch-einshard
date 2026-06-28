@@ -1590,6 +1590,312 @@ def test_einshard_registers_annotated_parameter_operands():
     assert not state.grad_comm.pending_inference
 
 
+def test_einshard_like_registers_annotated_parameter_operands_without_execution():
+    x = torch.ones(2, 5)
+    weight = torch.nn.Parameter(torch.ones(4, 3))
+
+    output = es.einshard_like("b c, o c [param, grad=async] -> b o", x, weight)
+    state = es.get_parameter_state(weight)
+
+    assert output is None
+    assert state.source == "formula"
+    assert state.layout_shard_dims == ()
+    assert state.init_sync.mode == "none"
+    assert state.grad_comm.mode == "none"
+    assert not state.grad_comm.pending_inference
+
+
+def test_einshard_like_infers_parameter_grad_dims_without_reference_tensor(dist_env, mesh_2d):
+    weight = torch.nn.Parameter(torch.ones(3))
+
+    es.einshard_like(
+        "b/dp c, c [param, grad=async] -> b/dp c",
+        None,
+        weight,
+        mesh=mesh_2d,
+    )
+    state = es.get_parameter_state(weight)
+
+    assert state.init_sync.mode == "inferred"
+    assert state.shared == ("dp", "sp")
+    assert state.grad_comm.mode == "inferred"
+    assert state.grad_comm.mesh_dims == ("dp",)
+    assert state.grad_comm.backend == "native"
+    assert state.grad_comm.schedule == "async"
+    assert not state.grad_comm.pending_inference
+
+
+def test_einshard_like_rejects_parameter_rank_mismatch():
+    weight = torch.nn.Parameter(torch.ones(2, 3))
+
+    try:
+        es.einshard_like("b c, c [param] -> b c", None, weight)
+    except ValueError as error:
+        assert "rank" in str(error)
+    else:
+        raise AssertionError("Expected parameter rank mismatch to fail")
+
+    assert es.get_parameter_state(weight) is None
+
+
+def test_einshard_like_allows_ellipsis_parameter_rank():
+    weight = torch.nn.Parameter(torch.ones(2, 3))
+
+    es.einshard_like("b c, ... [param] -> b c", None, weight)
+    state = es.get_parameter_state(weight)
+
+    assert state.source == "formula"
+    assert state.layout_shard_dims == ()
+
+
+def test_einshard_like_rejects_invalid_operation_without_attaching_metadata():
+    weight = torch.nn.Parameter(torch.ones(3))
+
+    try:
+        es.einshard_like("b c, c [param] -> b d", None, weight)
+    except ValueError as error:
+        assert "Output dimension" in str(error)
+    else:
+        raise AssertionError("Expected invalid local formula to fail")
+
+    assert es.get_parameter_state(weight) is None
+
+
+def test_einshard_like_rejects_duplicate_output_axes_without_attaching_metadata():
+    weight = torch.nn.Parameter(torch.ones(3))
+
+    try:
+        es.einshard_like("b [param] -> b b", weight)
+    except ValueError as error:
+        assert "appears more than once" in str(error)
+    else:
+        raise AssertionError("Expected duplicate output axis to fail")
+
+    assert es.get_parameter_state(weight) is None
+
+
+def test_einshard_like_rejects_invalid_distributed_operation_without_attaching_metadata(dist_env, mesh_2d):
+    weight = torch.nn.Parameter(torch.ones(3))
+
+    try:
+        es.einshard_like("b, c [param] -> b/dp d", None, weight, mesh=mesh_2d)
+    except ValueError as error:
+        assert "Output dimension" in str(error)
+    else:
+        raise AssertionError("Expected invalid distributed formula to fail")
+
+    assert es.get_parameter_state(weight) is None
+
+
+def test_einshard_like_rejects_duplicate_distributed_output_axes_without_attaching_metadata(dist_env, mesh_2d):
+    weight = torch.nn.Parameter(torch.ones(3))
+
+    try:
+        es.einshard_like("b [param] -> b/dp b/sp", weight, mesh=mesh_2d)
+    except ValueError as error:
+        assert "appears more than once" in str(error)
+    else:
+        raise AssertionError("Expected duplicate distributed output axis to fail")
+
+    assert es.get_parameter_state(weight) is None
+
+
+def test_einshard_like_rejects_unary_distributed_rank_mismatch_without_attaching_metadata(dist_env, mesh_2d):
+    weight = torch.nn.Parameter(torch.ones(2, 3))
+
+    try:
+        es.einshard_like("b c [param] -> b/dp", weight, mesh=mesh_2d)
+    except ValueError as error:
+        assert "dimensions must match" in str(error)
+    else:
+        raise AssertionError("Expected unary distributed rank mismatch to fail")
+
+    assert es.get_parameter_state(weight) is None
+
+
+def test_einshard_like_rejects_one_sided_distributed_ellipsis_without_attaching_metadata(dist_env, mesh_2d):
+    weight = torch.nn.Parameter(torch.ones(2, 3))
+
+    try:
+        es.einshard_like("b ... [param] -> b/dp", weight, mesh=mesh_2d)
+    except NotImplementedError as error:
+        assert "ellipsis in both" in str(error)
+    else:
+        raise AssertionError("Expected one-sided distributed ellipsis to fail")
+
+    assert es.get_parameter_state(weight) is None
+
+
+def test_einshard_like_rejects_distributed_ellipsis_fixed_rank_mismatch_without_attaching_metadata(dist_env, mesh_2d):
+    weight = torch.nn.Parameter(torch.ones(2, 3))
+
+    try:
+        es.einshard_like("b c ... [param] -> b/dp ...", weight, mesh=mesh_2d)
+    except ValueError as error:
+        assert "ellipsis notation" in str(error)
+    else:
+        raise AssertionError("Expected distributed ellipsis rank mismatch to fail")
+
+    assert es.get_parameter_state(weight) is None
+
+
+def test_einshard_like_rejects_duplicate_distributed_input_axes_without_attaching_metadata(dist_env, mesh_2d):
+    weight = torch.nn.Parameter(torch.ones(3, 3))
+
+    try:
+        es.einshard_like("b, c c [param] -> b/dp c", None, weight, mesh=mesh_2d)
+    except ValueError as error:
+        assert "unique axis names" in str(error)
+    else:
+        raise AssertionError("Expected duplicate distributed input axis to fail")
+
+    assert es.get_parameter_state(weight) is None
+
+
+def test_einshard_like_rejects_unsupported_binary_transition_without_attaching_metadata():
+    class Mesh:
+        mesh_dim_names = ("dp", "sp", "tp")
+
+    weight = torch.nn.Parameter(torch.ones(3, 3))
+
+    try:
+        es.einshard_like(
+            "o a/dp b/sp, a/sp b/tp [param] -> o",
+            None,
+            weight,
+            mesh=Mesh(),
+        )
+    except NotImplementedError:
+        pass
+    else:
+        raise AssertionError("Expected unsupported binary transition to fail")
+
+    assert es.get_parameter_state(weight) is None
+
+
+def test_einshard_like_rejects_unsupported_binary_transition_with_ellipsis_without_attaching_metadata():
+    class Mesh:
+        mesh_dim_names = ("dp", "sp", "tp")
+
+    weight = torch.nn.Parameter(torch.ones(3, 3))
+
+    try:
+        es.einshard_like(
+            "o ... a/dp b/sp, ... a/sp b/tp [param] -> o ...",
+            None,
+            weight,
+            mesh=Mesh(),
+        )
+    except NotImplementedError:
+        pass
+    else:
+        raise AssertionError("Expected unsupported binary transition with ellipsis to fail")
+
+    assert es.get_parameter_state(weight) is None
+
+
+def test_einshard_like_rejects_unknown_distributed_mesh_dim_without_attaching_metadata():
+    class Mesh:
+        mesh_dim_names = ("dp",)
+
+    weight = torch.nn.Parameter(torch.ones(3))
+
+    try:
+        es.einshard_like("b/foo ..., c [param] -> b ... c", None, weight, mesh=Mesh())
+    except ValueError as error:
+        assert "unknown mesh dimensions" in str(error)
+    else:
+        raise AssertionError("Expected unknown distributed mesh dim to fail")
+
+    assert es.get_parameter_state(weight) is None
+
+
+def test_einshard_like_rejects_unknown_distributed_partial_without_attaching_metadata():
+    class Mesh:
+        mesh_dim_names = ("dp",)
+
+    weight = torch.nn.Parameter(torch.ones(3))
+
+    try:
+        es.einshard_like("b ... // foo, c [param] -> b ... c", None, weight, mesh=Mesh())
+    except ValueError as error:
+        assert "unknown mesh dimensions" in str(error)
+    else:
+        raise AssertionError("Expected unknown distributed partial to fail")
+
+    assert es.get_parameter_state(weight) is None
+
+
+def test_einshard_like_rejects_binary_distributed_input_partials_without_attaching_metadata():
+    class Mesh:
+        mesh_dim_names = ("dp",)
+
+    weight = torch.nn.Parameter(torch.ones(3))
+
+    try:
+        es.einshard_like("b // dp, c [param] -> b c", None, weight, mesh=Mesh())
+    except ValueError as error:
+        assert "partial inputs" in str(error)
+    else:
+        raise AssertionError("Expected binary distributed input partial to fail")
+
+    assert es.get_parameter_state(weight) is None
+
+
+def test_einshard_like_rejects_omitted_sharded_input_only_axis_without_attaching_metadata():
+    class Mesh:
+        mesh_dim_names = ("dp", "sp")
+
+    weight = torch.nn.Parameter(torch.ones(3))
+
+    try:
+        es.einshard_like("b/dp c, c [param] -> c/sp", None, weight, mesh=Mesh())
+    except ValueError as error:
+        assert "output partial" in str(error)
+    else:
+        raise AssertionError("Expected omitted sharded input-only axis to fail")
+
+    assert es.get_parameter_state(weight) is None
+
+
+def test_einshard_like_rejects_local_omitted_sharded_input_only_axis_without_attaching_metadata():
+    weight = torch.nn.Parameter(torch.ones(3))
+
+    try:
+        es.einshard_like("b/dp c, c [param] -> c", None, weight)
+    except ValueError as error:
+        assert "output partial" in str(error)
+    else:
+        raise AssertionError("Expected local omitted sharded input-only axis to fail")
+
+    assert es.get_parameter_state(weight) is None
+
+
+def test_einshard_like_rejects_unknown_local_mesh_dim_without_attaching_metadata():
+    class Mesh:
+        mesh_dim_names = ("dp",)
+
+    weight = torch.nn.Parameter(torch.ones(3))
+
+    try:
+        es.einshard_like(
+            "b/foo, c [param, grad=none] -> b/foo c",
+            None,
+            weight,
+            mesh=Mesh(),
+        )
+    except ValueError as error:
+        assert "unknown mesh dimensions" in str(error)
+    else:
+        raise AssertionError("Expected unknown local mesh dim to fail")
+
+    assert es.get_parameter_state(weight) is None
+
+
+def test_einshard_like_is_torch_compile_disabled():
+    assert getattr(es.einshard_like, "_torchdynamo_disable", False) is True
+
+
 def test_einshard_infers_parameter_grad_dims_from_visible_sharded_axes(dist_env, mesh_2d):
     x = torch.ones(2, 3)
     weight = torch.nn.Parameter(torch.ones(3))
@@ -1956,6 +2262,22 @@ def test_register_parameter_operand_can_defer_grad_inference(dist_env, mesh_2d):
 
     assert returned is weight
     assert state.grad_comm.pending_inference
+
+
+def test_register_parameter_operand_rejects_parameter_rank_mismatch():
+    weight = torch.nn.Parameter(torch.ones(2, 3))
+    input_spec, param_spec, output_spec = es.parse_sharding(
+        "b c, c [param] -> b c"
+    )
+
+    try:
+        register_parameter_operand(weight, (input_spec, param_spec), output_spec, 1)
+    except ValueError as error:
+        assert "rank" in str(error)
+    else:
+        raise AssertionError("Expected parameter rank mismatch to fail")
+
+    assert es.get_parameter_state(weight) is None
 
 
 def test_einshard_merges_formula_grad_into_layout_only_param_spec(dist_env, mesh_2d):

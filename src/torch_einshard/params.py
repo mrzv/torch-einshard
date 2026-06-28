@@ -364,7 +364,15 @@ def _validate_metadata_keys(value, names, label):
 def _validate_parameter_state_rank(param, state):
     if state.spec is None:
         return
-    if hasattr(param, "ndim") and param.ndim != len(state.axes):
+    if not hasattr(param, "ndim"):
+        return
+    axes = tuple(state.axes)
+    if any(isinstance(axis, EllipsisAxis) for axis in axes):
+        min_rank = sum(not isinstance(axis, EllipsisAxis) for axis in axes)
+        valid = param.ndim >= min_rank
+    else:
+        valid = param.ndim == len(axes)
+    if not valid:
         raise ValueError(
             f"Parameter rank {param.ndim} does not match parameter layout rank {len(state.axes)}"
         )
@@ -1554,6 +1562,7 @@ def register_parameter_operand(
         source=source,
         infer_grad=infer_grad,
     )
+    _validate_parameter_state_rank(param, state)
     return register_parameter_state(param, state)
 
 
