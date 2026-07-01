@@ -356,6 +356,13 @@ def einshard(shard, *xs, mesh = None, shapes = None, sizes = None, families = No
 
 @_torch_compile_disable
 def einshard_like(shard, *xs, mesh=None, sizes=None, families=None):
+    """Register annotated parameter metadata from an einshard formula without executing it.
+
+    ``einshard_like`` parses and validates the same notation as ``einshard`` and
+    attaches metadata for operands annotated with ``[param]``. Non-parameter
+    operands are used only to line up formula operands with arguments; no tensor
+    operation is run and the function returns ``None``.
+    """
     shard, _ = cached_expand_axis_families(shard, sizes, families)
     shard = parse_sharding(shard)
     registrations = _parameter_operand_registrations(shard, xs, mesh)

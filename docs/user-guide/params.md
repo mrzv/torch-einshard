@@ -101,6 +101,28 @@ Ordinary forward formulas should not repeat initialization policy. Use
 later formulas preserve that metadata while filling in layout and gradient
 information.
 
+## Metadata-Only Formula Registration
+
+Use `einshard_like(...)` when the formula is the clearest way to describe a
+parameter's layout or gradient obligation, but the actual forward should use a
+native PyTorch operation or a fused/custom kernel. It parses and validates the
+same annotated formula syntax as `einshard(...)`, attaches metadata for operands
+marked `[param]`, and does not execute the tensor operation.
+
+For example, an RMSNorm wrapper can register the affine weight metadata from the
+formula while keeping the native norm implementation:
+
+```python
+es.einshard_like("b t h/sp1 w/sp2 c, c [param, grad=async] -> b t h/sp1 w/sp2 c", x, self.norm.weight, mesh=mesh)
+y = self.norm(x)
+```
+
+`einshard_like(...)` returns `None`. It should be treated as a metadata side
+effect, not as a tensor expression. The function is disabled for `torch.compile`,
+so calling it in a compiled region will graph-break; performance-sensitive
+modules should prefer calling it during initialization or outside the compiled
+hot path when the metadata is known ahead of time.
+
 ## Parameter Initialization
 
 Use `init_param_` to attach initialization metadata and immediately perform the

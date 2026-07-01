@@ -21,6 +21,7 @@ Attach, inspect, and validate metadata:
 
 Register hidden or explicit parameter layouts:
 
+- {py:func}`torch_einshard.einshard_like`
 - {py:func}`torch_einshard.register_parameter_layout`
 - {py:func}`torch_einshard.register_module_parameter_layouts_`
 - {py:func}`torch_einshard.register_linear_parameters_`
