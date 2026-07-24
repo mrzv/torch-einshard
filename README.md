@@ -3,6 +3,12 @@
 `torch-einshard` expresses local and distributed PyTorch tensor operations with
 einsum-like axis and sharding notation.
 
+## Installation
+
+```sh
+python -m pip install torch-einshard
+```
+
 The main entry point is `torch_einshard.einshard`:
 
 ```python
@@ -76,17 +82,22 @@ patches = es.einwindow(
 
 ## Documentation
 
-The full documentation now lives under `docs/`:
+The full documentation lives under
+[`docs/`](https://github.com/lbnl-sciml/torch-einshard/tree/main/docs):
 
-- `docs/getting-started.md` for installation, quickstart, and test commands.
-- `docs/notation.md` for axis, sharding, partial, factored-axis, family, and
-  ellipsis notation.
-- `docs/mesh-and-shapes.md` for `DeviceMesh`, compound mesh groups, and uneven
-  split metadata.
-- `docs/user-guide/` for local, distributed, FFT, halo/window/convolution,
-  roll, parameter, and policy guides.
-- `docs/reference/` for API-oriented reference material and limitations.
-- `docs/development/` for roadmap, performance, and design notes.
+- [Getting started](https://github.com/lbnl-sciml/torch-einshard/blob/main/docs/getting-started.md)
+  covers installation, quickstart, and test commands.
+- [Notation](https://github.com/lbnl-sciml/torch-einshard/blob/main/docs/notation.md)
+  covers axis, sharding, partial, factored-axis, family, and ellipsis notation.
+- [Meshes and shapes](https://github.com/lbnl-sciml/torch-einshard/blob/main/docs/mesh-and-shapes.md)
+  covers `DeviceMesh`, compound mesh groups, and uneven split metadata.
+- [User guides](https://github.com/lbnl-sciml/torch-einshard/tree/main/docs/user-guide)
+  cover local, distributed, FFT, halo/window/convolution, roll, parameter, and
+  policy topics.
+- [Reference documentation](https://github.com/lbnl-sciml/torch-einshard/tree/main/docs/reference)
+  covers the API and known limitations.
+- [Development documentation](https://github.com/lbnl-sciml/torch-einshard/tree/main/docs/development)
+  covers the roadmap, performance, and design notes.
 
 Build the HTML docs with:
 
@@ -117,5 +128,7 @@ split/gather/repartition patterns, tensor-parallel contractions, partial tensor
 notation, named-axis FFTs, halo/window/convolution helpers, roll operations,
 optimization-policy diagnostics, and parameter metadata helpers.
 
-Known limitations are tracked in `docs/reference/limitations.md`. Remaining
-feature and planning work is tracked in `docs/development/roadmap.md`.
+Known limitations are tracked in the
+[limitations reference](https://github.com/lbnl-sciml/torch-einshard/blob/main/docs/reference/limitations.md).
+Remaining feature and planning work is tracked in the
+[roadmap](https://github.com/lbnl-sciml/torch-einshard/blob/main/docs/development/roadmap.md).
