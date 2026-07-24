@@ -1,7 +1,8 @@
-# PyTorch is installed separately from its CPU-only index in .readthedocs.yaml.
+# A direct CPU wheel keeps PyTorch dependencies on the standard PyPI index.
 furo==2025.12.19
 myst-parser==5.1.0
 numpy==2.3.3
 parsley==1.3
 sphinx==9.1.0
 sphinx-autodoc-typehints==3.11.0
+torch @ https://download.pytorch.org/whl/cpu/torch-2.8.0%2Bcpu-cp312-cp312-manylinux_2_28_x86_64.whl#sha256=cb9a8ba8137ab24e36bf1742cb79a1294bd374db570f09fc15a5e1318160db4e

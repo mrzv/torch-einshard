@@ -12,6 +12,11 @@ Add user-visible changes to the `Unreleased` section as they are made, under
 
 - Read the Docs build configuration for publishing the Sphinx documentation.
 
+### Fixed
+
+- Resolve Read the Docs dependencies from PyPI while retaining CPU-only
+  PyTorch.
+
 ## [1.0] - 2026-07-24
 
 ### Added
