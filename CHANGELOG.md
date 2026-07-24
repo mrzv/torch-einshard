@@ -8,6 +8,10 @@ Add user-visible changes to the `Unreleased` section as they are made, under
 
 ## [Unreleased]
 
+### Added
+
+- Read the Docs build configuration for publishing the Sphinx documentation.
+
 ## [1.0] - 2026-07-24
 
 ### Added
