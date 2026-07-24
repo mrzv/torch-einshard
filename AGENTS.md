@@ -21,7 +21,8 @@ Tests are in `tests/`. Examples are in `examples/`. The project uses Python 3.12
 
 - Prefer small, focused changes that match the existing style.
 - Keep public behavior simple and explicit; do not add compatibility layers unless there is a concrete need.
-- The README is currently empty, so source files and tests are the best references for behavior.
+- Use `README.md`, `docs/`, source files, and tests as references for behavior.
+- Record user-visible changes in the `Unreleased` section of `CHANGELOG.md` as they are made.
 - Distributed tests are intended to run through `torchrun`; use `./run_tests.sh` when verifying the full suite.
 - Be careful with distributed process-group initialization and PyTorch `DeviceMesh` behavior when changing tests or examples.
 
