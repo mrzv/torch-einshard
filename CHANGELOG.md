@@ -16,6 +16,7 @@ Add user-visible changes to the `Unreleased` section as they are made, under
 
 - Link to the rendered Read the Docs site from the README and package metadata
   while retaining links to Markdown source documents.
+- Add PyPI installation instructions to the Getting Started guide.
 
 ### Fixed
 

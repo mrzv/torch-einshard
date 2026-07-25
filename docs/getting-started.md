@@ -8,13 +8,19 @@ import torch_einshard as es
 
 ## Installation
 
-From a source checkout, install or sync the project with `uv`:
+Install the package from PyPI:
+
+```sh
+python -m pip install torch-einshard
+```
+
+For development from a source checkout, install or sync the project with `uv`:
 
 ```sh
 uv sync
 ```
 
-For an editable install into an existing environment, use:
+For an editable source install into an existing environment, use:
 
 ```sh
 uv pip install -e .
