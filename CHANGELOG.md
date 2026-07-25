@@ -12,6 +12,11 @@ Add user-visible changes to the `Unreleased` section as they are made, under
 
 - Read the Docs build configuration for publishing the Sphinx documentation.
 
+### Changed
+
+- Link to the rendered Read the Docs site from the README and package metadata
+  while retaining links to Markdown source documents.
+
 ### Fixed
 
 - Resolve Read the Docs dependencies from PyPI while retaining CPU-only

@@ -25,7 +25,7 @@ dependencies = [
 
 [project.urls]
 Homepage = "https://github.com/lbnl-sciml/torch-einshard"
-Documentation = "https://github.com/lbnl-sciml/torch-einshard/tree/main/docs"
+Documentation = "https://torch-einshard.readthedocs.io/en/latest/"
 Issues = "https://github.com/lbnl-sciml/torch-einshard/issues"
 Repository = "https://github.com/lbnl-sciml/torch-einshard"
 

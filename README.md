@@ -82,22 +82,23 @@ patches = es.einwindow(
 
 ## Documentation
 
-The full documentation lives under
-[`docs/`](https://github.com/lbnl-sciml/torch-einshard/tree/main/docs):
+The full documentation is available on
+[Read the Docs](https://torch-einshard.readthedocs.io/en/latest/). Markdown
+source is kept under
+[`docs/`](https://github.com/lbnl-sciml/torch-einshard/tree/main/docs).
 
-- [Getting started](https://github.com/lbnl-sciml/torch-einshard/blob/main/docs/getting-started.md)
+- [Getting started](https://torch-einshard.readthedocs.io/en/latest/getting-started.html)
+  ([source](https://github.com/lbnl-sciml/torch-einshard/blob/main/docs/getting-started.md))
   covers installation, quickstart, and test commands.
-- [Notation](https://github.com/lbnl-sciml/torch-einshard/blob/main/docs/notation.md)
+- [Notation](https://torch-einshard.readthedocs.io/en/latest/notation.html)
+  ([source](https://github.com/lbnl-sciml/torch-einshard/blob/main/docs/notation.md))
   covers axis, sharding, partial, factored-axis, family, and ellipsis notation.
-- [Meshes and shapes](https://github.com/lbnl-sciml/torch-einshard/blob/main/docs/mesh-and-shapes.md)
+- [Meshes and shapes](https://torch-einshard.readthedocs.io/en/latest/mesh-and-shapes.html)
+  ([source](https://github.com/lbnl-sciml/torch-einshard/blob/main/docs/mesh-and-shapes.md))
   covers `DeviceMesh`, compound mesh groups, and uneven split metadata.
-- [User guides](https://github.com/lbnl-sciml/torch-einshard/tree/main/docs/user-guide)
-  cover local, distributed, FFT, halo/window/convolution, roll, parameter, and
-  policy topics.
-- [Reference documentation](https://github.com/lbnl-sciml/torch-einshard/tree/main/docs/reference)
-  covers the API and known limitations.
-- [Development documentation](https://github.com/lbnl-sciml/torch-einshard/tree/main/docs/development)
-  covers the roadmap, performance, and design notes.
+
+The rendered site's sidebar also provides the user guides, API reference, known
+limitations, roadmap, performance notes, and design documentation.
 
 Build the HTML docs with:
 
@@ -129,6 +130,8 @@ notation, named-axis FFTs, halo/window/convolution helpers, roll operations,
 optimization-policy diagnostics, and parameter metadata helpers.
 
 Known limitations are tracked in the
-[limitations reference](https://github.com/lbnl-sciml/torch-einshard/blob/main/docs/reference/limitations.md).
+[limitations reference](https://torch-einshard.readthedocs.io/en/latest/reference/limitations.html)
+([source](https://github.com/lbnl-sciml/torch-einshard/blob/main/docs/reference/limitations.md)).
 Remaining feature and planning work is tracked in the
-[roadmap](https://github.com/lbnl-sciml/torch-einshard/blob/main/docs/development/roadmap.md).
+[roadmap](https://torch-einshard.readthedocs.io/en/latest/development/roadmap.html)
+([source](https://github.com/lbnl-sciml/torch-einshard/blob/main/docs/development/roadmap.md)).
